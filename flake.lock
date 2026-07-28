@@ -1,0 +1,96 @@
+{
+  "nodes": {
+    "kalico-bleeding-edge": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1781881508,
+        "narHash": "sha256-l0p/IjzcPTtLH0IJI0fepYO5l34g1D2NVcF+E3T1nLY=",
+        "owner": "KalicoCrew",
+        "repo": "kalico",
+        "rev": "e0a57a0b55c65d8b9112c812a01bd32f88476618",
+        "type": "github"
+      },
+      "original": {
+        "owner": "KalicoCrew",
+        "ref": "bleeding-edge-v2",
+        "repo": "kalico",
+        "type": "github"
+      }
+    },
+    "kalico-main": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1785226942,
+        "narHash": "sha256-27QyFFo3YdLhJsVSobw7cjRr1gLPTOcbAWtf1+nEkxM=",
+        "owner": "KalicoCrew",
+        "repo": "kalico",
+        "rev": "5fdf0dd3ee8adba46a2aebea3a87bf507c8faf1d",
+        "type": "github"
+      },
+      "original": {
+        "owner": "KalicoCrew",
+        "repo": "kalico",
+        "type": "github"
+      }
+    },
+    "katapult": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1774007749,
+        "narHash": "sha256-iQ/z1qWWopb6wG1lHLL/nxrSCBmcdW20k66rpAYpN6Y=",
+        "owner": "Arksine",
+        "repo": "Katapult",
+        "rev": "ec59b9bb9ad6c2ec8d4dc6831fbc77f0b308e29e",
+        "type": "github"
+      },
+      "original": {
+        "owner": "Arksine",
+        "repo": "Katapult",
+        "type": "github"
+      }
+    },
+    "klipper": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1771555038,
+        "narHash": "sha256-qdB136JhHn2J2HFXt1/5igp4ynFxzSUxJYPqInXXSO0=",
+        "owner": "klipper3d",
+        "repo": "klipper",
+        "rev": "187481e2514f30fbaa19241869f4485ab4289cea",
+        "type": "github"
+      },
+      "original": {
+        "owner": "klipper3d",
+        "repo": "klipper",
+        "type": "github"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1785090369,
+        "narHash": "sha256-m0pDuRJG7EDo9ri+4Ksu83VsI+PlxNC9lNBfydejce4=",
+        "owner": "nixos",
+        "repo": "nixpkgs",
+        "rev": "624af665418d3c65d544145b4d34ad696439570e",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nixos",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "kalico-bleeding-edge": "kalico-bleeding-edge",
+        "kalico-main": "kalico-main",
+        "katapult": "katapult",
+        "klipper": "klipper",
+        "nixpkgs": "nixpkgs"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}

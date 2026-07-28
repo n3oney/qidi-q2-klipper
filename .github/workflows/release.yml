@@ -1,0 +1,86 @@
+name: Build and release firmware
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v22
+
+      - name: Prepare output directories
+        run: mkdir -p build dist
+
+      - parallel:
+          - name: Build Klipper
+            run: nix build .#klipper --out-link build/klipper --print-build-logs
+
+          - name: Build Kalico bleeding-edge-v2
+            run: nix build .#kalico-bleeding-edge --out-link build/kalico-bleeding-edge --print-build-logs
+
+          - name: Build Kalico main
+            run: nix build .#kalico-main --out-link build/kalico-main --print-build-logs
+
+          - name: Build Katapult
+            run: nix build .#katapult --out-link build/katapult --print-build-logs
+
+          - name: Build Katapult deployer
+            run: nix build .#katapult-deployer --out-link build/katapult-deployer --print-build-logs
+
+      - name: Package release archives
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for name in \
+            klipper \
+            kalico-bleeding-edge \
+            kalico-main \
+            katapult \
+            katapult-deployer
+          do
+            tar \
+              --dereference \
+              --sort=name \
+              --mtime='UTC 1970-01-01' \
+              --owner=0 \
+              --group=0 \
+              --numeric-owner \
+              -czf "dist/${name}.tar.gz" \
+              -C "build/${name}" \
+              .
+          done
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          release_tag="build-${GITHUB_SHA}"
+          release_title="Build ${GITHUB_SHA:0:7}"
+          release_notes="Automated firmware build for commit ${GITHUB_SHA}."
+
+          if gh release view "$release_tag" >/dev/null 2>&1; then
+            gh release upload "$release_tag" dist/*.tar.gz --clobber
+          else
+            gh release create "$release_tag" \
+              dist/*.tar.gz \
+              --target "$GITHUB_SHA" \
+              --title "$release_title" \
+              --latest \
+              --notes "$release_notes"
+          fi
