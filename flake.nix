@@ -69,7 +69,7 @@
         system: scopes:
           scopes
           // {
-            inherit (katapultScopes.${system}) katapult katapult-deployer;
+            inherit (katapultScopes.${system}) katapult katapult-deployer katapult-source;
           }
       )
       kalicoScopes;
@@ -79,6 +79,7 @@
         system: scopes:
           (lib.mapAttrs (_: scope: scope.full) scopes)
           // {
+            inherit (katapultScopes.${system}) katapult-source;
             katapult = katapultScopes.${system}.katapult.all;
             katapult-deployer = katapultScopes.${system}.katapult-deployer.all;
           }

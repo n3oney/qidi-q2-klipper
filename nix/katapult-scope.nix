@@ -31,22 +31,24 @@ lib.makeScope newScope (
         if buildDeployer
         then "deployer"
         else "katapult";
-      all = runCommand "katapult-qidi-${suffix}-firmwares" {
-        meta.license = lib.licenses.gpl3Only;
-      } ''
-        mkdir -p "$out"
-        install -m644 "${patchedKatapult}/LICENSE" "$out/LICENSE"
+      all =
+        runCommand "katapult-qidi-${suffix}-firmwares" {
+          meta.license = lib.licenses.gpl3Only;
+        } ''
+          mkdir -p "$out"
+          install -m644 "${patchedKatapult}/LICENSE" "$out/LICENSE"
 
-        ${lib.concatStringsSep "\n" (
-          lib.mapAttrsToList (board: drv: ''
-            cp "${drv}/${firmware}" "$out/${board}-${suffix}.bin"
-          '')
-          firmwares
-        )}
-      '';
+          ${lib.concatStringsSep "\n" (
+            lib.mapAttrsToList (board: drv: ''
+              cp "${drv}/${firmware}" "$out/${board}-${suffix}.bin"
+            '')
+            firmwares
+          )}
+        '';
     in
       firmwares // {inherit all;};
   in {
+    katapult-source = patchedKatapult;
     katapult = mkFirmwareSet directConfigs false;
     katapult-deployer = mkFirmwareSet deployerConfigs true;
   }
