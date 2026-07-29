@@ -1,0 +1,78 @@
+name: Update firmware inputs
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update:
+    name: Update ${{ matrix.input }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - input: kalico-main
+            packages: '.#kalico-main'
+          - input: kalico-bleeding-edge
+            packages: '.#kalico-bleeding-edge'
+          - input: klipper
+            packages: '.#klipper'
+          - input: katapult
+            packages: '.#katapult .#katapult-deployer'
+
+    concurrency:
+      group: update-firmware-input-${{ matrix.input }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v22
+
+      - uses: cachix/cachix-action@v17
+        with:
+          name: neoney
+          authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
+
+      - name: Update input
+        id: update
+        shell: bash
+        env:
+          INPUT: ${{ matrix.input }}
+        run: |
+          set -euo pipefail
+
+          cp flake.lock "$RUNNER_TEMP/flake.lock.before"
+          nix flake update "$INPUT"
+
+          if cmp -s "$RUNNER_TEMP/flake.lock.before" flake.lock; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build related packages
+        if: steps.update.outputs.changed == 'true'
+        run: nix build ${{ matrix.packages }} --no-link --print-build-logs
+
+      - name: Open update pull request
+        if: steps.update.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v8.1.1
+        with:
+          add-paths: flake.lock
+          base: main
+          branch: automation/update-${{ matrix.input }}
+          commit-message: 'chore: update ${{ matrix.input }}'
+          title: 'chore: update ${{ matrix.input }}'
+          body: |
+            Updates the `${{ matrix.input }}` flake input.
+          delete-branch: true
