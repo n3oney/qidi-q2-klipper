@@ -19,6 +19,11 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v22
 
+      - uses: cachix/cachix-action@v17
+        with:
+          name: neoney
+          authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
+
       - name: Prepare output directories
         run: mkdir -p build dist
 
