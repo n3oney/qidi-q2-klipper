@@ -50,8 +50,9 @@
         kalico-bleeding-edge = mkKalicoScope kalico-bleeding-edge "qidi-q2-kalico-bleeding-edge-v2" kalicoPatches;
         klipper = mkKalicoScope klipper "qidi-q2-klipper" [
           (pkgs.fetchpatch2 {
-            url = "https://raw.githubusercontent.com/MisterSheikh/Qidi_Q2_Mainline_Klipper/f9f6cf04e5e4b9442c23aefeff6061a8bedcbf29/patches/klipper/0001-q2-mainboard-usb-and-cs1237.patch";
-            hash = "sha256-UNbFaSd+0mcBe9NDS6CJkbWq1Oc9rS9HhTwfVGvcRNY=";
+            # my fork until this is merged into MisterSheikh's repo
+            url = "https://raw.githubusercontent.com/n3oney/Qidi_Q2_Mainline_Klipper/fa5e914c5eae96a7504e488f7dd5e58e316e2679/patches/klipper/0001-q2-mainboard-usb-and-cs1237.patch";
+            hash = "sha256-g61weTYz9DEz1ZEmJncLzSQFz5q4SNopyh+qx35EM4w=";
           })
         ];
       }
