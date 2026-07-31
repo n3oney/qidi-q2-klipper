@@ -21,6 +21,11 @@
     };
   };
 
+  nixConfig = {
+    extra-trusted-public-keys = "neoney.cachix.org-1:bsFaTdG04tfzci0osGfosbRX8KX94Ih/2hU0HpJ+qRM=";
+    extra-substituters = "https://neoney.cachix.org";
+  };
+
   outputs = {
     nixpkgs,
     kalico-main,
