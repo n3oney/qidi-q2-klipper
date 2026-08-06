@@ -20,11 +20,11 @@
     "kalico-main": {
       "flake": false,
       "locked": {
-        "lastModified": 1785226942,
-        "narHash": "sha256-27QyFFo3YdLhJsVSobw7cjRr1gLPTOcbAWtf1+nEkxM=",
+        "lastModified": 1785933192,
+        "narHash": "sha256-IGbzXTnKTKVrvxyjNDeuWMgEMtIVIQsNekFXaQDICNk=",
         "owner": "KalicoCrew",
         "repo": "kalico",
-        "rev": "5fdf0dd3ee8adba46a2aebea3a87bf507c8faf1d",
+        "rev": "ae261624f57fb597dcffaa46062b1c58d3e5999d",
         "type": "github"
       },
       "original": {
