@@ -37,12 +37,6 @@
     lib = nixpkgs.lib;
     forAllSystems = lib.genAttrs lib.systems.flakeExposed;
 
-    kalicoPatches = [
-      ./patches/0001-q2-gd32f425-usb.patch
-      ./patches/0002-q2-cs1237.patch
-      ./patches/0003-build-version-override.patch
-    ];
-
     kalicoScopes = forAllSystems (
       system: let
         pkgs = nixpkgs.legacyPackages.${system};
@@ -50,10 +44,36 @@
           pkgs.callPackage ./nix/kalico-scope.nix {
             inherit src name patches;
           };
-      in {
-        kalico-main = mkKalicoScope kalico-main "qidi-q2-kalico" kalicoPatches;
-        kalico-bleeding-edge = mkKalicoScope kalico-bleeding-edge "qidi-q2-kalico-bleeding-edge-v2" kalicoPatches;
-        klipper = mkKalicoScope klipper "qidi-q2-klipper" [
+
+        kalicoPatches = [
+          ./patches/0001-q2-gd32f425-usb.patch
+          ./patches/0002-q2-cs1237.patch
+
+          ./patches/0003-q2-multi-mcu-timeout.patch
+
+          ./patches/0004-q2-gd32f303-spi2.patch
+          ./patches/0005-q2-gd32f425-temperature.patch
+
+          (pkgs.fetchpatch2 {
+            url = "https://github.com/MisterSheikh/Qidi_Q2_Mainline_Klipper/raw/d3f7f86db676e5fa9aad2fec2175927bc06beb2a/patches/klipper/0006-stm32-add-Q2-GD32F303-120MHz-target.patch";
+            excludes = ["src/stm32/Kconfig"];
+            hash = "sha256-l6QpT54icFUWB9t5KhC5C7WmozGv+OHiTnWIkZM7BNM=n";
+          })
+          # everything from the upstream patch is compatible with kalico except the kconfig
+          ./patches/0006-q2-gd32f303-120mhz-kconfig.patch
+
+          (pkgs.fetchpatch2 {
+            url = "https://github.com/MisterSheikh/Qidi_Q2_Mainline_Klipper/raw/d3f7f86db676e5fa9aad2fec2175927bc06beb2a/patches/klipper/0007-stm32-add-Q2-GD32F425-200MHz-support.patch";
+            excludes = ["src/stm32/stm32f4.c"];
+            hash = "sha256-9XM20Tfqc11blDLEr3X7Dmh7bBh+WHLLhAOfSbSxpwQ=";
+          })
+          # everything from upstream works with kalico except src/stm32/stm32f4.c
+          ./patches/0007-q2-gd32f425-200mhz-stm32f4.patch
+
+          ./patches/0008-build-version-override.patch
+        ];
+
+        klipperPatches = [
           (pkgs.fetchpatch2 {
             url = "https://github.com/MisterSheikh/Qidi_Q2_Mainline_Klipper/raw/d3f7f86db676e5fa9aad2fec2175927bc06beb2a/patches/klipper/0001-stm32-add-GD32F425-USB-workaround.patch";
             hash = "sha256-lDHhrkxYHuBsYM/nDtyLrMuhhBMpsKl0YgjfwuRRKhA=";
@@ -89,6 +109,10 @@
             hash = "sha256-cLSbYokF7Cnw17y0Xa3ScjT9N9hc2bydUnzAUjLcDcM=";
           })
         ];
+      in {
+        kalico-main = mkKalicoScope kalico-main "qidi-q2-kalico" kalicoPatches;
+        kalico-bleeding-edge = mkKalicoScope kalico-bleeding-edge "qidi-q2-kalico-bleeding-edge-v2" kalicoPatches;
+        klipper = mkKalicoScope klipper "qidi-q2-klipper" klipperPatches;
       }
     );
 

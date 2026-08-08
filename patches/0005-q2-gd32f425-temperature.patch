@@ -1,0 +1,99 @@
+diff --git a/src/stm32/Kconfig b/src/stm32/Kconfig
+--- a/src/stm32/Kconfig
++++ b/src/stm32/Kconfig
+@@ -54,6 +54,11 @@
+         bool "STM32F407"
+         select MACH_STM32F4
+         select MACH_STM32F4x5
++    config MACH_GD32F425_Q2
++        bool "GD32F425 (Qidi Q2 mainboard)"
++        select MACH_STM32F4
++        select MACH_STM32F4x5
++        select STM32F4_GD32_USB_INIT_WORKAROUND if USBSERIAL
+     config MACH_STM32F427
+         bool "STM32F427"
+         select MACH_STM32F4
+@@ -195,6 +200,7 @@
+     default "stm32f411xe" if MACH_STM32F411
+     default "stm32f405xx" if MACH_STM32F405
+     default "stm32f407xx" if MACH_STM32F407
++    default "stm32f407xx" if MACH_GD32F425_Q2
+     default "stm32f427xx" if MACH_STM32F427
+     default "stm32f429xx" if MACH_STM32F429
+     default "stm32f446xx" if MACH_STM32F446
+@@ -216,6 +222,7 @@ config CLOCK_FREQ
+     default 120000000 if MACH_STM32F207
+     default 84000000 if MACH_STM32F401
+     default 96000000 if MACH_STM32F411
++    default 168000000 if MACH_GD32F425_Q2
+     default 168000000 if MACH_STM32F4x5
+     default 180000000 if MACH_STM32F446 || MACH_STM32F427
+     default 216000000 if MACH_STM32F765
+diff --git a/src/stm32/adc.c b/src/stm32/adc.c
+--- a/src/stm32/adc.c
++++ b/src/stm32/adc.c
+@@ -14,6 +14,9 @@
+ #include "sched.h" // sched_shutdown
+ 
+ DECL_CONSTANT("ADC_MAX", 4095);
++#if CONFIG_MACH_GD32F425_Q2
++DECL_CONSTANT_STR("MCU_TEMPERATURE_TYPE", "gd32f425");
++#endif
+ 
+ #define ADC_TEMPERATURE_PIN 0xfe
+ DECL_ENUMERATION("pin", "ADC_TEMPERATURE", ADC_TEMPERATURE_PIN);
+@@ -113,6 +116,11 @@
+     }
+ 
+     if (pin == ADC_TEMPERATURE_PIN) {
++#if CONFIG_MACH_GD32F425_Q2
++        // GD32F425 specifies at least 17.1us for temperature sampling.
++        adc->SMPR1 = ((adc->SMPR1 & ~ADC_SMPR1_SMP16_Msk)
++                      | (7 << ADC_SMPR1_SMP16_Pos));
++#endif
+ #if CONFIG_MACH_STM32F401 || CONFIG_MACH_STM32F411
+         ADC1_COMMON->CCR = ADC_CCR_TSVREFE;
+ #elif !CONFIG_MACH_STM32F1
+diff --git a/klippy/extras/temperature_mcu.py b/klippy/extras/temperature_mcu.py
+--- a/klippy/extras/temperature_mcu.py
++++ b/klippy/extras/temperature_mcu.py
+@@ -83,9 +83,14 @@
+         self.debug_read_cmd = _mcu.lookup_query_command(
+             "debug_read order=%c addr=%u", "debug_result val=%u"
+         )
+-        self.mcu_type = _mcu.get_constants().get("MCU", "")
++        constants = _mcu.get_constants()
++        self.mcu_type = constants.get("MCU", "")
++        self.temp_sensor_type = constants.get(
++            "MCU_TEMPERATURE_TYPE", self.mcu_type
++        )
+         # Run MCU specific configuration
+         cfg_funcs = [
++            ("gd32f425", self.config_gd32f425),
+             ("rp2", self.config_rp2040),
+             ("sam3", self.config_sam3),
+             ("sam4", self.config_sam4),
+@@ -110,7 +115,7 @@
+             ("", self.config_unknown),
+         ]
+         for name, func in cfg_funcs:
+-            if self.mcu_type.startswith(name):
++            if self.temp_sensor_type.startswith(name):
+                 func()
+                 break
+         logging.info(
+@@ -137,7 +142,13 @@
+ 
+     def config_unknown(self):
+         raise self.printer.config_error(
+-            "MCU temperature not supported on %s" % (self.mcu_type,)
++            "MCU temperature not supported on %s" % (self.temp_sensor_type,)
++        )
++
++    def config_gd32f425(self):
++        self.slope = self.reference_voltage / -0.004400
++        self.base_temperature = self.calc_base(
++            25.0, 1.4 / self.reference_voltage
+         )
+ 
+     def config_gd32e230x8(self):

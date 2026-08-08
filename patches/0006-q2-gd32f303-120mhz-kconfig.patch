@@ -1,0 +1,47 @@
+diff --git a/src/stm32/Kconfig b/src/stm32/Kconfig
+--- a/src/stm32/Kconfig
++++ b/src/stm32/Kconfig
+@@ -34,6 +34,9 @@
+     config MACH_STM32F103
+         bool "STM32F103"
+         select MACH_STM32F1
++    config MACH_GD32F303_Q2
++        bool "GD32F303 (Qidi Q2 toolhead, 120 MHz)"
++        select MACH_STM32F1
+     config MACH_STM32F207
+         bool "STM32F207"
+         select MACH_STM32F2
+@@ -186,6 +189,7 @@
+     default "stm32f070xb" if MACH_STM32F070
+     default "stm32f072xb" if MACH_STM32F072
+     default "stm32f103xe" if MACH_STM32F103 || MACH_AT32F403
++    default "stm32f103xe" if MACH_GD32F303_Q2
+     default "stm32f207xx" if MACH_STM32F207
+     default "stm32f401xc" if MACH_STM32F401
+     default "stm32f411xe" if MACH_STM32F411
+@@ -214,6 +218,7 @@
+     default 48000000 if MACH_STM32F0
+     default 64000000 if MACH_STM32F103 && STM32_CLOCK_REF_INTERNAL
+     default 72000000 if MACH_STM32F103
++    default 120000000 if MACH_GD32F303_Q2
+     default 120000000 if MACH_STM32F207
+     default 84000000 if MACH_STM32F401
+     default 96000000 if MACH_STM32F411
+@@ -234,7 +239,7 @@
+     hex
+     default 0x8000 if MACH_STM32F031 || MACH_STM32F042 || MACH_STM32F070x6
+     default 0x20000 if (MACH_STM32F070 || MACH_STM32F072) && !MACH_STM32F070x6
+-    default 0x10000 if MACH_STM32F103 || MACH_STM32L412 # Flash size of stm32f103x8 (64KiB)
++    default 0x10000 if MACH_STM32F103 || MACH_GD32F303_Q2 || MACH_STM32L412 # Flash size of stm32f103x8 (64KiB)
+     default 0x40000 if MACH_STM32F2 || MACH_STM32F401 || MACH_STM32H723 || MACH_AT32F403
+     default 0x80000 if MACH_STM32F4x5 || MACH_STM32F446 || MACH_STM32F411
+     default 0x20000 if MACH_STM32G0 || MACH_STM32G431
+@@ -258,7 +263,7 @@
+     default 0x1800 if MACH_STM32F070x6
+     default 0x4000 if (MACH_STM32F070 || MACH_STM32F072) && !MACH_STM32F070x6
+     default 0x2800 if MACH_STM32F103x6
+-    default 0x5000 if MACH_STM32F103 && !MACH_STM32F103x6 # Ram size of stm32f103x8
++    default 0x5000 if (MACH_STM32F103 && !MACH_STM32F103x6) || MACH_GD32F303_Q2 # Ram size of stm32f103x8
+     default 0x8000 if MACH_STM32G431
+     default 0x20000 if MACH_STM32G474
+     default 0xa000 if MACH_STM32L412
