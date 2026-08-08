@@ -71,6 +71,7 @@
           ./patches/0007-q2-gd32f425-200mhz-stm32f4.patch
 
           ./patches/0008-build-version-override.patch
+          ./patches/0009-load-cell-reduce-status-allocations.patch
         ];
 
         klipperPatches = [
