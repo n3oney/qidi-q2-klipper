@@ -1,5 +1,5 @@
 diff --git a/klippy/extras/load_cell/__init__.py b/klippy/extras/load_cell/__init__.py
-index ecaeff8..e497471 100644
+index ecaeff859e..e4974719ec 100644
 --- a/klippy/extras/load_cell/__init__.py
 +++ b/klippy/extras/load_cell/__init__.py
 @@ -6,7 +6,7 @@
@@ -11,7 +11,7 @@ index ecaeff8..e497471 100644
  from .load_cell import LoadCell
  
  
-@@ -14,6 +14,7 @@ from .load_cell import LoadCell
+@@ -14,6 +14,7 @@
  def register_components(subsystem: SubsystemComponentCollection):
      sensors = (
          hx71x.HX71X_SENSOR_TYPES
@@ -21,7 +21,7 @@ index ecaeff8..e497471 100644
      )
 diff --git a/klippy/extras/load_cell/cs1237.py b/klippy/extras/load_cell/cs1237.py
 new file mode 100644
-index 0000000..be2d670
+index 0000000000..8ef10fd157
 --- /dev/null
 +++ b/klippy/extras/load_cell/cs1237.py
 @@ -0,0 +1,184 @@
@@ -210,7 +210,7 @@ index 0000000..be2d670
 +
 +CS1237_SENSOR_TYPES = {"cs1237": CS1237, "c_sensor": CS1237}
 diff --git a/klippy/extras/load_cell_probe.py b/klippy/extras/load_cell_probe.py
-index eac2985..e7f35d4 100644
+index eac29855b1..e7f35d4ef8 100644
 --- a/klippy/extras/load_cell_probe.py
 +++ b/klippy/extras/load_cell_probe.py
 @@ -3,7 +3,7 @@
@@ -222,7 +222,7 @@ index eac2985..e7f35d4 100644
  from klippy.extras.load_cell.load_cell_probe import LoadCellPrinterProbe
  from klippy.extras.load_cell.tap_analysis import TapClassifierModule
  from klippy.extras.load_cell.tap_quality_classifier import TapQualityClassifier
-@@ -14,6 +14,7 @@ from klippy.printer import Printer, SubsystemComponentCollection
+@@ -14,6 +14,7 @@
  def register_components(subsystem: SubsystemComponentCollection):
      sensors = (
          hx71x.HX71X_SENSOR_TYPES
@@ -231,10 +231,10 @@ index eac2985..e7f35d4 100644
          | ads131m0x.ADS131M0X_SENSOR_TYPES
      )
 diff --git a/src/Kconfig b/src/Kconfig
-index fd47bff..266f94d 100644
+index 383a5c3842..9d08d83d78 100644
 --- a/src/Kconfig
 +++ b/src/Kconfig
-@@ -174,6 +174,10 @@ config WANT_HX71X
+@@ -191,6 +191,10 @@
      bool
      depends on HAVE_GPIO
      default y
@@ -245,7 +245,7 @@ index fd47bff..266f94d 100644
  config WANT_ADS1220
      bool
      depends on WANT_SPI
-@@ -205,12 +209,12 @@ config WANT_GPIO_I2C
+@@ -222,12 +226,12 @@
  config NEED_SENSOR_BULK
      bool
      depends on WANT_ADXL345 || WANT_LIS2DW || WANT_MPU9250 || WANT_ICM20948 \
@@ -261,10 +261,10 @@ index fd47bff..266f94d 100644
  config NEED_SOS_FILTER
      bool
 diff --git a/src/Makefile b/src/Makefile
-index ecefd62..e917fed 100644
+index ecefd62b53..e917fedd57 100644
 --- a/src/Makefile
 +++ b/src/Makefile
-@@ -24,6 +24,7 @@ src-$(CONFIG_WANT_LDC1612) += sensor_ldc1612.c
+@@ -24,6 +24,7 @@
  src-$(CONFIG_WANT_MPU9250) += sensor_mpu9250.c
  src-$(CONFIG_WANT_ICM20948) += sensor_icm20948.c
  src-$(CONFIG_WANT_HX71X) += sensor_hx71x.c
@@ -274,10 +274,10 @@ index ecefd62..e917fed 100644
  src-$(CONFIG_WANT_SENSOR_ANGLE) += sensor_angle.c
 diff --git a/src/sensor_cs1237.c b/src/sensor_cs1237.c
 new file mode 100644
-index 0000000..1ae5274
+index 0000000000..8efe966b82
 --- /dev/null
 +++ b/src/sensor_cs1237.c
-@@ -0,0 +1,464 @@
+@@ -0,0 +1,572 @@
 +// Support for bit-banging commands to CS1237 ADC chips
 +//
 +// Copyright (C) 2026  The Klipper project
@@ -286,6 +286,8 @@ index 0000000..1ae5274
 +//
 +// CS1237 sampling/timing logic based on code from:
 +// https://codeberg.org/kuwoyuki/klipper-q2
++// Interrupt-driven acquisition based on Anycubic's MCU implementation:
++// https://github.com/ANYCUBIC-3D/K3-klipper-mcu/blob/main/src/sensor_cs1237.c
 +// Adapted to Kalico's load_cell_probe interface.
 +
 +#include <stdint.h>
@@ -298,6 +300,10 @@ index 0000000..1ae5274
 +#include "sched.h" // sched_add_timer
 +#include "sensor_bulk.h" // sensor_bulk_report
 +#include "load_cell_probe.h" // load_cell_probe_report_sample
++#if CONFIG_MACH_GD32F303_Q2
++#include "generic/armcm_boot.h" // armcm_enable_irq
++#include "stm32/internal.h" // GPIO and STM32 register definitions
++#endif
 +
 +struct cs1237_adc {
 +    struct timer timer;
@@ -313,6 +319,9 @@ index 0000000..1ae5274
 +    struct gpio_out sclk;
 +    struct sensor_bulk sb;
 +    struct load_cell_probe *lce;
++#if CONFIG_MACH_GD32F303_Q2
++    uint8_t use_drdy_irq;
++#endif
 +};
 +
 +enum {
@@ -331,6 +340,80 @@ index 0000000..1ae5274
 +#define CMD_READ_CONFIG 0x56
 +
 +static struct task_wake wake_cs1237;
++#if CONFIG_MACH_GD32F303_Q2
++
++static uint8_t cs1237_is_data_ready(struct cs1237_adc *cs1237);
++
++// The Q2 toolhead routes CS1237 DOUT to PB4 / EXTI4.
++#define CS1237_DRDY_PIN GPIO('B', 4)
++#define CS1237_DRDY_EXTI EXTI_IMR_MR4
++
++static struct cs1237_adc *cs1237_exti4;
++
++void
++cs1237_exti4_irq(void)
++{
++    if (!(EXTI->PR & CS1237_DRDY_EXTI))
++        return;
++    EXTI->PR = CS1237_DRDY_EXTI;
++    struct cs1237_adc *cs1237 = cs1237_exti4;
++    if (!cs1237 || cs1237->flags)
++        return;
++    // Mask this line until the background task consumes the sample.
++    EXTI->IMR &= ~CS1237_DRDY_EXTI;
++    cs1237->pending_since = timer_read_time();
++    cs1237->flags = CS_PENDING;
++    sched_wake_task(&wake_cs1237);
++}
++
++static void
++cs1237_drdy_irq_disable(struct cs1237_adc *cs1237)
++{
++    if (cs1237->use_drdy_irq)
++        EXTI->IMR &= ~CS1237_DRDY_EXTI;
++}
++
++static void
++cs1237_drdy_irq_enable(struct cs1237_adc *cs1237)
++{
++    if (!cs1237->use_drdy_irq)
++        return;
++    irqstatus_t flag = irq_save();
++    EXTI->PR = CS1237_DRDY_EXTI;
++    EXTI->IMR |= CS1237_DRDY_EXTI;
++    // Enabling an EXTI line does not synthesize an edge if DOUT is already
++    // low, so explicitly queue a sample in that case.
++    if (cs1237_is_data_ready(cs1237)) {
++        EXTI->IMR &= ~CS1237_DRDY_EXTI;
++        EXTI->PR = CS1237_DRDY_EXTI;
++        cs1237->pending_since = timer_read_time();
++        cs1237->flags = CS_PENDING;
++        sched_wake_task(&wake_cs1237);
++    }
++    irq_restore(flag);
++}
++
++static void
++cs1237_drdy_irq_setup(struct cs1237_adc *cs1237, uint32_t dout_pin)
++{
++    if (dout_pin != CS1237_DRDY_PIN)
++        shutdown("Q2 CS1237 DOUT must use PB4");
++    if (cs1237_exti4)
++        shutdown("Q2 supports only one CS1237");
++    cs1237_exti4 = cs1237;
++    cs1237->use_drdy_irq = 1;
++    RCC->APB2ENR |= RCC_APB2ENR_AFIOEN;
++    RCC->APB2ENR;
++    AFIO->EXTICR[1] = (AFIO->EXTICR[1] & ~AFIO_EXTICR2_EXTI4)
++                      | AFIO_EXTICR2_EXTI4_PB;
++    EXTI->IMR &= ~CS1237_DRDY_EXTI;
++    EXTI->RTSR &= ~EXTI_RTSR_TR4;
++    EXTI->FTSR |= EXTI_FTSR_TR4;
++    EXTI->PR = CS1237_DRDY_EXTI;
++    armcm_enable_irq(cs1237_exti4_irq, EXTI4_IRQn, 2);
++}
++
++#endif
 +
 +/****************************************************************
 + * Low-level bit-banging
@@ -598,6 +681,13 @@ index 0000000..1ae5274
 +cs1237_read_adc(struct cs1237_adc *cs1237, uint8_t oid)
 +{
 +    // claim bus
++#if CONFIG_MACH_GD32F303_Q2
++    cs1237_drdy_irq_disable(cs1237);
++    if (cs1237->use_drdy_irq
++        && timer_read_time() - cs1237->pending_since
++           > cs1237->period_ticks)
++        cs1237->sb.possible_overflows++;
++#endif
 +    cs1237->flags = CS_READING;
 +    uint32_t counts = 0;
 +    if (cs1237->last_error == 0) {
@@ -625,6 +715,10 @@ index 0000000..1ae5274
 +    }
 +    // Release the bus
 +    cs1237->flags = 0;
++#if CONFIG_MACH_GD32F303_Q2
++    if (cs1237->last_error == 0)
++        cs1237_drdy_irq_enable(cs1237);
++#endif
 +    if (cs1237->last_error != 0) {
 +        // Report the error sentinel through the bulk stream and stop polling.
 +        // The host detects the sentinel and restarts capture to recover.
@@ -651,6 +745,9 @@ index 0000000..1ae5274
 +    cs1237->sclk = gpio_out_setup(args[3], 1); // high -> power down
 +    cs1237->last_sample = 0;
 +    cs1237->lce = NULL;
++#if CONFIG_MACH_GD32F303_Q2
++    cs1237_drdy_irq_setup(cs1237, args[2]);
++#endif
 +}
 +DECL_COMMAND(command_config_cs1237, "config_cs1237 oid=%c config=%c"
 +             " dout_pin=%u sclk_pin=%u");
@@ -673,6 +770,9 @@ index 0000000..1ae5274
 +    sched_del_timer(&cs1237->timer);
 +    cs1237->flags = 0;
 +    cs1237->last_error = 0;
++#if CONFIG_MACH_GD32F303_Q2
++    cs1237_drdy_irq_disable(cs1237);
++#endif
 +
 +    if (!args[1]) {
 +        // End measurements - SCLK high for >100us enters power-down
@@ -695,6 +795,10 @@ index 0000000..1ae5274
 +    gpio_out_write(cs1237->sclk, 0); // begin power-up
 +    cs1237->flags = CS_NEED_CONFIG;
 +    sched_wake_task(&wake_cs1237);
++#if CONFIG_MACH_GD32F303_Q2
++    if (cs1237->use_drdy_irq)
++        return;
++#endif
 +    irq_disable();
 +    cs1237->timer.waketime = timer_read_time() + cs1237->rest_ticks;
 +    sched_add_timer(&cs1237->timer);
@@ -735,6 +839,10 @@ index 0000000..1ae5274
 +                sched_del_timer(&cs1237->timer);
 +                add_sample(cs1237, oid, cs1237->last_error, 1);
 +            }
++#if CONFIG_MACH_GD32F303_Q2
++            else
++                cs1237_drdy_irq_enable(cs1237);
++#endif
 +            continue;
 +        }
 +        if ((f & (CS_PENDING | CS_OVERFLOW)) && !(f & CS_READING))
