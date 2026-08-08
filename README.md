@@ -2,6 +2,9 @@
 
 Patched Klipper, Kalico and Katapult for the QIDI Q2.
 
+> [!NOTE]
+> I personally use Kalico (bleeding edge), so that variant is the most "stable" here.
+
 ## Flashing Katapult without an ST-Link
 
 1. Connect to the printer over SSH.
