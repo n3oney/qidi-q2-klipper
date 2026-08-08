@@ -55,9 +55,38 @@
         kalico-bleeding-edge = mkKalicoScope kalico-bleeding-edge "qidi-q2-kalico-bleeding-edge-v2" kalicoPatches;
         klipper = mkKalicoScope klipper "qidi-q2-klipper" [
           (pkgs.fetchpatch2 {
-            # my fork until this is merged into MisterSheikh's repo
-            url = "https://raw.githubusercontent.com/n3oney/Qidi_Q2_Mainline_Klipper/fa5e914c5eae96a7504e488f7dd5e58e316e2679/patches/klipper/0001-q2-mainboard-usb-and-cs1237.patch";
-            hash = "sha256-g61weTYz9DEz1ZEmJncLzSQFz5q4SNopyh+qx35EM4w=";
+            url = "https://github.com/MisterSheikh/Qidi_Q2_Mainline_Klipper/raw/d3f7f86db676e5fa9aad2fec2175927bc06beb2a/patches/klipper/0001-stm32-add-GD32F425-USB-workaround.patch";
+            hash = "sha256-lDHhrkxYHuBsYM/nDtyLrMuhhBMpsKl0YgjfwuRRKhA=";
+          })
+
+          (pkgs.fetchpatch2 {
+            url = "https://github.com/MisterSheikh/Qidi_Q2_Mainline_Klipper/raw/d3f7f86db676e5fa9aad2fec2175927bc06beb2a/patches/klipper/0002-load_cell-add-CS1237-ADC-support.patch";
+            hash = "sha256-cV8WcTNa2Xf7WMdT3Iu8qJSg6EALIKG4H5QBBh8F8FQ=";
+          })
+
+          (pkgs.fetchpatch2 {
+            url = "https://github.com/MisterSheikh/Qidi_Q2_Mainline_Klipper/raw/d3f7f86db676e5fa9aad2fec2175927bc06beb2a/patches/klipper/0003-mcu-extend-Q2-multi-MCU-trigger-synchronization-time.patch";
+            hash = "sha256-Zngp/pSsvSPCq5eaZbvSE5eUCBlfqNNqag8kZ9UmNa4=";
+          })
+
+          (pkgs.fetchpatch2 {
+            url = "https://github.com/MisterSheikh/Qidi_Q2_Mainline_Klipper/raw/d3f7f86db676e5fa9aad2fec2175927bc06beb2a/patches/klipper/0004-stm32-add-Qidi-Q2-GD32F303-SPI2-mapping.patch";
+            hash = "sha256-5bQr4cedNkDQ1+H7lJakrobZ/maL0iSRe40JwGm1Aw0=";
+          })
+
+          (pkgs.fetchpatch2 {
+            url = "https://github.com/MisterSheikh/Qidi_Q2_Mainline_Klipper/raw/d3f7f86db676e5fa9aad2fec2175927bc06beb2a/patches/klipper/0005-stm32-add-Q2-GD32F425-MCU-temperature-support.patch";
+            hash = "sha256-l5kBf+za5O0HPmWJrQKCH6HnI7UbSaYCQQirwTmUBV8=";
+          })
+
+          (pkgs.fetchpatch2 {
+            url = "https://github.com/MisterSheikh/Qidi_Q2_Mainline_Klipper/raw/d3f7f86db676e5fa9aad2fec2175927bc06beb2a/patches/klipper/0006-stm32-add-Q2-GD32F303-120MHz-target.patch";
+            hash = "sha256-X3kZ4uZRW3dT/L8zil1rEyiRSX9O17Z7DopuxL7xkgw=";
+          })
+
+          (pkgs.fetchpatch2 {
+            url = "https://github.com/MisterSheikh/Qidi_Q2_Mainline_Klipper/raw/d3f7f86db676e5fa9aad2fec2175927bc06beb2a/patches/klipper/0007-stm32-add-Q2-GD32F425-200MHz-support.patch";
+            hash = "sha256-cLSbYokF7Cnw17y0Xa3ScjT9N9hc2bydUnzAUjLcDcM=";
           })
         ];
       }
