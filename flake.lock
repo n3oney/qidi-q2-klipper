@@ -52,11 +52,11 @@
     "klipper": {
       "flake": false,
       "locked": {
-        "lastModified": 1786114898,
-        "narHash": "sha256-n8pJ3/grYLDZeSfId38DUm49G9hhMV6IJDQH5O/disw=",
+        "lastModified": 1786300183,
+        "narHash": "sha256-Oe1ciNBOzeqmmTUPyatkzMVSe3l/4+1gVAZGPXAz16c=",
         "owner": "klipper3d",
         "repo": "klipper",
-        "rev": "84104bbbd7625d28b4eaaad83f4562972460ecd9",
+        "rev": "0499b30374315f2a9f49fc12808527fc7d0f5cfa",
         "type": "github"
       },
       "original": {
