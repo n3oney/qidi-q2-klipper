@@ -81,13 +81,67 @@
         "type": "github"
       }
     },
+    "rockchip-kernel": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1766744593,
+        "narHash": "sha256-hhaNyBer/2dzWNZWxxExNbSoDptKtX1lSUQJGZjRjI0=",
+        "owner": "rockchip-linux",
+        "repo": "kernel",
+        "rev": "b4ef083dc0c3608e744deabb43dc6b781aadbe6e",
+        "type": "github"
+      },
+      "original": {
+        "owner": "rockchip-linux",
+        "ref": "develop-6.1",
+        "repo": "kernel",
+        "type": "github"
+      }
+    },
+    "rockchip-uboot": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1766458892,
+        "narHash": "sha256-OlJD80LFarOPoGLOVHs0cQFX8wJSTcYfugxsF5xIllk=",
+        "owner": "rockchip-linux",
+        "repo": "u-boot",
+        "rev": "aeec6f2bfd5ce0cfcdfe0ffc7f84d9d143683856",
+        "type": "github"
+      },
+      "original": {
+        "owner": "rockchip-linux",
+        "ref": "next-dev",
+        "repo": "u-boot",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
         "kalico-bleeding-edge": "kalico-bleeding-edge",
         "kalico-main": "kalico-main",
         "katapult": "katapult",
         "klipper": "klipper",
-        "nixpkgs": "nixpkgs"
+        "nixpkgs": "nixpkgs",
+        "rockchip-kernel": "rockchip-kernel",
+        "rockchip-uboot": "rockchip-uboot",
+        "rtl8189fs": "rtl8189fs"
+      }
+    },
+    "rtl8189fs": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1784035724,
+        "narHash": "sha256-rPVQKbo/S03WSoYk1ZFeF0KAbN9DnUnLLPA1mdyKSfg=",
+        "owner": "jwrdegoede",
+        "repo": "rtl8189ES_linux",
+        "rev": "63900adf1633d31d56af28ac4c535b618e7a5927",
+        "type": "github"
+      },
+      "original": {
+        "owner": "jwrdegoede",
+        "ref": "rtl8189fs",
+        "repo": "rtl8189ES_linux",
+        "type": "github"
       }
     }
   },

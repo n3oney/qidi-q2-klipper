@@ -1,4 +1,4 @@
-name: Build and release firmware
+name: Build and release firmware and kernel
 
 on:
   push:
@@ -45,6 +45,9 @@ jobs:
           - name: Build Katapult deployer
             run: nix build .#katapult-deployer --out-link build/katapult-deployer --print-build-logs
 
+          - name: Build Q2 Linux kernel
+            run: nix build .#q2-kernel --out-link build/q2-kernel --print-build-logs
+
       - name: Package release archives
         shell: bash
         run: |
@@ -55,7 +58,8 @@ jobs:
             kalico-bleeding-edge \
             kalico-main \
             katapult \
-            katapult-deployer
+            katapult-deployer \
+            q2-kernel
           do
             tar \
               --dereference \
@@ -79,7 +83,7 @@ jobs:
 
           release_tag="build-${GITHUB_SHA}"
           release_title="Build ${GITHUB_SHA:0:7}"
-          release_notes="Automated firmware build for commit ${GITHUB_SHA}."
+          release_notes="Automated firmware and Linux kernel build for commit ${GITHUB_SHA}."
 
           if gh release view "$release_tag" >/dev/null 2>&1; then
             gh release upload "$release_tag" dist/*.tar.gz --clobber

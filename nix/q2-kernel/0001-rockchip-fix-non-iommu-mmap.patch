@@ -1,0 +1,21 @@
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_gem.c b/drivers/gpu/drm/rockchip/rockchip_drm_gem.c
+index 0fc8b6cc6..b1fc868bc 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_gem.c
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_gem.c
+@@ -570,6 +570,7 @@ static int rockchip_drm_gem_object_mmap(struct drm_gem_object *obj,
+ {
+ 	int ret;
+ 	struct rockchip_gem_object *rk_obj = to_rockchip_obj(obj);
++	struct rockchip_drm_private *private = obj->dev->dev_private;
+ 
+ 	/*
+ 	 * Set vm_pgoff (used as a fake buffer offset by DRM) to 0 and map the
+@@ -594,7 +595,7 @@ static int rockchip_drm_gem_object_mmap(struct drm_gem_object *obj,
+ 	if (rk_obj->buf_type == ROCKCHIP_GEM_BUF_TYPE_SECURE) {
+ 		DRM_ERROR("Disallow mmap for secure buffer\n");
+ 		ret = -EINVAL;
+-	} else if (rk_obj->pages) {
++	} else if (private->domain) {
+ 		ret = rockchip_drm_gem_object_mmap_iommu(obj, vma);
+ 	} else {
+ 		ret = rockchip_drm_gem_object_mmap_dma(obj, vma);

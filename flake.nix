@@ -19,6 +19,19 @@
       url = "github:Arksine/Katapult";
       flake = false;
     };
+
+    rockchip-kernel = {
+      url = "github:rockchip-linux/kernel/develop-6.1";
+      flake = false;
+    };
+    rockchip-uboot = {
+      url = "github:rockchip-linux/u-boot/next-dev";
+      flake = false;
+    };
+    rtl8189fs = {
+      url = "github:jwrdegoede/rtl8189ES_linux/rtl8189fs";
+      flake = false;
+    };
   };
 
   nixConfig = {
@@ -32,6 +45,9 @@
     kalico-bleeding-edge,
     klipper,
     katapult,
+    rockchip-kernel,
+    rockchip-uboot,
+    rtl8189fs,
     ...
   }: let
     lib = nixpkgs.lib;
@@ -52,6 +68,11 @@
           src = katapult;
         };
 
+        q2Kernel = pkgs.callPackage ./nix/q2-kernel {
+          kernelSrc = rockchip-kernel;
+          ubootSrc = rockchip-uboot;
+          wifiSrc = rtl8189fs;
+        };
       in {
         legacyPackages =
           klipperScopes
@@ -62,6 +83,7 @@
               katapult-deployer
               katapult-source
               ;
+            q2-kernel = q2Kernel;
           };
 
         packages =
@@ -70,6 +92,7 @@
             inherit (katapultScope) katapult-source;
             katapult = katapultScope.katapult.all;
             katapult-deployer = katapultScope.katapult-deployer.all;
+            q2-kernel = q2Kernel;
           };
       }
     );
