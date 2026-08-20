@@ -2499,7 +2499,7 @@ index 1c7d5d69a5..2b82870ab3 100644
  #
  # This file may be distributed under the terms of the GNU GPLv3 license.
  import logging
-@@ -105,27 +105,35 @@
+@@ -105,27 +105,37 @@
          enable = setup_enable_pin(self.printer, config.get("enable_pin", None))
          self.enable_lines[name] = EnableTracking(mcu_stepper, enable)
  
@@ -2551,11 +2551,13 @@ index 1c7d5d69a5..2b82870ab3 100644
 -        toolhead.dwell(DISABLE_STALL_TIME)
 +        self.set_motors_enable(self.get_steppers(), False)
 +        toolhead = self.printer.lookup_object("toolhead")
-+        self.printer.send_event("stepper_enable:motor_off")
++        self.printer.send_event(
++            "stepper_enable:motor_off", toolhead.get_last_move_time()
++        )
  
      def get_status(self, eventtime):
          steppers = {
-@@ -151,7 +159,11 @@
+@@ -151,7 +161,11 @@
              )
              return
          stepper_enable = gcmd.get_int("ENABLE", 1)
@@ -3002,32 +3004,6 @@ index dd7ec642e2..3eea9a6636 100644
              stepper.set_trapq(self._prev_trapq)
              stepper.set_stepper_kinematics(self._prev_sks[i])
              stepper.set_rotation_distance(self._prev_rotation_dists[i])
-diff --git a/klippy/extras/z_tilt.py b/klippy/extras/z_tilt.py
-index 4abfbb90fb..14cc210a01 100644
---- a/klippy/extras/z_tilt.py
-+++ b/klippy/extras/z_tilt.py
-@@ -97,7 +97,7 @@
-     def get_status(self, eventtime):
-         return {"applied": self.applied}
- 
--    def _motor_off(self, print_time):
-+    def _motor_off(self):
-         self.reset()
- 
- 
-diff --git a/klippy/extras/z_tilt_ng.py b/klippy/extras/z_tilt_ng.py
-index 266c0b995c..e84b71ad50 100644
---- a/klippy/extras/z_tilt_ng.py
-+++ b/klippy/extras/z_tilt_ng.py
-@@ -122,7 +122,7 @@
-     def get_status(self, eventtime):
-         return {"applied": self.applied}
- 
--    def _motor_off(self, print_time):
-+    def _motor_off(self):
-         self.reset()
- 
- 
 diff --git a/klippy/kinematics/cartesian.py b/klippy/kinematics/cartesian.py
 index 9e5a8b3202..bc8922a88b 100644
 --- a/klippy/kinematics/cartesian.py
