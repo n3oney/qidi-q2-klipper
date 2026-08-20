@@ -30,14 +30,35 @@ jobs:
         run: mkdir -p build dist
 
       - parallel:
-          - name: Build Klipper
-            run: nix build .#klipper --out-link build/klipper --print-build-logs
+          - name: Build and publish Klipper
+            env:
+              GH_TOKEN: ${{ github.token }}
+            shell: bash
+            run: |
+              set -euo pipefail
+              nix build .#klipper --out-link build/klipper --print-build-logs
+              .github/scripts/publish-patched-source \
+                klipper build/klipper klipper
 
-          - name: Build Kalico bleeding-edge-v2
-            run: nix build .#kalico-bleeding-edge --out-link build/kalico-bleeding-edge --print-build-logs
+          - name: Build and publish Kalico bleeding-edge-v2
+            env:
+              GH_TOKEN: ${{ github.token }}
+            shell: bash
+            run: |
+              set -euo pipefail
+              nix build .#kalico-bleeding-edge --out-link build/kalico-bleeding-edge --print-build-logs
+              .github/scripts/publish-patched-source \
+                kalico-bleeding-edge build/kalico-bleeding-edge kalico-bleeding-edge
 
-          - name: Build Kalico main
-            run: nix build .#kalico-main --out-link build/kalico-main --print-build-logs
+          - name: Build and publish Kalico main
+            env:
+              GH_TOKEN: ${{ github.token }}
+            shell: bash
+            run: |
+              set -euo pipefail
+              nix build .#kalico-main --out-link build/kalico-main --print-build-logs
+              .github/scripts/publish-patched-source \
+                kalico-main build/kalico-main kalico-main
 
           - name: Build Katapult
             run: nix build .#katapult --out-link build/katapult --print-build-logs
@@ -47,6 +68,7 @@ jobs:
 
           - name: Build Q2 Linux kernel
             run: nix build .#q2-kernel --out-link build/q2-kernel --print-build-logs
+
 
       - name: Package release archives
         shell: bash
