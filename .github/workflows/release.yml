@@ -30,6 +30,16 @@ jobs:
         run: mkdir -p build dist
 
       - parallel:
+          - name: Build ant publish Happy-Hare
+            env:
+              GH_TOKEN: ${{ github.token }}
+            shell: bash
+            run: |
+              set -euo pipefail
+              nix build .#happy-hare --out-link build/happy-hare --print-build-logs
+              .github/scripts/publish-patched-source \
+                happy-hare build/happy-hare happy-hare
+          
           - name: Build and publish Klipper
             env:
               GH_TOKEN: ${{ github.token }}

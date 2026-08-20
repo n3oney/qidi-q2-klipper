@@ -1,5 +1,22 @@
 {
   "nodes": {
+    "happy-hare": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1786191837,
+        "narHash": "sha256-OrvvRAPgyyOSQcC6TwlctOKq75TUO5r6cYDg08UHh7I=",
+        "owner": "Wazzup77",
+        "repo": "Happy-Hare",
+        "rev": "5bf0cc47bf8d8bb887a0b95da07e7e263c242139",
+        "type": "github"
+      },
+      "original": {
+        "owner": "Wazzup77",
+        "ref": "bunnybox",
+        "repo": "Happy-Hare",
+        "type": "github"
+      }
+    },
     "kalico-bleeding-edge": {
       "flake": false,
       "locked": {
@@ -117,6 +134,7 @@
     },
     "root": {
       "inputs": {
+        "happy-hare": "happy-hare",
         "kalico-bleeding-edge": "kalico-bleeding-edge",
         "kalico-main": "kalico-main",
         "katapult": "katapult",

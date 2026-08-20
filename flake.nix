@@ -32,6 +32,11 @@
       url = "github:jwrdegoede/rtl8189ES_linux/rtl8189fs";
       flake = false;
     };
+
+    happy-hare = {
+      url = "github:Wazzup77/Happy-Hare/bunnybox";
+      flake = false;
+    };
   };
 
   nixConfig = {
@@ -49,7 +54,7 @@
     rockchip-uboot,
     rtl8189fs,
     ...
-  }: let
+  } @ inputs: let
     lib = nixpkgs.lib;
     forAllSystems = lib.genAttrs lib.systems.flakeExposed;
 
@@ -68,10 +73,14 @@
           src = katapult;
         };
 
-        q2Kernel = pkgs.callPackage ./nix/q2-kernel {
+        q2-kernel = pkgs.callPackage ./nix/q2-kernel {
           kernelSrc = rockchip-kernel;
           ubootSrc = rockchip-uboot;
           wifiSrc = rtl8189fs;
+        };
+
+        happy-hare = pkgs.callPackage ./nix/happy-hare {
+          src = inputs.happy-hare;
         };
       in {
         legacyPackages =
@@ -83,16 +92,16 @@
               katapult-deployer
               katapult-source
               ;
-            q2-kernel = q2Kernel;
+            inherit q2-kernel happy-hare;
           };
 
         packages =
           (lib.mapAttrs (_: scope: scope.full) klipperScopes)
           // {
             inherit (katapultScope) katapult-source;
+            inherit q2-kernel happy-hare;
             katapult = katapultScope.katapult.all;
             katapult-deployer = katapultScope.katapult-deployer.all;
-            q2-kernel = q2Kernel;
           };
       }
     );
