@@ -18,12 +18,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - input: kalico-main
-            packages: '.#kalico-main'
           - input: kalico-bleeding-edge
             packages: '.#kalico-bleeding-edge'
-          - input: klipper
-            packages: '.#klipper'
           - input: katapult
             packages: '.#katapult .#katapult-deployer'
 

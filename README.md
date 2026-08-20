@@ -66,7 +66,7 @@ sudo ~/mcu_update_BOX_to_v2.sh ~/qidi-q2-klipper/katapult-deployer/mmu-deployer.
 sudo ~/mcu_update_BOX_to_v2.sh ~/qidi-q2-klipper/katapult-deployer/mmu-deployer.bin '/dev/serial/by-id/usb-Klipper_stm32f401xc_*-if00'
 ```
 
-## Flashing Klipper or Kalico
+## Flashing Kalico
 
 1. On the printer:
 
@@ -75,27 +75,11 @@ mkdir -p ~/qidi-q2-klipper/klipper
 cd ~/qidi-q2-klipper
 ```
 
-2. Now, download one of:
-
-- Kalico `main`:
-
-```sh
-wget -O klipper.tar.gz \
-  'https://github.com/n3oney/qidi-q2-klipper/releases/latest/download/kalico-main.tar.gz'
-```
-
-- Kalico `bleeding-edge-v2`:
+2. Download Kalico `bleeding-edge-v2`:
 
 ```sh
 wget -O klipper.tar.gz \
   'https://github.com/n3oney/qidi-q2-klipper/releases/latest/download/kalico-bleeding-edge.tar.gz'
-```
-
-- Klipper `main`:
-
-```sh
-wget -O klipper.tar.gz \
-  'https://github.com/n3oney/qidi-q2-klipper/releases/latest/download/klipper.tar.gz'
 ```
 
 3. Unpack it:

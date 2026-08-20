@@ -45,16 +45,6 @@ jobs:
               .github/scripts/publish-patched-source \
                 happy-hare build/happy-hare happy-hare
           
-          - name: Build and publish Klipper
-            env:
-              GH_TOKEN: ${{ secrets.PUBLISH_TOKEN }}
-            shell: bash
-            run: |
-              set -euo pipefail
-              nix build .#klipper --out-link build/klipper --print-build-logs
-              .github/scripts/publish-patched-source \
-                klipper build/klipper klipper
-
           - name: Build and publish Kalico bleeding-edge-v2
             env:
               GH_TOKEN: ${{ secrets.PUBLISH_TOKEN }}
@@ -64,16 +54,6 @@ jobs:
               nix build .#kalico-bleeding-edge --out-link build/kalico-bleeding-edge --print-build-logs
               .github/scripts/publish-patched-source \
                 kalico-bleeding-edge build/kalico-bleeding-edge kalico-bleeding-edge
-
-          - name: Build and publish Kalico main
-            env:
-              GH_TOKEN: ${{ secrets.PUBLISH_TOKEN }}
-            shell: bash
-            run: |
-              set -euo pipefail
-              nix build .#kalico-main --out-link build/kalico-main --print-build-logs
-              .github/scripts/publish-patched-source \
-                kalico-main build/kalico-main kalico-main
 
           - name: Build Katapult
             run: nix build .#katapult --out-link build/katapult --print-build-logs
@@ -91,9 +71,7 @@ jobs:
           set -euo pipefail
 
           for name in \
-            klipper \
             kalico-bleeding-edge \
-            kalico-main \
             katapult \
             katapult-deployer \
             q2-kernel

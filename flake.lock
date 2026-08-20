@@ -34,22 +34,6 @@
         "type": "github"
       }
     },
-    "kalico-main": {
-      "flake": false,
-      "locked": {
-        "lastModified": 1785933192,
-        "narHash": "sha256-IGbzXTnKTKVrvxyjNDeuWMgEMtIVIQsNekFXaQDICNk=",
-        "owner": "KalicoCrew",
-        "repo": "kalico",
-        "rev": "ae261624f57fb597dcffaa46062b1c58d3e5999d",
-        "type": "github"
-      },
-      "original": {
-        "owner": "KalicoCrew",
-        "repo": "kalico",
-        "type": "github"
-      }
-    },
     "katapult": {
       "flake": false,
       "locked": {
@@ -63,22 +47,6 @@
       "original": {
         "owner": "Arksine",
         "repo": "Katapult",
-        "type": "github"
-      }
-    },
-    "klipper": {
-      "flake": false,
-      "locked": {
-        "lastModified": 1787876725,
-        "narHash": "sha256-thlhgqjbTxqK/o7KiOC9s4Kwsl2wFn+CCbheN8/I850=",
-        "owner": "klipper3d",
-        "repo": "klipper",
-        "rev": "f0892d82b0f1c1228454f09eb508eddde2250f4b",
-        "type": "github"
-      },
-      "original": {
-        "owner": "klipper3d",
-        "repo": "klipper",
         "type": "github"
       }
     },
@@ -136,9 +104,7 @@
       "inputs": {
         "happy-hare": "happy-hare",
         "kalico-bleeding-edge": "kalico-bleeding-edge",
-        "kalico-main": "kalico-main",
         "katapult": "katapult",
-        "klipper": "klipper",
         "nixpkgs": "nixpkgs",
         "rockchip-kernel": "rockchip-kernel",
         "rockchip-uboot": "rockchip-uboot",

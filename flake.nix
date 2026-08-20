@@ -2,16 +2,8 @@
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
 
-    kalico-main = {
-      url = "github:KalicoCrew/kalico";
-      flake = false;
-    };
     kalico-bleeding-edge = {
       url = "github:KalicoCrew/kalico/bleeding-edge-v2";
-      flake = false;
-    };
-    klipper = {
-      url = "github:klipper3d/klipper";
       flake = false;
     };
 
@@ -46,9 +38,7 @@
 
   outputs = {
     nixpkgs,
-    kalico-main,
     kalico-bleeding-edge,
-    klipper,
     katapult,
     rockchip-kernel,
     rockchip-uboot,
@@ -63,8 +53,7 @@
         pkgs = nixpkgs.legacyPackages.${system};
 
         klipperScopes = import ./nix/klipper {
-          inherit pkgs klipper;
-          kalicoMain = kalico-main;
+          inherit pkgs;
           kalicoBleedingEdge = kalico-bleeding-edge;
         };
 

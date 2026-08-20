@@ -1,8 +1,6 @@
 {
   pkgs,
   kalicoBleedingEdge,
-  kalicoMain,
-  klipper,
 }: let
   inherit (pkgs) applyPatches fetchpatch2 newScope runCommand;
   lib = pkgs.lib;
@@ -62,7 +60,7 @@
       }
     );
 
-  kalicoPatchesCommon = [
+  kalicoBleedingEdgePatches = [
     ./patches/0001-q2-gd32f425-usb.patch
     ./patches/0002-q2-cs1237.patch
 
@@ -93,85 +91,18 @@
     ./patches/0011-webhooks-msgspec-json.patch
     ./patches/0013-compat-ignore-namespace-packages.patch
     ./patches/0014-manual-home-probe-position.patch
-  ];
-
-  kalicoMainPatches =
-    kalicoPatchesCommon
-    ++ [
-      (fetchpatch2 {
-        url = "https://github.com/KalicoCrew/kalico/pull/932.diff";
-        hash = "sha256-QUVTW788TXh0wsW/wVeiIUyZNLPiQoERmJJvigLnV48=";
-      })
-
-      (fetchpatch2 {
-        url = "https://github.com/Klipper3d/klipper/commit/c49dbb5a879df16ebf3014ef0901eb9dd61e6225.patch";
-        hash = "sha256-xodhwjuTUHh7KNghpLwnxi4ff7M4Ms49W1OG2pIRbjg=";
-      })
-    ];
-
-  kalicoBePatches =
-    kalicoPatchesCommon
-    ++ [
-      # https://github.com/KalicoCrew/kalico/pull/932
-      ./patches/0012-motion-queuing-steppersync.patch
-      (fetchpatch2 {
-        url = "https://github.com/Klipper3d/klipper/commit/c49dbb5a879df16ebf3014ef0901eb9dd61e6225.patch";
-        hash = "sha256-xodhwjuTUHh7KNghpLwnxi4ff7M4Ms49W1OG2pIRbjg=";
-      })
-    ];
-
-  klipperPatches = [
+    # https://github.com/KalicoCrew/kalico/pull/932
+    ./patches/0012-motion-queuing-steppersync.patch
     (fetchpatch2 {
-      url = "https://github.com/MisterSheikh/Qidi_Q2_Mainline_Klipper/raw/d3f7f86db676e5fa9aad2fec2175927bc06beb2a/patches/klipper/0001-stm32-add-GD32F425-USB-workaround.patch";
-      hash = "sha256-lDHhrkxYHuBsYM/nDtyLrMuhhBMpsKl0YgjfwuRRKhA=";
-    })
-
-    (fetchpatch2 {
-      url = "https://github.com/MisterSheikh/Qidi_Q2_Mainline_Klipper/raw/d3f7f86db676e5fa9aad2fec2175927bc06beb2a/patches/klipper/0002-load_cell-add-CS1237-ADC-support.patch";
-      hash = "sha256-cV8WcTNa2Xf7WMdT3Iu8qJSg6EALIKG4H5QBBh8F8FQ=";
-    })
-
-    (fetchpatch2 {
-      url = "https://github.com/MisterSheikh/Qidi_Q2_Mainline_Klipper/raw/d3f7f86db676e5fa9aad2fec2175927bc06beb2a/patches/klipper/0003-mcu-extend-Q2-multi-MCU-trigger-synchronization-time.patch";
-      hash = "sha256-Zngp/pSsvSPCq5eaZbvSE5eUCBlfqNNqag8kZ9UmNa4=";
-    })
-
-    (fetchpatch2 {
-      url = "https://github.com/MisterSheikh/Qidi_Q2_Mainline_Klipper/raw/d3f7f86db676e5fa9aad2fec2175927bc06beb2a/patches/klipper/0004-stm32-add-Qidi-Q2-GD32F303-SPI2-mapping.patch";
-      hash = "sha256-5bQr4cedNkDQ1+H7lJakrobZ/maL0iSRe40JwGm1Aw0=";
-    })
-
-    (fetchpatch2 {
-      url = "https://github.com/MisterSheikh/Qidi_Q2_Mainline_Klipper/raw/d3f7f86db676e5fa9aad2fec2175927bc06beb2a/patches/klipper/0005-stm32-add-Q2-GD32F425-MCU-temperature-support.patch";
-      hash = "sha256-l5kBf+za5O0HPmWJrQKCH6HnI7UbSaYCQQirwTmUBV8=";
-    })
-
-    (fetchpatch2 {
-      url = "https://github.com/MisterSheikh/Qidi_Q2_Mainline_Klipper/raw/d3f7f86db676e5fa9aad2fec2175927bc06beb2a/patches/klipper/0006-stm32-add-Q2-GD32F303-120MHz-target.patch";
-      hash = "sha256-X3kZ4uZRW3dT/L8zil1rEyiRSX9O17Z7DopuxL7xkgw=";
-    })
-
-    (fetchpatch2 {
-      url = "https://github.com/MisterSheikh/Qidi_Q2_Mainline_Klipper/raw/d3f7f86db676e5fa9aad2fec2175927bc06beb2a/patches/klipper/0007-stm32-add-Q2-GD32F425-200MHz-support.patch";
-      hash = "sha256-cLSbYokF7Cnw17y0Xa3ScjT9N9hc2bydUnzAUjLcDcM=";
+      url = "https://github.com/Klipper3d/klipper/commit/c49dbb5a879df16ebf3014ef0901eb9dd61e6225.patch";
+      hash = "sha256-xodhwjuTUHh7KNghpLwnxi4ff7M4Ms49W1OG2pIRbjg=";
     })
   ];
+
 in {
-  kalico-main = mkScope {
-    src = kalicoMain;
-    name = "qidi-q2-kalico";
-    patches = kalicoMainPatches;
-  };
-
   kalico-bleeding-edge = mkScope {
     src = kalicoBleedingEdge;
     name = "qidi-q2-kalico-bleeding-edge-v2";
-    patches = kalicoBePatches;
-  };
-
-  klipper = mkScope {
-    src = klipper;
-    name = "qidi-q2-klipper";
-    patches = klipperPatches;
+    patches = kalicoBleedingEdgePatches;
   };
 }
