@@ -1,0 +1,12 @@
+diff --git a/klippy/extras/motion_queuing.py b/klippy/extras/motion_queuing.py
+--- a/klippy/extras/motion_queuing.py
++++ b/klippy/extras/motion_queuing.py
+@@ -22,7 +22,7 @@
+ SDS_CHECK_TIME = 0.001  # step+dir+step filter in stepcompress.c
+ 
+ DRIP_SEGMENT_TIME = 0.050
+-DRIP_TIME = 0.100
++DRIP_TIME = 0.300
+ 
+ 
+ class PrinterMotionQueuing:

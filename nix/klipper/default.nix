@@ -99,6 +99,7 @@
     })
     ./patches/0015-motion-queuing-disconnect-cleanup.patch
     ./patches/0016-toolhead-check-pause-yield.patch
+    ./patches/0017-motion-queuing-drip-headroom.patch
   ];
 
 in {
