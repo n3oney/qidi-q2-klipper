@@ -8,9 +8,14 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   release:
     runs-on: ubuntu-24.04-arm
+    environment: main
 
     steps:
       - name: Check out repository
@@ -32,7 +37,7 @@ jobs:
       - parallel:
           - name: Build and publish Happy-Hare
             env:
-              GH_TOKEN: ${{ github.token }}
+              GH_TOKEN: ${{ secrets.PUBLISH_TOKEN }}
             shell: bash
             run: |
               set -euo pipefail
@@ -42,7 +47,7 @@ jobs:
           
           - name: Build and publish Klipper
             env:
-              GH_TOKEN: ${{ github.token }}
+              GH_TOKEN: ${{ secrets.PUBLISH_TOKEN }}
             shell: bash
             run: |
               set -euo pipefail
@@ -52,7 +57,7 @@ jobs:
 
           - name: Build and publish Kalico bleeding-edge-v2
             env:
-              GH_TOKEN: ${{ github.token }}
+              GH_TOKEN: ${{ secrets.PUBLISH_TOKEN }}
             shell: bash
             run: |
               set -euo pipefail
@@ -62,7 +67,7 @@ jobs:
 
           - name: Build and publish Kalico main
             env:
-              GH_TOKEN: ${{ github.token }}
+              GH_TOKEN: ${{ secrets.PUBLISH_TOKEN }}
             shell: bash
             run: |
               set -euo pipefail

@@ -24,20 +24,56 @@ cleanup() {
 }
 trap cleanup EXIT
 
+git init --quiet "$publish_directory"
+git -C "$publish_directory" config user.name "github-actions[bot]"
+git -C "$publish_directory" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+git -C "$publish_directory" remote add origin \
+  "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+git -C "$publish_directory" remote add upstream \
+  "https://github.com/${source_owner}/${source_repo}.git"
+
+generated_tip=""
+remote_ref="$(
+  git -C "$publish_directory" ls-remote \
+    --heads origin "refs/heads/${target_branch}"
+)"
+if [[ -n "$remote_ref" ]]; then
+  git -C "$publish_directory" fetch --no-tags origin \
+    "refs/heads/${target_branch}"
+  generated_tip="$(git -C "$publish_directory" rev-parse FETCH_HEAD)"
+fi
+git -C "$publish_directory" fetch --no-tags upstream "$source_rev"
+
 cp -a "${tree_directory}/." "$publish_directory/"
 chmod -R u+w "$publish_directory"
 rm -rf "$publish_directory/.github/workflows"
 find "$publish_directory" -type f -name '*.orig' -delete
-
-git init --quiet "$publish_directory"
-git -C "$publish_directory" config user.name "github-actions[bot]"
-git -C "$publish_directory" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 git -C "$publish_directory" add --all --force
-git -C "$publish_directory" commit \
-  -m "apply patches" \
-  -m "Upstream: https://github.com/${source_owner}/${source_repo}/commit/${source_rev}"
+snapshot_tree="$(git -C "$publish_directory" write-tree)"
 
-git -C "$publish_directory" remote add origin \
-  "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-git -C "$publish_directory" push --force origin \
-  "HEAD:refs/heads/${target_branch}"
+if [[ -n "$generated_tip" ]] &&
+  [[ "$(git -C "$publish_directory" rev-parse "${generated_tip}^{tree}")" == "$snapshot_tree" ]] &&
+  git -C "$publish_directory" merge-base --is-ancestor "$source_rev" "$generated_tip"
+then
+  echo "No changes to publish on ${target_branch}"
+  exit 0
+fi
+
+parents=()
+if [[ -n "$generated_tip" ]]; then
+  parents+=(-p "$generated_tip")
+fi
+if [[ -z "$generated_tip" ]] ||
+  ! git -C "$publish_directory" merge-base --is-ancestor "$source_rev" "$generated_tip"
+then
+  parents+=(-p "$source_rev")
+fi
+
+snapshot_commit="$(
+  git -C "$publish_directory" commit-tree \
+    "$snapshot_tree" "${parents[@]}" \
+    -m "apply patches" \
+    -m "Upstream: https://github.com/${source_owner}/${source_repo}/commit/${source_rev}"
+)"
+git -C "$publish_directory" push origin \
+  "${snapshot_commit}:refs/heads/${target_branch}"
