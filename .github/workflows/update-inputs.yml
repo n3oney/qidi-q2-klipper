@@ -22,6 +22,8 @@ jobs:
             packages: '.#kalico-bleeding-edge'
           - input: katapult
             packages: '.#katapult .#katapult-deployer'
+          - input: happy-hare
+            packages: '.#happy-hare'
 
     concurrency:
       group: update-firmware-input-${{ matrix.input }}
