@@ -30,7 +30,7 @@ jobs:
         run: mkdir -p build dist
 
       - parallel:
-          - name: Build ant publish Happy-Hare
+          - name: Build and publish Happy-Hare
             env:
               GH_TOKEN: ${{ github.token }}
             shell: bash
