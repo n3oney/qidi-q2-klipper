@@ -98,6 +98,7 @@
       hash = "sha256-xodhwjuTUHh7KNghpLwnxi4ff7M4Ms49W1OG2pIRbjg=";
     })
     ./patches/0015-motion-queuing-disconnect-cleanup.patch
+    ./patches/0016-toolhead-check-pause-yield.patch
   ];
 
 in {
