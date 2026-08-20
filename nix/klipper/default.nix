@@ -89,6 +89,7 @@
 
     ./patches/0008-build-version-override.patch
     ./patches/0009-load-cell-reduce-status-allocations.patch
+    ./patches/0010-thr-uart-tx-buffer.patch
   ];
 
   klipperPatches = [
