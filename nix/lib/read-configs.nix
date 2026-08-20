@@ -1,5 +1,4 @@
-{lib}:
-configDir:
+{lib}: configDir:
 lib.mapAttrs' (configFile: _: {
   name = lib.removeSuffix ".config" configFile;
   value = configDir + "/${configFile}";
