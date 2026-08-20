@@ -96,11 +96,26 @@
   kalicoMainPatches =
     kalicoPatchesCommon
     ++ [
+      (fetchpatch2 {
+        url = "https://github.com/KalicoCrew/kalico/pull/932.diff";
+        hash = "sha256-QUVTW788TXh0wsW/wVeiIUyZNLPiQoERmJJvigLnV48=";
+      })
+
+      (fetchpatch2 {
+        url = "https://github.com/Klipper3d/klipper/commit/c49dbb5a879df16ebf3014ef0901eb9dd61e6225.patch";
+        hash = "sha256-xodhwjuTUHh7KNghpLwnxi4ff7M4Ms49W1OG2pIRbjg=";
+      })
     ];
 
   kalicoBePatches =
     kalicoPatchesCommon
     ++ [
+      # https://github.com/KalicoCrew/kalico/pull/932
+      ./patches/0012-motion-queuing-steppersync.patch
+      (fetchpatch2 {
+        url = "https://github.com/Klipper3d/klipper/commit/c49dbb5a879df16ebf3014ef0901eb9dd61e6225.patch";
+        hash = "sha256-xodhwjuTUHh7KNghpLwnxi4ff7M4Ms49W1OG2pIRbjg=";
+      })
     ];
 
   klipperPatches = [
