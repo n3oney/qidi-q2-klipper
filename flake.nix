@@ -34,7 +34,7 @@
     };
 
     happy-hare = {
-      url = "github:Wazzup77/Happy-Hare/bunnybox";
+      url = "github:moggieuk/Happy-Hare/main";
       flake = false;
     };
   };

@@ -5,5 +5,7 @@
 applyPatches {
   inherit src;
   name = "happy-hare";
-  patches = [./happy-hare-kalico-extruder.patch];
+  patches = [
+    ./happy-hare-kalico-extruder.patch
+  ];
 }

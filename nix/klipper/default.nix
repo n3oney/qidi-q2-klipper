@@ -91,6 +91,8 @@
     ./patches/0009-load-cell-reduce-status-allocations.patch
     ./patches/0010-thr-uart-tx-buffer.patch
     ./patches/0011-webhooks-msgspec-json.patch
+    ./patches/0013-compat-ignore-namespace-packages.patch
+    ./patches/0014-manual-home-probe-position.patch
   ];
 
   kalicoMainPatches =
