@@ -97,6 +97,7 @@
       url = "https://github.com/Klipper3d/klipper/commit/c49dbb5a879df16ebf3014ef0901eb9dd61e6225.patch";
       hash = "sha256-xodhwjuTUHh7KNghpLwnxi4ff7M4Ms49W1OG2pIRbjg=";
     })
+    ./patches/0015-motion-queuing-disconnect-cleanup.patch
   ];
 
 in {
