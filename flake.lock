@@ -84,16 +84,16 @@
     "rockchip-kernel": {
       "flake": false,
       "locked": {
-        "lastModified": 1766744593,
-        "narHash": "sha256-hhaNyBer/2dzWNZWxxExNbSoDptKtX1lSUQJGZjRjI0=",
+        "lastModified": 1782730555,
+        "narHash": "sha256-scwFaSX+ymkEBfViPsA+UV/ii1Z69SYJC421iwE4IFU=",
         "owner": "rockchip-linux",
         "repo": "kernel",
-        "rev": "b4ef083dc0c3608e744deabb43dc6b781aadbe6e",
+        "rev": "470f9dccbdc42e7b8a824d0a5c5640a10e9457d2",
         "type": "github"
       },
       "original": {
         "owner": "rockchip-linux",
-        "ref": "develop-6.1",
+        "ref": "develop-6.12",
         "repo": "kernel",
         "type": "github"
       }

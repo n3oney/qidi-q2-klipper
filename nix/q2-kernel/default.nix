@@ -22,7 +22,7 @@
 in
   stdenv.mkDerivation {
     pname = "qidi-q2-kernel";
-    version = "6.1.141";
+    version = "6.12.69";
     src = kernelSrc;
     patches = [
       ./0001-rockchip-fix-non-iommu-mmap.patch

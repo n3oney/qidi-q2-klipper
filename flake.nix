@@ -21,7 +21,7 @@
     };
 
     rockchip-kernel = {
-      url = "github:rockchip-linux/kernel/develop-6.1";
+      url = "github:rockchip-linux/kernel/develop-6.12";
       flake = false;
     };
     rockchip-uboot = {
