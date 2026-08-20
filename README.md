@@ -1,6 +1,10 @@
 # QIDI Q2 Klipper/Kalico builds
 
-Patched Klipper, Kalico and Katapult for the QIDI Q2.
+> [!CAUTION]
+> This repository is currently in an unstable, work in progress state.
+> Expect crashes.
+
+Patched Klipper, Kalico and Katapult builds, plus a Linux kernel for the QIDI Q2.
 
 > [!NOTE]
 > I personally use Kalico (bleeding edge), so that variant is the most "stable" here.
