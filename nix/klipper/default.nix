@@ -62,7 +62,7 @@
       }
     );
 
-  kalicoPatches = [
+  kalicoPatchesCommon = [
     ./patches/0001-q2-gd32f425-usb.patch
     ./patches/0002-q2-cs1237.patch
 
@@ -90,7 +90,18 @@
     ./patches/0008-build-version-override.patch
     ./patches/0009-load-cell-reduce-status-allocations.patch
     ./patches/0010-thr-uart-tx-buffer.patch
+    ./patches/0011-webhooks-msgspec-json.patch
   ];
+
+  kalicoMainPatches =
+    kalicoPatchesCommon
+    ++ [
+    ];
+
+  kalicoBePatches =
+    kalicoPatchesCommon
+    ++ [
+    ];
 
   klipperPatches = [
     (fetchpatch2 {
@@ -132,13 +143,13 @@ in {
   kalico-main = mkScope {
     src = kalicoMain;
     name = "qidi-q2-kalico";
-    patches = kalicoPatches;
+    patches = kalicoMainPatches;
   };
 
   kalico-bleeding-edge = mkScope {
     src = kalicoBleedingEdge;
     name = "qidi-q2-kalico-bleeding-edge-v2";
-    patches = kalicoPatches;
+    patches = kalicoBePatches;
   };
 
   klipper = mkScope {
