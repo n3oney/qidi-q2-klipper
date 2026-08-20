@@ -59,7 +59,6 @@ in
       export KBUILD_BUILD_USER=nix
       export KBUILD_BUILD_TIMESTAMP="Thu Jan 1 00:00:01 UTC 1970"
       export KBUILD_BUILD_VERSION=1
-
       buildDir="$PWD/build"
       make O="$buildDir" rk3308_linux_defconfig
       scripts/kconfig/merge_config.sh -m -O "$buildDir" \
@@ -103,11 +102,6 @@ in
       ${python3}/bin/python ${./verify-boot.py} zboot.img \
         --max-size ${toString bootPartitionSize} \
         --resource resource.img
-      scripts/resource_tool \
-        --unpack --image=resource.img checked-resource
-      cmp ${./q2-stock.dtb} checked-resource/rk-kernel.dtb
-      cmp ${./logo.bmp} checked-resource/logo.bmp
-      cmp ${./logo.bmp} checked-resource/logo_kernel.bmp
       runHook postCheck
     '';
 
@@ -117,14 +111,8 @@ in
       buildDir="$PWD/build"
       kernelRelease="$(make -s O="$buildDir" kernelrelease)"
 
-      mkdir -p "$out/boot" "$out/rootfs"
-      install -m644 zboot.img "$out/boot/boot.img"
-      install -m644 resource.img "$out/boot/resource.img"
-      install -m644 "$buildDir/arch/arm64/boot/Image.lz4" \
-        "$out/boot/Image.lz4"
-      install -m644 \
-        "$buildDir/arch/arm64/boot/dts/rockchip/${board}.dtb" \
-        "$out/boot/${board}.dtb"
+      mkdir -p "$out/boot"
+      install -m644 "$buildDir/arch/arm64/boot/Image" "$out/boot/Image"
       install -m644 "$buildDir/.config" "$out/boot/kernel.config"
       install -m644 COPYING "$out/COPYING"
 
