@@ -68,27 +68,34 @@
           wifiSrc = rtl8189fs;
         };
 
+        q2-kernel-qemu = pkgs.callPackage ./nix/q2-kernel {
+          kernelSrc = rockchip-kernel;
+          ubootSrc = rockchip-uboot;
+          wifiSrc = rtl8189fs;
+          forQemu = true;
+        };
+
         happy-hare = pkgs.callPackage ./nix/happy-hare {
           src = inputs.happy-hare;
         };
       in {
-        legacyPackages =
-          klipperScopes
-          // {
-            inherit
-              (katapultScope)
-              katapult
-              katapult-deployer
-              katapult-source
-              ;
-            inherit q2-kernel happy-hare;
-          };
+      legacyPackages =
+        klipperScopes
+        // {
+          inherit
+            (katapultScope)
+            katapult
+            katapult-deployer
+            katapult-source
+            ;
+          inherit q2-kernel q2-kernel-qemu happy-hare;
+        };
 
         packages =
           (lib.mapAttrs (_: scope: scope.full) klipperScopes)
           // {
             inherit (katapultScope) katapult-source;
-            inherit q2-kernel happy-hare;
+            inherit q2-kernel q2-kernel-qemu happy-hare;
             katapult = katapultScope.katapult.all;
             katapult-deployer = katapultScope.katapult-deployer.all;
           };
