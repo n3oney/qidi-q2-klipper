@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 3 ]]; then
+  echo "usage: $0 <flake-input> <source-directory> <target-branch>" >&2
+  exit 2
+fi
+
+input="$1"
+source_directory="$2"
+target_branch="$3"
+
+: "${GH_TOKEN:?GH_TOKEN must be set}"
+: "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY must be set}"
+: "${RUNNER_TEMP:?RUNNER_TEMP must be set}"
+
+source_owner="$(jq -er --arg input "$input" '.nodes[$input].locked.owner' flake.lock)"
+source_repo="$(jq -er --arg input "$input" '.nodes[$input].locked.repo' flake.lock)"
+source_rev="$(jq -er --arg input "$input" '.nodes[$input].locked.rev' flake.lock)"
+publish_directory="$(mktemp -d "$RUNNER_TEMP/publish-${target_branch}.XXXXXX")"
+cleanup() {
+  chmod -R u+w "$publish_directory" 2>/dev/null || true
+  rm -rf "$publish_directory"
+}
+trap cleanup EXIT
+
+cp -a "${source_directory}/." "$publish_directory/"
+chmod -R u+w "$publish_directory"
+rm -rf "$publish_directory/.github/workflows"
+find "$publish_directory" -type f -name '*.orig' -delete
+
+git init --quiet "$publish_directory"
+git -C "$publish_directory" config user.name "github-actions[bot]"
+git -C "$publish_directory" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+git -C "$publish_directory" add --all --force
+git -C "$publish_directory" commit \
+  -m "apply patches" \
+  -m "Upstream: https://github.com/${source_owner}/${source_repo}/commit/${source_rev}"
+
+git -C "$publish_directory" remote add origin \
+  "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+git -C "$publish_directory" push --force origin \
+  "HEAD:refs/heads/${target_branch}"

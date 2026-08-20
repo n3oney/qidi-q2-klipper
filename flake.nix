@@ -89,6 +89,9 @@
         packages =
           (lib.mapAttrs (_: scope: scope.full) klipperScopes)
           // {
+            kalico-main-source = klipperScopes.kalico-main.kalico;
+            kalico-bleeding-edge-source = klipperScopes.kalico-bleeding-edge.kalico;
+            klipper-source = klipperScopes.klipper.kalico;
             inherit (katapultScope) katapult-source;
             katapult = katapultScope.katapult.all;
             katapult-deployer = katapultScope.katapult-deployer.all;
