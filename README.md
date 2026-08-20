@@ -206,7 +206,7 @@ Keep `klipper` and `klipper-mcu` stopped until every converted MCU has its match
 ```sh
 test ! -e ~/klipper.pre-mainline &&
   mv ~/klipper ~/klipper.pre-mainline &&
-  mv ~/qidi-q2-klipper/klipper ~/klipper
+  git clone https://github.com/n3oney/qidi-q2-klipper --single-branch -b kalico-bleeding-edge klipper
 ```
 
 This command chain stops before changing `~/klipper` if the `~/klipper.pre-mainline` backup path already exists.
@@ -228,7 +228,7 @@ sudo systemctl start klipper klipper-mcu
 
 ### Config setup
 
-Refer to [MisterSheikh's guide](https://github.com/MisterSheikh/Qidi_Q2_Mainline_Klipper/blob/main/docs/config_changes.md) for required changes.
+Refer to [my config](https://github.com/n3oney/q2-config) for a full, functional example.
 
 ## License
 
