@@ -133,7 +133,9 @@ class PrinterStepperEnable:
     def motor_off(self):
         self.set_motors_enable(self.get_steppers(), False)
         toolhead = self.printer.lookup_object("toolhead")
-        self.printer.send_event("stepper_enable:motor_off")
+        self.printer.send_event(
+            "stepper_enable:motor_off", toolhead.get_last_move_time()
+        )
 
     def get_status(self, eventtime):
         steppers = {
