@@ -569,6 +569,26 @@ class MmuToolHead(toolhead.ToolHead, object):
         self.mmu_toolhead = self # Make it easier to read code and distinquish printer_toolhead from mmu_toolhead
         self.sync_mode = None
 
+    # Kalico bleeding-edge supports multiple steppers per PrinterExtruder.
+    @staticmethod
+    def _get_extruder_steppers(printer_extruder):
+        if hasattr(printer_extruder, 'get_extruder_steppers'):
+            return printer_extruder.get_extruder_steppers()
+        extruder_stepper = getattr(printer_extruder, 'extruder_stepper', None)
+        return [extruder_stepper] if extruder_stepper is not None else []
+
+    @staticmethod
+    def _link_extruder_stepper(printer_extruder, extruder_stepper):
+        if hasattr(printer_extruder, 'link_extruder_stepper'):
+            printer_extruder.link_extruder_stepper(extruder_stepper)
+        else:
+            printer_extruder.extruder_stepper = extruder_stepper
+
+    @staticmethod
+    def _unlink_extruder_stepper(printer_extruder, extruder_stepper):
+        if hasattr(printer_extruder, 'unlink_extruder_stepper'):
+            printer_extruder.unlink_extruder_stepper(extruder_stepper)
+
     def handle_connect(self):
         self.printer_toolhead = self.printer.lookup_object('toolhead')
 
@@ -579,10 +599,13 @@ class MmuToolHead(toolhead.ToolHead, object):
                 self.config.fileconfig.set('extruder', key, value)
 
             # Now we can switch in homing MmuExtruderStepper
-            printer_extruder.extruder_stepper = self.mmu_extruder_stepper
+            self._link_extruder_stepper(printer_extruder, self.mmu_extruder_stepper)
             self.mmu_extruder_stepper.stepper.set_trapq(printer_extruder.get_trapq())
         else:
-            self.mmu_extruder_stepper = printer_extruder.extruder_stepper
+            extruder_steppers = self._get_extruder_steppers(printer_extruder)
+            if not extruder_steppers:
+                raise self.printer.command_error("Printer extruder does not have a stepper")
+            self.mmu_extruder_stepper = extruder_steppers[0]
 
     # Ensure the correct number of axes for convenience - MMU only has two
     # Also, handle case when gear rail is synced to extruder
@@ -649,6 +672,9 @@ class MmuToolHead(toolhead.ToolHead, object):
     def _register(self, toolhead, stepper, trapq=None):
         trapq = trapq or toolhead.get_trapq()
         stepper.set_trapq(trapq) # Restore movement
+        if toolhead is self.printer_toolhead and stepper is self.mmu_extruder_stepper.stepper:
+            printer_extruder = self.printer_toolhead.get_extruder()
+            self._link_extruder_stepper(printer_extruder, self.mmu_extruder_stepper)
         if not self.motion_queuing:
             # klipper 0.13.0 <= 195 we also register step generators from mmu_toolhead
             if stepper.generate_steps not in self.mmu_toolhead.step_generators:
@@ -660,6 +686,9 @@ class MmuToolHead(toolhead.ToolHead, object):
     # Unregister stepper step generator with desired toolhead and remove from trapq
     def _unregister(self, toolhead, stepper):
         stepper.set_trapq(None) # Cripple movement
+        if toolhead is self.printer_toolhead and stepper is self.mmu_extruder_stepper.stepper:
+            printer_extruder = self.printer_toolhead.get_extruder()
+            self._unlink_extruder_stepper(printer_extruder, self.mmu_extruder_stepper)
         if not self.motion_queuing:
             # klipper 0.13.0 <= 195 we also unregister step generators from mmu_toolhead
             if stepper.generate_steps in self.mmu_toolhead.step_generators:
@@ -772,7 +801,7 @@ class MmuToolHead(toolhead.ToolHead, object):
             if self.sync_mode in [self.EXTRUDER_SYNCED_TO_GEAR, self.EXTRUDER_ONLY_ON_GEAR]:
                 driving_toolhead   = self.mmu_toolhead        # OLD owner (mmu/gear)
                 following_toolhead = self.printer_toolhead    # NEW owner (printer/extruder)
-                following_steppers = [following_toolhead.get_extruder().extruder_stepper.stepper]
+                following_steppers = [self.mmu_extruder_stepper.stepper]
                 old_trapq = driving_toolhead.get_trapq()      # trapq we’re finalizing
                 new_trapq = self._prev_trapq                  # trapq saved during sync()
                 pos = [following_toolhead.get_position()[3], 0., 0.]
@@ -847,7 +876,7 @@ class MmuToolHead(toolhead.ToolHead, object):
         if new_sync_mode in [self.EXTRUDER_SYNCED_TO_GEAR, self.EXTRUDER_ONLY_ON_GEAR]:
             driving_toolhead   = self.mmu_toolhead       # NEW owner (mmu/gear)
             following_toolhead = self.printer_toolhead   # OLD owner (printer/extruder)
-            following_steppers = [following_toolhead.get_extruder().extruder_stepper.stepper]
+            following_steppers = [self.mmu_extruder_stepper.stepper]
             self._prev_trapq = following_steppers[0].get_trapq() # Save the *old* trapq **before** any rebind/unregister
             driving_trapq = driving_toolhead.get_trapq()
             s_alloc = ffi_lib.cartesian_stepper_alloc(b"y")
@@ -1004,7 +1033,7 @@ class MmuToolHead(toolhead.ToolHead, object):
                 if self.is_extruder_synced_to_gear():
                     msg += "SYNCHRONIZED: Extruder '%s' synced to gear rail\n" % extruder_name
 
-        e_stepper = self.printer_toolhead.get_extruder().extruder_stepper
+        e_stepper = self.mmu_extruder_stepper
         msg +=  "\nPRINTER TOOLHEAD: %s Last move time: %s\n" % (self.printer_toolhead.get_position(), self.printer_toolhead.get_last_move_time())
         header = "Extruder Stepper: %s %s %s" % (extruder_name, "(MmuExtruderStepper)" if isinstance(e_stepper, MmuExtruderStepper) else "(Non Homing Default)", '-' * 100)
         msg += header[:100] + "\n"
@@ -1325,6 +1354,8 @@ class MmuExtruderStepper(ExtruderStepper, object):
 
     # Override to add QUIET option to control console logging
     def cmd_SET_PRESSURE_ADVANCE(self, gcmd):
+        if hasattr(self, 'pa_model'):
+            return super(MmuExtruderStepper, self).cmd_SET_PRESSURE_ADVANCE(gcmd)
         pressure_advance = gcmd.get_float('ADVANCE', self.pressure_advance, minval=0.)
         smooth_time = gcmd.get_float('SMOOTH_TIME', self.pressure_advance_smooth_time, minval=0., maxval=.200)
         self._set_pressure_advance(pressure_advance, smooth_time)
