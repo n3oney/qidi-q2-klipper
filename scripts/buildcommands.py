@@ -594,6 +594,9 @@ def git_version():
 
 
 def build_version(extra, cleanbuild):
+    version = os.environ.get("KALICO_BUILD_VERSION")
+    if version:
+        return version + extra
     version = git_version()
     if not version:
         cleanbuild = False

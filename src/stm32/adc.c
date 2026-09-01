@@ -14,6 +14,9 @@
 #include "sched.h" // sched_shutdown
 
 DECL_CONSTANT("ADC_MAX", 4095);
+#if CONFIG_MACH_GD32F425_Q2
+DECL_CONSTANT_STR("MCU_TEMPERATURE_TYPE", "gd32f425");
+#endif
 
 #define ADC_TEMPERATURE_PIN 0xfe
 DECL_ENUMERATION("pin", "ADC_TEMPERATURE", ADC_TEMPERATURE_PIN);
@@ -58,7 +61,12 @@ adc_calibrate(ADC_TypeDef *adc)
 {
 #if CONFIG_MACH_STM32F1
     adc->CR2 = ADC_CR2_ADON;
+#if CONFIG_MACH_GD32F303_Q2
+    // GD32F30x erratum: wait 1ms after enabling ADC before calibration.
+    udelay(1000);
+#else
     udelay(10);
+#endif
     adc->CR2 = ADC_CR2_ADON | ADC_CR2_RSTCAL;
     while (adc->CR2 & ADC_CR2_RSTCAL)
         ;
@@ -108,6 +116,11 @@ gpio_adc_setup(uint32_t pin)
     }
 
     if (pin == ADC_TEMPERATURE_PIN) {
+#if CONFIG_MACH_GD32F425_Q2
+        // GD32F425 specifies at least 17.1us for temperature sampling.
+        adc->SMPR1 = ((adc->SMPR1 & ~ADC_SMPR1_SMP16_Msk)
+                      | (7 << ADC_SMPR1_SMP16_Pos));
+#endif
 #if CONFIG_MACH_STM32F401 || CONFIG_MACH_STM32F411
         ADC1_COMMON->CCR = ADC_CCR_TSVREFE;
 #elif !CONFIG_MACH_STM32F1
@@ -148,6 +161,10 @@ uint16_t
 gpio_adc_read(struct gpio_adc g)
 {
     ADC_TypeDef *adc = g.adc;
+#if CONFIG_MACH_GD32F303_Q2
+    // GD32F30x erratum: defer the data read by at least two ADC clocks.
+    udelay(1);
+#endif
     adc->SR = ~ADC_SR_STRT;
     return adc->DR;
 }
