@@ -6,7 +6,6 @@
 import collections
 import errno
 import grp
-import json
 import logging
 import os
 import pwd
@@ -18,28 +17,44 @@ import numpy
 from . import APP_NAME, gcode
 from .extras.danger_options import get_danger_options
 
+try:
+    import msgspec
+except ImportError:
+    import json
+
+    # Json decodes strings as unicode types in Python 2.x.  This doesn't
+    # play well with some parts of Klipper (particularly displays), so we
+    # need to create an object hook. This solution borrowed from:
+    #
+    # https://stackoverflow.com/questions/956867/
+    #
+    json_loads_byteify = None
+    if sys.version_info.major < 3:
+
+        def json_loads_byteify(data, ignore_dicts=False):
+            if isinstance(data, bytes):
+                return data.decode("utf-8")
+            if isinstance(data, list):
+                return [json_loads_byteify(i, True) for i in data]
+            if isinstance(data, dict) and not ignore_dicts:
+                return {
+                    json_loads_byteify(k, True): json_loads_byteify(v, True)
+                    for k, v in data.items()
+                }
+            return data
+
+    def json_dumps(obj, enc_hook=None):
+        return json.dumps(
+            obj, separators=(",", ":"), default=enc_hook
+        ).encode()
+
+    def json_loads(data):
+        return json.loads(data, object_hook=json_loads_byteify)
+else:
+    json_dumps = msgspec.json.encode
+    json_loads = msgspec.json.decode
+
 REQUEST_LOG_SIZE = 20
-
-# Json decodes strings as unicode types in Python 2.x.  This doesn't
-# play well with some parts of Klipper (particuarly displays), so we
-# need to create an object hook. This solution borrowed from:
-#
-# https://stackoverflow.com/questions/956867/
-#
-json_loads_byteify = None
-if sys.version_info.major < 3:
-
-    def json_loads_byteify(data, ignore_dicts=False):
-        if isinstance(data, bytes):
-            return data.decode("utf-8")
-        if isinstance(data, list):
-            return [json_loads_byteify(i, True) for i in data]
-        if isinstance(data, dict) and not ignore_dicts:
-            return {
-                json_loads_byteify(k, True): json_loads_byteify(v, True)
-                for k, v in data.items()
-            }
-        return data
 
 
 class WebRequestError(gcode.CommandError):
@@ -62,7 +77,7 @@ class WebRequest:
 
     def __init__(self, client_conn, request):
         self.client_conn = client_conn
-        base_request = json.loads(request, object_hook=json_loads_byteify)
+        base_request = json_loads(request)
         if not isinstance(base_request, dict):
             raise ValueError("Not a top-level dictionary")
         self.id = base_request.get("id", None)
@@ -337,10 +352,8 @@ class ClientConnection:
 
     def send(self, data):
         try:
-            jmsg = json.dumps(
-                data, separators=(",", ":"), default=self._json_convert
-            )
-            self.send_buffer += jmsg.encode() + b"\x03"
+            jmsg = json_dumps(data, enc_hook=self._json_convert)
+            self.send_buffer += jmsg + b"\x03"
         except (TypeError, ValueError) as e:
             msg = "json encoding error: %s\ndata: %s" % (
                 str(e),

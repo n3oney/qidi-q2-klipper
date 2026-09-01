@@ -18,6 +18,8 @@ markupsafe==2.1.5
     # via
     #   jinja2
     #   kalico
+msgspec==0.19.0
+    # via kalico
 numpy==2.0.2 ; python_full_version < '3.10'
     # via kalico
 numpy==2.2.2 ; python_full_version >= '3.10' and python_full_version < '3.14'
