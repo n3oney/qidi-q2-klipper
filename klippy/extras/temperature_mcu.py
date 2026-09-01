@@ -65,9 +65,13 @@ class PrinterTemperatureMCU:
         mcu = self.mcu_adc.get_mcu()
         self.debug_read_cmd = mcu.lookup_query_command(
             "debug_read order=%c addr=%u", "debug_result val=%u")
-        self.mcu_type = mcu.get_constants().get("MCU", "")
+        constants = mcu.get_constants()
+        self.mcu_type = constants.get("MCU", "")
+        self.temp_sensor_type = constants.get("MCU_TEMPERATURE_TYPE",
+                                              self.mcu_type)
         # Run MCU specific configuration
         cfg_funcs = [
+            ('gd32f425', self.config_gd32f425),
             ('rp2', self.config_rp2040),
             ('sam3', self.config_sam3), ('sam4', self.config_sam4),
             ('same70', self.config_same70), ('samd21', self.config_samd21),
@@ -84,7 +88,7 @@ class PrinterTemperatureMCU:
             ('stm32h7', self.config_stm32h7),
             ('', self.config_unknown)]
         for name, func in cfg_funcs:
-            if self.mcu_type.startswith(name):
+            if self.temp_sensor_type.startswith(name):
                 func()
                 break
         logging.info("mcu_temperature '%s' nominal base=%.6f slope=%.6f",
@@ -104,7 +108,10 @@ class PrinterTemperatureMCU:
                                            min_adc, max_adc)
     def config_unknown(self):
         raise self.printer.config_error("MCU temperature not supported on %s"
-                                        % (self.mcu_type,))
+                                        % (self.temp_sensor_type,))
+    def config_gd32f425(self):
+        self.slope = 3.3 / -.004400
+        self.base_temperature = self.calc_base(25., 1.4 / 3.3)
     def config_rp2040(self):
         self.slope = 3.3 / -0.001721
         self.base_temperature = self.calc_base(27., 0.706 / 3.3)

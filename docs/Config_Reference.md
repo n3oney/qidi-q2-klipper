@@ -5217,6 +5217,29 @@ dout_pin:
 #   in software.
 ```
 
+#### CS1237
+The CS1237 is a 24-bit ADC with software-selectable gain and sample rate. It is
+suitable for load-cell probing.
+```
+[load_cell]
+sensor_type: cs1237
+sclk_pin:
+#   The pin connected to the CS1237 clock line. This parameter must be
+#   provided.
+dout_pin:
+#   The bidirectional pin connected to the CS1237 data line. This parameter
+#   must be provided.
+#sample_rate: 1280
+#   Valid sample rates are 10, 40, 640, and 1280 samples per second. The
+#   default is 1280.
+#gain: 128
+#   Valid gain values are 1, 2, 64, and 128. The default is 128.
+#channel: A
+#   Valid channels are A, temperature, and short. The default is A.
+#refout_off: False
+#   Disable the CS1237 reference output when True. The default is False.
+```
+
 #### ADS1220
 The ADS1220 is a 24 bit ADC supporting up to a 2Khz sample rate configurable in
 software.

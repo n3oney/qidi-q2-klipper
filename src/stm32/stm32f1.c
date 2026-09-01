@@ -19,6 +19,105 @@
 
 #define FREQ_PERIPH (CONFIG_CLOCK_FREQ / 2)
 
+#if CONFIG_MACH_GD32F303_Q2
+#if CONFIG_CLOCK_REF_FREQ != 8000000
+#error The Qidi Q2 GD32F303 target requires an 8 MHz crystal
+#endif
+
+// GD32F303 extensions to the STM32F1-compatible clock and power registers.
+#define GD32_RCC_CFGR_PLLMF_4 (1U << 27)
+#define GD32_RCC_CFGR_PLL_MUL30 \
+    (GD32_RCC_CFGR_PLLMF_4 | (13U << RCC_CFGR_PLLMULL_Pos))
+#define GD32_RCC_CFG1 (*(volatile uint32_t *)(RCC_BASE + 0x2cU))
+#define GD32_PWR_CR_LDOVS_MASK (3U << 14)
+#define GD32_PWR_CR_LDOVS_HIGH (3U << 14)
+#define GD32_PWR_CR_HDEN (1U << 16)
+#define GD32_PWR_CR_HDS (1U << 17)
+#define GD32_PWR_CSR_HDRF (1U << 16)
+#define GD32_PWR_CSR_HDSRF (1U << 17)
+
+static void
+gd32f303_clock_delay(void)
+{
+    for (volatile uint32_t i = 0; i < 0x50; i++)
+        ;
+}
+
+// Safely leave a PLL clock configured by Katapult before reconfiguring it.
+static void
+gd32f303_clock_reset(void)
+{
+    RCC->CR |= RCC_CR_HSION;
+    while (!(RCC->CR & RCC_CR_HSIRDY))
+        ;
+
+    if ((RCC->CFGR & RCC_CFGR_SWS_Msk) == RCC_CFGR_SWS_PLL) {
+        static const uint32_t ahb_divs[] = {
+            RCC_CFGR_HPRE_DIV2, RCC_CFGR_HPRE_DIV4,
+            RCC_CFGR_HPRE_DIV8, RCC_CFGR_HPRE_DIV16
+        };
+        for (uint32_t i = 0; i < sizeof(ahb_divs) / sizeof(ahb_divs[0]); i++) {
+            uint32_t cfgr = RCC->CFGR & ~RCC_CFGR_HPRE_Msk;
+            RCC->CFGR = cfgr | ahb_divs[i];
+            gd32f303_clock_delay();
+        }
+    }
+
+    RCC->CFGR = (RCC->CFGR & ~RCC_CFGR_SW_Msk) | RCC_CFGR_SW_HSI;
+    while ((RCC->CFGR & RCC_CFGR_SWS_Msk) != RCC_CFGR_SWS_HSI)
+        ;
+
+    RCC->CR &= ~(RCC_CR_PLLON | RCC_CR_CSSON | RCC_CR_HSEON);
+    while (RCC->CR & RCC_CR_PLLRDY)
+        ;
+    RCC->CR &= ~RCC_CR_HSEBYP;
+    RCC->CIR = 0x009f0000U;
+    RCC->CFGR = 0;
+    GD32_RCC_CFG1 = 0;
+}
+
+static void
+gd32f303_clock_setup(void)
+{
+    // Enable the external 8 MHz crystal.
+    RCC->CR |= RCC_CR_HSEON;
+    while (!(RCC->CR & RCC_CR_HSERDY))
+        ;
+
+    // Select the high LDO voltage before enabling the 120 MHz PLL.
+    RCC->APB1ENR |= RCC_APB1ENR_PWREN;
+    PWR->CR = ((PWR->CR & ~GD32_PWR_CR_LDOVS_MASK)
+               | GD32_PWR_CR_LDOVS_HIGH);
+
+    // AHB=120 MHz, APB1=60 MHz, APB2=60 MHz, ADC=7.5 MHz.
+    uint32_t cfgr = (RCC_CFGR_PPRE1_DIV2 | RCC_CFGR_PPRE2_DIV2
+                     | RCC_CFGR_ADCPRE_DIV8 | RCC_CFGR_PLLSRC
+                     | RCC_CFGR_PLLXTPRE_HSE_DIV2
+                     | GD32_RCC_CFGR_PLL_MUL30);
+    RCC->CFGR = cfgr;
+
+    // GD32F303 code flash supports zero-wait-state access at 120 MHz.
+    FLASH->ACR = 0;
+
+    RCC->CR |= RCC_CR_PLLON;
+    while (!(RCC->CR & RCC_CR_PLLRDY))
+        ;
+
+    // Enable and select high-drive mode before switching SYSCLK to the PLL.
+    PWR->CR |= GD32_PWR_CR_HDEN;
+    while (!(PWR->CSR & GD32_PWR_CSR_HDRF))
+        ;
+    PWR->CR |= GD32_PWR_CR_HDS;
+    while (!(PWR->CSR & GD32_PWR_CSR_HDSRF))
+        ;
+
+    RCC->CFGR = cfgr | RCC_CFGR_SW_PLL;
+    while ((RCC->CFGR & RCC_CFGR_SWS_Msk) != RCC_CFGR_SWS_PLL)
+        ;
+    SystemCoreClock = CONFIG_CLOCK_FREQ;
+}
+#endif
+
 // Map a peripheral address to its enable bits
 struct cline
 lookup_clock_line(uint32_t periph_base)
@@ -57,6 +156,9 @@ gpio_clock_enable(GPIO_TypeDef *regs)
 static void
 clock_setup(void)
 {
+#if CONFIG_MACH_GD32F303_Q2
+    gd32f303_clock_setup();
+#else
     // Configure and enable PLL
     uint32_t cfgr;
     if (!CONFIG_STM32_CLOCK_REF_INTERNAL) {
@@ -90,6 +192,7 @@ clock_setup(void)
     RCC->CFGR = cfgr | RCC_CFGR_SW_PLL;
     while ((RCC->CFGR & RCC_CFGR_SWS_Msk) != RCC_CFGR_SWS_PLL)
         ;
+#endif
 }
 
 
@@ -263,7 +366,11 @@ void
 armcm_main(void)
 {
     // Run SystemInit() and then restore VTOR
+#if CONFIG_MACH_GD32F303_Q2
+    gd32f303_clock_reset();
+#else
     SystemInit();
+#endif
     SCB->VTOR = (uint32_t)VectorTable;
 
     // Reset peripheral clocks (for some bootloaders that don't)
