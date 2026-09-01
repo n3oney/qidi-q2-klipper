@@ -532,7 +532,7 @@ add_move(struct stepcompress *sc, uint64_t first_clock
     qm->min_clock = qm->req_clock = sc->last_step_clock;
     if (move->count == 1 && first_clock >= sc->last_step_clock + CLOCK_DIFF_MAX)
         qm->req_clock = first_clock;
-    list_add_tail(&qm->node, &sc->msg_queue);
+    list_add_tail(&qm->node, sc->msg_queue);
     sc->last_step_clock = last_clock;
     sc->next_expected_interval = move->next_step_interval;
 
@@ -594,14 +594,13 @@ queue_flush_far_hp(struct stepcompress *sc, uint64_t abs_step_clock)
 }
 
 // Allocate a new 'stepcompress' object
-struct stepcompress * __visible
-stepcompress_hp_alloc(uint32_t oid)
+struct stepcompress *
+stepcompress_hp_alloc(struct list_head *msg_queue)
 {
     struct stepcompress *sc = malloc(sizeof(*sc));
     memset(sc, 0, sizeof(*sc));
-    list_init(&sc->msg_queue);
     list_init(&sc->history_list);
-    sc->oid = oid;
+    sc->msg_queue = msg_queue;
     sc->sdir = -1;
     sc->queue_flush = queue_flush_hp;
     sc->queue_flush_far = queue_flush_far_hp;

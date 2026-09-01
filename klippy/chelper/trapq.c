@@ -49,6 +49,7 @@ trapq_alloc(void)
     list_init(&tq->moves);
     list_init(&tq->history);
     struct move *head_sentinel = move_alloc(), *tail_sentinel = move_alloc();
+    head_sentinel->print_time = -1.0;
     tail_sentinel->print_time = tail_sentinel->move_t = NEVER_TIME;
     list_add_head(&head_sentinel->node, &tq->moves);
     list_add_tail(&tail_sentinel->node, &tq->moves);
@@ -103,7 +104,7 @@ trapq_add_move(struct trapq *tq, struct move *m)
         // Add a null move to fill time gap
         struct move *null_move = move_alloc();
         null_move->start_pos = m->start_pos;
-        if (!prev->print_time && m->print_time > MAX_NULL_MOVE)
+        if (prev->print_time <= 0. && m->print_time > MAX_NULL_MOVE)
             // Limit the first null move to improve numerical stability
             null_move->print_time = m->print_time - MAX_NULL_MOVE;
         else

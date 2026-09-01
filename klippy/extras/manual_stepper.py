@@ -3,7 +3,7 @@
 # Copyright (C) 2019-2021  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-from klippy import chelper, stepper
+from klippy import stepper
 
 from . import force_move
 
@@ -26,11 +26,11 @@ class ManualStepper:
             "accel", 0.0, minval=0.0
         )
         self.next_cmd_time = 0.0
+        self.commanded_pos = 0.0
         # Setup iterative solver
-        ffi_main, ffi_lib = chelper.get_ffi()
-        self.trapq = ffi_main.gc(ffi_lib.trapq_alloc(), ffi_lib.trapq_free)
-        self.trapq_append = ffi_lib.trapq_append
-        self.trapq_finalize_moves = ffi_lib.trapq_finalize_moves
+        self.motion_queuing = self.printer.load_object(config, "motion_queuing")
+        self.trapq = self.motion_queuing.allocate_trapq()
+        self.trapq_append = self.motion_queuing.lookup_trapq_append()
         self.rail.setup_itersolve("cartesian_stepper_alloc", b"x")
         self.rail.set_trapq(self.trapq)
         # Register commands
@@ -53,24 +53,19 @@ class ManualStepper:
             self.next_cmd_time = print_time
 
     def do_enable(self, enable):
-        self.sync_print_time()
+        stepper_names = [s.get_name() for s in self.steppers]
         stepper_enable = self.printer.lookup_object("stepper_enable")
-        if enable:
-            for s in self.steppers:
-                se = stepper_enable.lookup_enable(s.get_name())
-                se.motor_enable(self.next_cmd_time)
-        else:
-            for s in self.steppers:
-                se = stepper_enable.lookup_enable(s.get_name())
-                se.motor_disable(self.next_cmd_time)
-        self.sync_print_time()
+        stepper_enable.set_motors_enable(stepper_names, enable)
 
     def do_set_position(self, setpos):
-        self.rail.set_position([setpos, 0.0, 0.0])
+        toolhead = self.printer.lookup_object("toolhead")
+        toolhead.flush_step_generation()
+        self.commanded_pos = setpos
+        self.rail.set_position([self.commanded_pos, 0.0, 0.0])
 
     def do_move(self, movepos, speed, accel, sync=True):
         self.sync_print_time()
-        cp = self.rail.get_commanded_position()
+        cp = self.commanded_pos
         dist = movepos - cp
         axis_r, accel_t, cruise_t, cruise_v = force_move.calc_move_time(
             dist, speed, accel
@@ -91,15 +86,9 @@ class ManualStepper:
             cruise_v,
             accel,
         )
+        self.commanded_pos = movepos
         self.next_cmd_time = self.next_cmd_time + accel_t + cruise_t + accel_t
-        self.rail.generate_steps(self.next_cmd_time)
-        self.trapq_finalize_moves(
-            self.trapq,
-            self.next_cmd_time + 99999.9,
-            self.next_cmd_time + 99999.9,
-        )
-        toolhead = self.printer.lookup_object("toolhead")
-        toolhead.note_mcu_movequeue_activity(self.next_cmd_time)
+        self.motion_queuing.note_mcu_movequeue_activity(self.next_cmd_time)
         if sync:
             self.sync_print_time()
 
@@ -140,12 +129,15 @@ class ManualStepper:
         elif gcmd.get_int("SYNC", 0):
             self.sync_print_time()
 
+
+
     # Toolhead wrappers to support homing
     def flush_step_generation(self):
-        self.sync_print_time()
+        toolhead = self.printer.lookup_object("toolhead")
+        toolhead.flush_step_generation()
 
     def get_position(self):
-        return [self.rail.get_commanded_position(), 0.0, 0.0, 0.0]
+        return [self.commanded_pos, 0.0, 0.0, 0.0]
 
     def set_position(self, newpos, homing_axes=()):
         self.do_set_position(newpos[0])

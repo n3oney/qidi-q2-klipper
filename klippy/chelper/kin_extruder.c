@@ -12,6 +12,7 @@
 #include "itersolve.h" // struct stepper_kinematics
 #include "integrate.h" // struct smoother
 #include "kin_shaper.h" // struct shaper_pulses
+#include "list.h" // list_node
 #include "pyhelper.h" // errorf
 #include "trapq.h" // move_get_distance
 
@@ -141,13 +142,18 @@ struct pressure_advance_params {
 typedef double (*pressure_advance_func)(
         double, double, struct pressure_advance_params *pa_params);
 
+struct pa_params {
+    struct pressure_advance_params params;
+    pressure_advance_func func;
+    double time_offset, active_print_time;
+    struct list_node node;
+};
+
 struct extruder_stepper {
     struct stepper_kinematics sk;
     struct shaper_pulses sp[3];
     struct smoother sm[3];
-    struct pressure_advance_params pa_params;
-    pressure_advance_func pa_func;
-    double time_offset;
+    struct list_head pa_list;
 };
 
 double __visible
@@ -181,12 +187,24 @@ pressure_advance_recipr_model_func(double position, double pa_velocity
     return position;
 }
 
+static struct pa_params *
+extruder_lookup_pa(struct extruder_stepper *es, double print_time)
+{
+    struct pa_params *pa = list_last_entry(
+        &es->pa_list, struct pa_params, node);
+    while (unlikely(pa->active_print_time > print_time)
+           && !list_is_first(&pa->node, &es->pa_list))
+        pa = list_prev_entry(pa, node);
+    return pa;
+}
+
 static double
 extruder_calc_position(struct stepper_kinematics *sk, struct move *m
                        , double move_time)
 {
     struct extruder_stepper *es = container_of(sk, struct extruder_stepper, sk);
-    move_time += es->time_offset;
+    struct pa_params *pa = extruder_lookup_pa(es, m->print_time);
+    move_time += pa->time_offset;
     while (unlikely(move_time < 0.)) {
         m = list_prev_entry(m, node);
         move_time += m->move_t;
@@ -208,20 +226,17 @@ extruder_calc_position(struct stepper_kinematics *sk, struct move *m
             : m->start_pos.axis[i] + m->axes_r.axis[i] * move_dist;
         if (!sm->hst) {
             pa_vel.axis[i] = 0.;
+        } else if (num_pulses) {
+            shaper_pa_range_integrate(m, axis, move_time, sp, sm,
+                                      &pa_vel.axis[i]);
         } else {
-            if (num_pulses) {
-                shaper_pa_range_integrate(m, axis, move_time, sp, sm,
-                                          &pa_vel.axis[i]);
-            } else {
-                pa_range_integrate(m, axis, move_time, sm,
-                                   &pa_vel.axis[i]);
-            }
+            pa_range_integrate(m, axis, move_time, sm, &pa_vel.axis[i]);
         }
     }
     double position = e_pos.x + e_pos.y + e_pos.z;
     double pa_velocity = pa_vel.x + pa_vel.y + pa_vel.z;
     if (pa_velocity > 0.)
-        return es->pa_func(position, pa_velocity, &es->pa_params);
+        return pa->func(position, pa_velocity, &pa->params);
     return position;
 }
 
@@ -233,9 +248,11 @@ extruder_note_generation_time(struct extruder_stepper *es)
     for (i = 0; i < 3; ++i) {
         struct shaper_pulses* sp = &es->sp[i];
         const struct smoother* sm = &es->sm[i];
-        double pre_active_axis = sm->hst + sm->t_offs + es->time_offset +
+        double time_offset = list_last_entry(
+            &es->pa_list, struct pa_params, node)->time_offset;
+        double pre_active_axis = sm->hst + sm->t_offs + time_offset +
             (sp->num_pulses ? sp->pulses[sp->num_pulses-1].t : 0.);
-        double post_active_axis = sm->hst - sm->t_offs - es->time_offset +
+        double post_active_axis = sm->hst - sm->t_offs - time_offset +
             (sp->num_pulses ? -sp->pulses[0].t : 0.);
         if (pre_active_axis > pre_active)
             pre_active = pre_active_axis;
@@ -247,26 +264,47 @@ extruder_note_generation_time(struct extruder_stepper *es)
 }
 
 void __visible
-extruder_set_pressure_advance(struct stepper_kinematics *sk
+extruder_set_pressure_advance(struct stepper_kinematics *sk, double print_time
+                              , pressure_advance_func func
                               , int n_params, double params[]
                               , double time_offset)
 {
     struct extruder_stepper *es = container_of(sk, struct extruder_stepper, sk);
-    es->time_offset = time_offset;
-    memset(&es->pa_params, 0, sizeof(es->pa_params));
-    extruder_note_generation_time(es);
-    if (n_params < 0 || n_params > ARRAY_SIZE(es->pa_params.params))
+    if (n_params < 0 || n_params > 3)
         return;
-    memcpy(&es->pa_params, params, n_params * sizeof(params[0]));
-}
 
-void __visible
-extruder_set_pressure_advance_model_func(struct stepper_kinematics *sk
-                                         , pressure_advance_func func)
-{
-    struct extruder_stepper *es = container_of(sk, struct extruder_stepper, sk);
-    memset(&es->pa_params, 0, sizeof(es->pa_params));
-    es->pa_func = func;
+    // Discard settings that can no longer be observed by step generation.
+    double cleanup_time = sk->last_flush_time
+        - (sk->gen_steps_pre_active > sk->gen_steps_post_active
+           ? sk->gen_steps_pre_active : sk->gen_steps_post_active);
+    struct pa_params *first = list_first_entry(
+        &es->pa_list, struct pa_params, node);
+    while (!list_is_last(&first->node, &es->pa_list)) {
+        struct pa_params *next = list_next_entry(first, node);
+        if (next->active_print_time >= cleanup_time)
+            break;
+        list_del(&first->node);
+        free(first);
+        first = next;
+    }
+
+    struct pa_params candidate;
+    memset(&candidate, 0, sizeof(candidate));
+    candidate.func = func;
+    candidate.time_offset = time_offset;
+    candidate.active_print_time = print_time;
+    memcpy(&candidate.params, params, n_params * sizeof(params[0]));
+    struct pa_params *last = list_last_entry(
+        &es->pa_list, struct pa_params, node);
+    if (last->func == candidate.func
+        && last->time_offset == candidate.time_offset
+        && !memcmp(&last->params, &candidate.params, sizeof(candidate.params)))
+        return;
+
+    struct pa_params *pa = malloc(sizeof(*pa));
+    *pa = candidate;
+    list_add_tail(&pa->node, &es->pa_list);
+    extruder_note_generation_time(es);
 }
 
 int __visible
@@ -296,21 +334,30 @@ extruder_set_smoothing_params(struct stepper_kinematics *sk, char axis
     return status;
 }
 
-double __visible
-extruder_get_step_gen_window(struct stepper_kinematics *sk)
-{
-    struct extruder_stepper *es = container_of(sk, struct extruder_stepper, sk);
-    return es->sk.gen_steps_pre_active > es->sk.gen_steps_post_active
-         ? es->sk.gen_steps_pre_active : es->sk.gen_steps_post_active;
-}
-
 struct stepper_kinematics * __visible
 extruder_stepper_alloc(void)
 {
     struct extruder_stepper *es = malloc(sizeof(*es));
     memset(es, 0, sizeof(*es));
     es->sk.calc_position_cb = extruder_calc_position;
-    es->pa_func = pressure_advance_tanh_model_func;
     es->sk.active_flags = AF_X | AF_Y | AF_Z;
+    list_init(&es->pa_list);
+    struct pa_params *pa = malloc(sizeof(*pa));
+    memset(pa, 0, sizeof(*pa));
+    pa->func = pressure_advance_linear_model_func;
+    list_add_tail(&pa->node, &es->pa_list);
     return &es->sk;
+}
+
+void __visible
+extruder_stepper_free(struct stepper_kinematics *sk)
+{
+    struct extruder_stepper *es = container_of(sk, struct extruder_stepper, sk);
+    while (!list_empty(&es->pa_list)) {
+        struct pa_params *pa = list_first_entry(
+            &es->pa_list, struct pa_params, node);
+        list_del(&pa->node);
+        free(pa);
+    }
+    free(es);
 }

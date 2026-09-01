@@ -58,7 +58,6 @@ class HybridCoreXZKinematics:
             )
         for s in self.get_steppers():
             s.set_trapq(toolhead.get_trapq())
-            toolhead.register_step_generator(s.generate_steps)
         self.printer.register_event_handler(
             "stepper_enable:motor_off", self._motor_off
         )

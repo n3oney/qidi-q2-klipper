@@ -215,12 +215,9 @@ class ExtruderStepper:
         self.stepper = stepper.PrinterStepper(config)
         ffi_main, ffi_lib = chelper.get_ffi()
         self.sk_extruder = ffi_main.gc(
-            ffi_lib.extruder_stepper_alloc(), ffi_lib.free
+            ffi_lib.extruder_stepper_alloc(), ffi_lib.extruder_stepper_free
         )
         self.stepper.set_stepper_kinematics(self.sk_extruder)
-        ffi_lib.extruder_set_pressure_advance_model_func(
-            self.sk_extruder, self.pa_model.get_func()
-        )
         self.motion_queue = None
         self.extruder = None
         # Register commands
@@ -259,12 +256,15 @@ class ExtruderStepper:
         )
 
     def _handle_connect(self):
-        toolhead = self.printer.lookup_object("toolhead")
-        toolhead.register_step_generator(self.stepper.generate_steps)
-        self._update_pressure_advance(
-            self.pa_model, self.pressure_advance_time_offset
+        self._set_pressure_advance(
+            0.0,
+            self.pa_model.get_func(),
+            self.pa_model.get_pa_params(),
+            self.pressure_advance_time_offset,
         )
         self.smoother.update_extruder_kinematics(self.sk_extruder)
+        motion_queuing = self.printer.lookup_object("motion_queuing")
+        motion_queuing.check_step_generation_scan_windows()
 
     def get_status(self, eventtime):
         sts = {
@@ -305,31 +305,48 @@ class ExtruderStepper:
         _, rotation_dist = self.stepper.get_rotation_distance()
         return rotation_dist
 
-    def _update_pressure_advance(self, pa_model, time_offset):
-        toolhead = self.printer.lookup_object("toolhead")
-        toolhead.flush_step_generation()
+    def _set_pressure_advance(
+        self, print_time, pa_func, pa_params, time_offset
+    ):
         ffi_main, ffi_lib = chelper.get_ffi()
-        old_delay = ffi_lib.extruder_get_step_gen_window(self.sk_extruder)
-        if self.pa_model.name != pa_model.name:
-            pa_func = pa_model.get_func()
-            ffi_lib.extruder_set_pressure_advance_model_func(
-                self.sk_extruder, pa_func
-            )
-        pa_params = pa_model.get_pa_params()
         ffi_lib.extruder_set_pressure_advance(
-            self.sk_extruder, len(pa_params), pa_params, time_offset
+            self.sk_extruder,
+            print_time,
+            pa_func,
+            len(pa_params),
+            pa_params,
+            time_offset,
         )
+
+    def _update_pressure_advance(
+        self, pa_model, time_offset, scan_window_changed
+    ):
+        toolhead = self.printer.lookup_object("toolhead")
+        pa_func = pa_model.get_func()
+        pa_params = tuple(pa_model.get_pa_params())
         self.smoother.update_pa_model(pa_model)
-        self.smoother.update_extruder_kinematics(self.sk_extruder)
-        new_delay = ffi_lib.extruder_get_step_gen_window(self.sk_extruder)
-        if old_delay != new_delay:
-            toolhead.note_step_generation_scan_time(new_delay, old_delay)
+        if scan_window_changed:
+            toolhead.flush_step_generation()
+            self._set_pressure_advance(
+                0.0,
+                pa_func,
+                pa_params,
+                time_offset,
+            )
+            self.smoother.update_extruder_kinematics(self.sk_extruder)
+            motion_queuing = self.printer.lookup_object("motion_queuing")
+            motion_queuing.check_step_generation_scan_windows()
+        else:
+            toolhead.register_lookahead_callback(
+                lambda print_time: self._set_pressure_advance(
+                    print_time, pa_func, pa_params, time_offset
+                )
+            )
         self.pa_model = pa_model
         self.pressure_advance_time_offset = time_offset
 
     def update_input_shaping(self, shapers, exact_mode):
         ffi_main, ffi_lib = chelper.get_ffi()
-        old_delay = ffi_lib.extruder_get_step_gen_window(self.sk_extruder)
         failed_shapers = []
         for shaper in shapers:
             if not shaper.update_extruder_kinematics(
@@ -343,10 +360,6 @@ class ExtruderStepper:
             else:
                 self.smoother.enable_axis(shaper.get_axis())
         self.smoother.update_extruder_kinematics(self.sk_extruder)
-        new_delay = ffi_lib.extruder_get_step_gen_window(self.sk_extruder)
-        toolhead = self.printer.lookup_object("toolhead")
-        if old_delay != new_delay:
-            toolhead.note_step_generation_scan_time(new_delay, old_delay)
         return failed_shapers
 
     cmd_SET_PRESSURE_ADVANCE_help = "Set pressure advance parameters"
@@ -363,6 +376,10 @@ class ExtruderStepper:
             extruder_stepper.cmd_SET_PRESSURE_ADVANCE(gcmd)
 
     def cmd_SET_PRESSURE_ADVANCE(self, gcmd):
+        old_smooth_time = (
+            self.smoother.smooth_time if self.pa_model.enabled() else 0.0
+        )
+        old_time_offset = self.pressure_advance_time_offset
         pa_model_name = gcmd.get("MODEL", self.pa_model.name)
         if pa_model_name not in self.pa_models:
             raise gcmd.error("Invalid MODEL='%s' choice" % (pa_model_name,))
@@ -377,7 +394,16 @@ class ExtruderStepper:
             minval=-0.2,
             maxval=0.2,
         )
-        self._update_pressure_advance(pa_model, time_offset)
+        new_smooth_time = (
+            self.smoother.smooth_time if pa_model.enabled() else 0.0
+        )
+        scan_window_changed = (
+            old_smooth_time != new_smooth_time
+            or old_time_offset != time_offset
+        )
+        self._update_pressure_advance(
+            pa_model, time_offset, scan_window_changed
+        )
         if get_danger_options().log_pressure_advance_changes:
             msg = (
                 "pressure_advance_model: %s" % pa_model.name,
@@ -468,10 +494,9 @@ class PrinterExtruder:
             "instantaneous_corner_velocity", 1.0, minval=0.0
         )
         # Setup extruder trapq (trapezoidal motion queue)
-        ffi_main, ffi_lib = chelper.get_ffi()
-        self.trapq = ffi_main.gc(ffi_lib.trapq_alloc(), ffi_lib.trapq_free)
-        self.trapq_append = ffi_lib.trapq_append
-        self.trapq_finalize_moves = ffi_lib.trapq_finalize_moves
+        self.motion_queuing = self.printer.load_object(config, "motion_queuing")
+        self.trapq = self.motion_queuing.allocate_trapq()
+        self.trapq_append = self.motion_queuing.lookup_trapq_append()
 
         # Setup extruder stepper
         self.extruder_steppers = []
