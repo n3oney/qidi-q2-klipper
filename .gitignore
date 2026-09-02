@@ -1,4 +1,15 @@
 my_*.cfg
+out/
+out_*/
+*.mmu_config
+*.mmu_config.old
+*.mmu_config_*
+.mmu_test_state
+__pycache__/
+*.pyc
+venv/
+.hh-stamps/
 .DS_Store
-benchmark_full_chain.py
-benchmark_callbacks.py
+.claude/*
+!.claude/skills/
+!.claude/skills/**
