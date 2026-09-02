@@ -63,7 +63,7 @@ class KlippyPathFinder(importlib.machinery.PathFinder):
 
         spec = super().find_spec(fullname, path, target)
 
-        if spec and spec.name.startswith("klippy."):
+        if spec and spec.loader and spec.name.startswith("klippy."):
             cls.patch_loader(spec, spec.name.removeprefix("klippy."))
 
         return spec
