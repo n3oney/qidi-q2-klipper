@@ -17,10 +17,9 @@ from .pn532_uart_driver import PN532UARTDriver, DEFAULT_BAUD
 from .pn5180_driver import PN5180Driver
 from .pn7160_driver import PN7160Driver
 from .rc522_driver import RC522Driver
-from .fm17550_driver import FM17550Driver
 from .rx_gain import RX_GAIN_DB
 
-SUPPORTED_READER_TYPES = ('pn532', 'pn5180', 'pn7160', 'rc522', 'fm17550')
+SUPPORTED_READER_TYPES = ('pn532', 'pn5180', 'pn7160', 'rc522')
 DEFAULT_READER_TYPE = 'pn532'
 
 # Which host<->chip transports each reader has a DRIVER for, first entry being the
@@ -33,7 +32,6 @@ SUPPORTED_INTERFACES = {
     'pn5180': ('spi',),
     'pn7160': ('i2c',),
     'rc522':  ('spi',),
-    'fm17550': ('spi',),
 }
 DEFAULT_I2C_ADDRESS = {
     'pn532': 0x24,
@@ -47,7 +45,6 @@ DEFAULT_SPI_SPEED = {
     'pn532': 1000000,
     'pn5180': 1000000,
     'rc522': 1000000,
-    'fm17550': 5000000,
 }
 PN7160_I2C_ADDRESSES = (0x28, 0x29, 0x2A, 0x2B)
 
@@ -354,13 +351,12 @@ def create_reader(config, defaults, reader_type, debug,
             spi, name, transceive_delay, crc_delay, debug,
             low_level_debug=low_level_debug, sleep_fn=sleep_fn)
 
-    if reader_type in ('rc522', 'fm17550'):
+    if reader_type == 'rc522':
         spi = bus_module.MCU_SPI_from_config(
             config, 0, default_speed=default_spi_speed(reader_type))
         rc522_delay = config.getfloat(
             'rc522_transceive_delay', 0.035, minval=0.001, maxval=1.0)
-        driver = FM17550Driver if reader_type == 'fm17550' else RC522Driver
-        return driver(
+        return RC522Driver(
             spi, name, transceive_delay=rc522_delay, debug=debug,
             sleep_fn=sleep_fn)
 

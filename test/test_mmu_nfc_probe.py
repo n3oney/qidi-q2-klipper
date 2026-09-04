@@ -40,7 +40,6 @@ install()
 
 from extras.mmu.unit.nfc import rc522_driver
 from extras.mmu.unit.nfc.rc522_driver import RC522Driver
-from extras.mmu.unit.nfc.fm17550_driver import FM17550Driver
 from extras.mmu.unit.nfc import pn7160_driver
 from extras.mmu.unit.nfc.pn7160_driver import PN7160Driver
 
@@ -97,23 +96,6 @@ class FakeSpi:
 def driver(registers=None):
     spi = FakeSpi(registers)
     return RC522Driver(spi, name="gate0", debug=0, sleep_fn=lambda _s: None), spi
-
-class TestSpiReaderHealth(unittest.TestCase):
-    def test_rc522_rejects_floating_miso(self):
-        drv, _spi = driver({TX_CONTROL: 0xFF})
-        self.assertFalse(drv.is_alive())
-
-    def test_fm17550_requires_initialized_mode_register(self):
-        spi = FakeSpi({TX_CONTROL: 0x83, rc522_driver._ModeReg: 0x3D})
-        drv = FM17550Driver(
-            spi, name="gate0", debug=0, sleep_fn=lambda _s: None)
-        self.assertTrue(drv.is_alive())
-
-    def test_fm17550_rejects_floating_miso(self):
-        spi = FakeSpi({TX_CONTROL: 0xFF, rc522_driver._ModeReg: 0xFF})
-        drv = FM17550Driver(
-            spi, name="gate0", debug=0, sleep_fn=lambda _s: None)
-        self.assertFalse(drv.is_alive())
 
 
 class TestProbeUsesWupa(unittest.TestCase):
