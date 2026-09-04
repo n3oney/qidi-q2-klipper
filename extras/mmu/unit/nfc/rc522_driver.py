@@ -239,7 +239,7 @@ class RC522Driver:
                     logger.info("[%s rc522] init attempt %d raised: %s\n%s",
                                 self._name, attempt, e, traceback.format_exc())
             else:
-                if tx_final & 0x03:
+                if tx_final not in (0x00, 0xFF) and tx_final & 0x03:
                     suffix = '' if attempt == 1 else ' on attempt %d' % attempt
                     logger.info("[%s rc522] init OK%s (TxControl=0x%02X, %s)",
                                 self._name, suffix, tx_final, self._bus_description())
@@ -340,10 +340,10 @@ class RC522Driver:
             self._name, tx_final, version, tmode, self._bus_description(), cause)
 
     def is_alive(self):
-        """Return True if the reader is responding (antenna TX bits are set)."""
+        """Return True only when the reader returns a driven antenna value."""
         try:
             tx = self._read(_TxControlReg)
-            alive = bool(tx & 0x03)
+            alive = tx not in (0x00, 0xFF) and bool(tx & 0x03)
             if not alive:
                 logger.warning(
                     "[%s rc522] not responding — antenna TX bits are off "
