@@ -61,6 +61,7 @@ class PrinterMotionQueuing:
         self.need_flush_time = self.need_step_gen_time = 0.0
         # Register handlers
         printer.register_event_handler("klippy:shutdown", self._handle_shutdown)
+        printer.register_event_handler("klippy:disconnect", self._handle_disconnect)
 
     # C trapq tracking
     def allocate_trapq(self):
@@ -158,6 +159,16 @@ class PrinterMotionQueuing:
     # Flush tracking
     def _handle_shutdown(self):
         self.can_pause = False
+
+    def _handle_disconnect(self):
+        steppersyncmgr = self.steppersyncmgr
+        if steppersyncmgr is None:
+            return
+        self.steppersyncmgr = None
+        self.syncemitters.clear()
+        self.steppersyncs.clear()
+        ffi_main, ffi_lib = chelper.get_ffi()
+        ffi_main.release(steppersyncmgr)
 
     def _advance_flush_time(self, want_flush_time, want_step_gen_time=0.0):
         flush_time = max(
