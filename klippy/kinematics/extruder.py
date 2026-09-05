@@ -325,7 +325,13 @@ class ExtruderStepper:
         pa_func = pa_model.get_func()
         pa_params = tuple(pa_model.get_pa_params())
         self.smoother.update_pa_model(pa_model)
-        if scan_window_changed:
+        linear_update = (
+            self.pa_model.name == PALinearModel.name
+            and pa_model.name == PALinearModel.name
+        )
+        # Only linear PA is weighted per move inside the smoothing integral.
+        # Nonlinear parameters and model changes must wait for queued steps.
+        if scan_window_changed or not linear_update:
             toolhead.flush_step_generation()
             self._set_pressure_advance(
                 0.0,

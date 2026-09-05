@@ -30,102 +30,10 @@
 //     smooth_velocity(t) = (
 //         definitive_integral(nominal_velocity(x+t_offs) * smoother(t-x) * dx,
 //                             from=t-smooth_time/2, to=t+smooth_time/2)
-// and the final pressure advance value calculated as
-//     smooth_pa_position(t) = smooth_position(t) + pa_func(smooth_velocity(t))
-// where pa_func(v) = pressure_advance * v for linear velocity model or a more
-// complicated function for non-linear pressure advance models.
-
-// Calculate the definitive integral of extruder for a given move
-static inline void
-pa_move_integrate(const struct move *m, int axis
-                  , double t0, const smoother_antiderivatives *ad
-                  , double *pa_velocity_integral)
-{
-    // Calculate base position and velocity with pressure advance
-    int can_pressure_advance = m->axes_r.x > 0. || m->axes_r.y > 0.;
-
-    // Calculate definitive integral
-    if (can_pressure_advance)
-        *pa_velocity_integral += integrate_velocity(m, axis, t0, ad);
-}
-
-// Calculate the definitive integral of the extruder over a range of moves
-static void
-pa_range_integrate(const struct move *m, int axis, double move_time
-                   , const struct smoother *sm
-                   , double *pa_velocity_integral)
-{
-    move_time += sm->t_offs;
-    while (unlikely(move_time < 0.)) {
-        m = list_prev_entry(m, node);
-        move_time += m->move_t;
-    }
-    while (unlikely(move_time > m->move_t)) {
-        move_time -= m->move_t;
-        m = list_next_entry(m, node);
-    }
-    // Calculate integral for the current move
-    double start = move_time - sm->hst, end = move_time + sm->hst;
-    double t0 = move_time;
-    *pa_velocity_integral = 0.;
-    if (unlikely(start >= 0. && end <= m->move_t)) {
-        pa_move_integrate(m, axis, t0, &sm->pm_diff,
-                          pa_velocity_integral);
-        return;
-    }
-    smoother_antiderivatives left =
-        likely(start < 0.) ? calc_antiderivatives(sm, t0) : sm->p_hst;
-    smoother_antiderivatives right =
-        likely(end > m->move_t) ? calc_antiderivatives(sm, t0 - m->move_t)
-                                : sm->m_hst;
-    smoother_antiderivatives diff = diff_antiderivatives(&right, &left);
-    pa_move_integrate(m, axis, t0, &diff,
-                      pa_velocity_integral);
-    // Integrate over previous moves
-    const struct move *prev = m;
-    while (likely(start < 0.)) {
-        prev = list_prev_entry(prev, node);
-        start += prev->move_t;
-        t0 += prev->move_t;
-        smoother_antiderivatives r = left;
-        left = likely(start < 0.) ? calc_antiderivatives(sm, t0)
-                                  : sm->p_hst;
-        diff = diff_antiderivatives(&r, &left);
-        pa_move_integrate(prev, axis, t0, &diff,
-                          pa_velocity_integral);
-    }
-    // Integrate over future moves
-    t0 = move_time;
-    while (likely(end > m->move_t)) {
-        end -= m->move_t;
-        t0 -= m->move_t;
-        m = list_next_entry(m, node);
-        smoother_antiderivatives l = right;
-        right = likely(end > m->move_t) ? calc_antiderivatives(sm,
-                                                               t0 - m->move_t)
-                                        : sm->m_hst;
-        diff = diff_antiderivatives(&right, &l);
-        pa_move_integrate(m, axis, t0, &diff,
-                          pa_velocity_integral);
-    }
-}
-
-static void
-shaper_pa_range_integrate(const struct move *m, int axis, double move_time
-                          , const struct shaper_pulses *sp
-                          , const struct smoother *sm
-                          , double *pa_velocity_integral)
-{
-    *pa_velocity_integral = 0.;
-    int num_pulses = sp->num_pulses, i;
-    for (i = 0; i < num_pulses; ++i) {
-        double t = sp->pulses[i].t, a = sp->pulses[i].a;
-        double p_pa_vel_int;
-        pa_range_integrate(m, axis, move_time + t, sm,
-                           &p_pa_vel_int);
-        *pa_velocity_integral += a * p_pa_vel_int;
-    }
-}
+// Nonlinear PA applies pa_func to the smoothed velocity. Linear PA instead
+// weights each move's velocity by its active PA value inside the integral:
+//     smooth_pa_position(t) = smooth_position(t) + smooth(PA(t) * velocity(t))
+// This keeps queued PA changes continuous across move boundaries.
 
 struct pressure_advance_params {
     union {
@@ -155,6 +63,115 @@ struct extruder_stepper {
     struct smoother sm[3];
     struct list_head pa_list;
 };
+
+static struct pa_params *
+extruder_lookup_pa(struct list_head *pa_list, double print_time)
+{
+    struct pa_params *pa = list_last_entry(
+        pa_list, struct pa_params, node);
+    while (unlikely(pa->active_print_time > print_time)
+           && !list_is_first(&pa->node, pa_list))
+        pa = list_prev_entry(pa, node);
+    return pa;
+}
+
+// Calculate the definitive integral of extruder for a given move
+static inline void
+pa_move_integrate(const struct move *m, int axis
+                  , struct list_head *pa_list, double t0
+                  , const smoother_antiderivatives *ad
+                  , double *pa_velocity_integral)
+{
+    // Calculate base position and velocity with pressure advance
+    int can_pressure_advance = m->axes_r.x > 0. || m->axes_r.y > 0.;
+
+    // Calculate definitive integral
+    if (can_pressure_advance) {
+        double integral = integrate_velocity(m, axis, t0, ad);
+        if (pa_list)
+            integral *= extruder_lookup_pa(pa_list, m->print_time)
+                ->params.pressure_advance;
+        *pa_velocity_integral += integral;
+    }
+}
+
+// Calculate the definitive integral of the extruder over a range of moves
+static void
+pa_range_integrate(const struct move *m, int axis, double move_time
+                   , const struct smoother *sm, struct list_head *pa_list
+                   , double *pa_velocity_integral)
+{
+    move_time += sm->t_offs;
+    while (unlikely(move_time < 0.)) {
+        m = list_prev_entry(m, node);
+        move_time += m->move_t;
+    }
+    while (unlikely(move_time > m->move_t)) {
+        move_time -= m->move_t;
+        m = list_next_entry(m, node);
+    }
+    // Calculate integral for the current move
+    double start = move_time - sm->hst, end = move_time + sm->hst;
+    double t0 = move_time;
+    *pa_velocity_integral = 0.;
+    if (unlikely(start >= 0. && end <= m->move_t)) {
+        pa_move_integrate(m, axis, pa_list, t0, &sm->pm_diff,
+                          pa_velocity_integral);
+        return;
+    }
+    smoother_antiderivatives left =
+        likely(start < 0.) ? calc_antiderivatives(sm, t0) : sm->p_hst;
+    smoother_antiderivatives right =
+        likely(end > m->move_t) ? calc_antiderivatives(sm, t0 - m->move_t)
+                                : sm->m_hst;
+    smoother_antiderivatives diff = diff_antiderivatives(&right, &left);
+    pa_move_integrate(m, axis, pa_list, t0, &diff,
+                      pa_velocity_integral);
+    // Integrate over previous moves
+    const struct move *prev = m;
+    while (likely(start < 0.)) {
+        prev = list_prev_entry(prev, node);
+        start += prev->move_t;
+        t0 += prev->move_t;
+        smoother_antiderivatives r = left;
+        left = likely(start < 0.) ? calc_antiderivatives(sm, t0)
+                                  : sm->p_hst;
+        diff = diff_antiderivatives(&r, &left);
+        pa_move_integrate(prev, axis, pa_list, t0, &diff,
+                          pa_velocity_integral);
+    }
+    // Integrate over future moves
+    t0 = move_time;
+    while (likely(end > m->move_t)) {
+        end -= m->move_t;
+        t0 -= m->move_t;
+        m = list_next_entry(m, node);
+        smoother_antiderivatives l = right;
+        right = likely(end > m->move_t) ? calc_antiderivatives(sm,
+                                                               t0 - m->move_t)
+                                        : sm->m_hst;
+        diff = diff_antiderivatives(&right, &l);
+        pa_move_integrate(m, axis, pa_list, t0, &diff,
+                          pa_velocity_integral);
+    }
+}
+
+static void
+shaper_pa_range_integrate(const struct move *m, int axis, double move_time
+                          , const struct shaper_pulses *sp
+                          , const struct smoother *sm, struct list_head *pa_list
+                          , double *pa_velocity_integral)
+{
+    *pa_velocity_integral = 0.;
+    int num_pulses = sp->num_pulses, i;
+    for (i = 0; i < num_pulses; ++i) {
+        double t = sp->pulses[i].t, a = sp->pulses[i].a;
+        double p_pa_vel_int;
+        pa_range_integrate(m, axis, move_time + t, sm, pa_list,
+                           &p_pa_vel_int);
+        *pa_velocity_integral += a * p_pa_vel_int;
+    }
+}
 
 double __visible
 pressure_advance_linear_model_func(double position, double pa_velocity
@@ -187,23 +204,14 @@ pressure_advance_recipr_model_func(double position, double pa_velocity
     return position;
 }
 
-static struct pa_params *
-extruder_lookup_pa(struct extruder_stepper *es, double print_time)
-{
-    struct pa_params *pa = list_last_entry(
-        &es->pa_list, struct pa_params, node);
-    while (unlikely(pa->active_print_time > print_time)
-           && !list_is_first(&pa->node, &es->pa_list))
-        pa = list_prev_entry(pa, node);
-    return pa;
-}
-
 static double
 extruder_calc_position(struct stepper_kinematics *sk, struct move *m
                        , double move_time)
 {
     struct extruder_stepper *es = container_of(sk, struct extruder_stepper, sk);
-    struct pa_params *pa = extruder_lookup_pa(es, m->print_time);
+    struct pa_params *pa = extruder_lookup_pa(&es->pa_list, m->print_time);
+    struct list_head *pa_list =
+        pa->func == pressure_advance_linear_model_func ? &es->pa_list : NULL;
     move_time += pa->time_offset;
     while (unlikely(move_time < 0.)) {
         m = list_prev_entry(m, node);
@@ -227,16 +235,19 @@ extruder_calc_position(struct stepper_kinematics *sk, struct move *m
         if (!sm->hst) {
             pa_vel.axis[i] = 0.;
         } else if (num_pulses) {
-            shaper_pa_range_integrate(m, axis, move_time, sp, sm,
+            shaper_pa_range_integrate(m, axis, move_time, sp, sm, pa_list,
                                       &pa_vel.axis[i]);
         } else {
-            pa_range_integrate(m, axis, move_time, sm, &pa_vel.axis[i]);
+            pa_range_integrate(m, axis, move_time, sm, pa_list, &pa_vel.axis[i]);
         }
     }
     double position = e_pos.x + e_pos.y + e_pos.z;
     double pa_velocity = pa_vel.x + pa_vel.y + pa_vel.z;
-    if (pa_velocity > 0.)
+    if (pa_velocity > 0.) {
+        if (pa_list)
+            return position + pa_velocity;
         return pa->func(position, pa_velocity, &pa->params);
+    }
     return position;
 }
 
