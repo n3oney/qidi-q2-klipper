@@ -457,6 +457,7 @@ class ToolHead:
             wtime = eventtime + max(0.100, buffer_time - BUFFER_TIME_HIGH)
             self.reactor.update_timer(self.priming_timer, wtime)
         # Check if there are lots of queued moves and pause if so
+        did_pause = False
         while True:
             pause_time = buffer_time - BUFFER_TIME_HIGH
             if pause_time <= 0.0:
@@ -464,12 +465,17 @@ class ToolHead:
             if not self.can_pause:
                 self.need_check_pause = self.reactor.NEVER
                 return
-            eventtime = self.reactor.pause(eventtime + min(1.0, pause_time))
+            pause_time = max(0.005, min(1.0, pause_time))
+            eventtime = self.reactor.pause(eventtime + pause_time)
             est_print_time = self.mcu.estimated_print_time(eventtime)
             buffer_time = self.print_time - est_print_time
+            did_pause = True
         if not self.special_queuing_state:
-            # In main state - defer pause checking until needed
-            self.need_check_pause = est_print_time + BUFFER_TIME_HIGH + 0.100
+            # In main state - defer pause checking
+            self.need_check_pause = self.print_time
+            if not did_pause:
+                # May be falling behind - yield to avoid starving other tasks
+                self.reactor.pause(self.reactor.NOW)
 
     def _priming_handler(self, eventtime):
         self.reactor.unregister_timer(self.priming_timer)
