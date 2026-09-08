@@ -59,8 +59,6 @@ class MmuController(MmuFilamentMovement):
         self.gcode = self.printer.lookup_object('gcode')
         self.gcode_move = self.printer.load_object(config, 'gcode_move')
 
-        self._ready = False # Used to prevent early access to get_status() before everything is loaded
-
         self.num_gates = self.mmu_machine.num_gates
         self.toolchange_retract = 0.            # Set from mmu_macro_vars
         self.toolchange_purge_volume = 0.       # During toolchange, the total calculated purge volume
@@ -221,7 +219,6 @@ class MmuController(MmuFilamentMovement):
 
     def handle_disconnect(self):
         self.log_debug('Klipper disconnected!')
-        self._ready = False
 
 
     def handle_ready(self):
@@ -272,7 +269,6 @@ class MmuController(MmuFilamentMovement):
 
         # Send event to allow modules to finalize configuration now everything is loaded
         self.log_debug("MMU Initialization Complete -------------------------------\n")
-        self._ready = True
         self.printer.send_event("mmu:initialized")
 
 
@@ -419,7 +415,7 @@ class MmuController(MmuFilamentMovement):
             # on a perfectly good one (and vice versa).
             if self.gate_selected != TOOL_GATE_UNKNOWN and self.mmu_unit(self.gate_selected).calibrator.check_calibrated(CALIBRATED_SELECTOR):
                 try:
-                    self.log_info(f"Selecting last gate used ({self.gate_selected})...")
+                    self.log_info(f"Selecting last gate used ({self.selected_gate_string()})...")
                     self.select_gate(self.gate_selected)
                 except Exception as e:
                     # This is recoverable so just report errors
@@ -681,9 +677,6 @@ class MmuController(MmuFilamentMovement):
         # establish stable subscriptions before MMU initialization completes.
         status.update(self.mmu_unit().sync_feedback.get_status(eventtime))
 
-        if not self._ready:
-            return status
-
         # Adds status for gate map, ttg map, endless spool, etc
         status.update(self.gate_maps.get_status(eventtime))
 
@@ -726,8 +719,7 @@ class MmuController(MmuFilamentMovement):
             st = mgr.get_status(eventtime)
             if st['shared'] is not None or st['gates']:
                 nfc_status.append(st)
-        if nfc_status:
-            status['nfc'] = nfc_status
+        status['nfc'] = nfc_status
 
         # Development/testing hook
         if hasattr(self, "developer_status_update"):

@@ -25,6 +25,8 @@ menu "Pins / TMC"
 
     config CHOICE_GEAR_TMC2209
       bool "TMC2209"
+    config CHOICE_GEAR_TMC2226
+      bool "TMC2226"
     config CHOICE_GEAR_TMC2130
       bool "TMC2130"
     config CHOICE_GEAR_TMC2208
@@ -45,6 +47,7 @@ menu "Pins / TMC"
   config PARAM_GEAR_TMC
     string
     default "tmc2209" if CHOICE_GEAR_TMC2209
+    default "tmc2209" if CHOICE_GEAR_TMC2226 # TMC2226 uses Klipper's TMC2209 driver.
     default "tmc2130" if CHOICE_GEAR_TMC2130
     default "tmc2208" if CHOICE_GEAR_TMC2208
     default "tmc2660" if CHOICE_GEAR_TMC2660
@@ -81,7 +84,6 @@ menu "Pins / TMC"
         int
         default 0
         range 0 3
-        depends on BOARD_TYPE_EASY_BRD || BOARD_TYPE_SKR_PICO_1 || BOARD_TYPE_OTHER
     @endrepeat@
 
     @repeat var=i min=1 max=11@
@@ -104,7 +106,7 @@ menu "Pins / TMC"
           config PIN_GEAR_UART_$(i)
             prompt "Gear $(i) UART pin  " if PARAM_GEAR_TMC != ""
           config PARAM_GEAR_UART_ADDRESS_$(i)
-            prompt "Gear $(i) UART addr " if PARAM_GEAR_TMC != ""
+            prompt "Gear $(i) UART addr " if PARAM_GEAR_TMC != "" && (BOARD_TYPE_EASY_BRD || BOARD_TYPE_SKR_PICO_1 || BOARD_TYPE_OTHER)
           config PIN_GEAR_STEP_$(i)
             prompt "Gear $(i) step pin  "
           config PIN_GEAR_DIR_$(i)
@@ -154,6 +156,8 @@ menu "Pins / TMC"
 
     config CHOICE_SELECTOR_TMC2209
       bool "TMC2209"
+    config CHOICE_SELECTOR_TMC2226
+      bool "TMC2226"
     config CHOICE_SELECTOR_TMC2130
       bool "TMC2130"
     config CHOICE_SELECTOR_TMC2208
@@ -169,6 +173,7 @@ menu "Pins / TMC"
   config PARAM_SELECTOR_TMC
     string
     default "tmc2209" if CHOICE_SELECTOR_TMC2209
+    default "tmc2209" if CHOICE_SELECTOR_TMC2226 # TMC2226 uses Klipper's TMC2209 driver.
     default "tmc2130" if CHOICE_SELECTOR_TMC2130
     default "tmc2208" if CHOICE_SELECTOR_TMC2208
     default "tmc2660" if CHOICE_SELECTOR_TMC2660
@@ -277,7 +282,7 @@ menu "Pins / TMC"
       prompt "Proportional (analog) pin    " if MMU_HAS_SENSOR_BUFFER_PROPORTIONAL
     config PIN_BUFFER_NEOPIXEL
       string
-      prompt "Neopixel pin                 " if MMU_HAS_LEDS && !CUSTOM_LED_SETUP
+      prompt "Buffer neopixel pin          " if MMU_HAS_LEDS && !CUSTOM_LED_SETUP
   endmenu
 
 # -------------------------------------
@@ -345,17 +350,39 @@ menu "Pins / TMC"
     @endrepeat@
   endmenu
 
+# -------------------------------------
+# Managed fans
+# -------------------------------------
+
   config PIN_FAN
     string
-    prompt "Cooling fan           " if MMU_HAS_FANS && !MMU_HAS_PER_GATE_MCU
+    prompt "Managed fan pin       " if MMU_HAS_FANS && !MMU_HAS_PER_GATE_CONFIG && !CUSTOM_FAN_SETUP
 
-  menu "Fan per-gate pins" 
-    depends on MMU_HAS_LEDS && MMU_HAS_PER_GATE_MCU
+  menu "Managed fan per-gate pins"
+    depends on MMU_HAS_FANS && MMU_HAS_PER_GATE_CONFIG && !CUSTOM_FAN_SETUP
 
     @repeat var=i min=0 max=11@
       config PIN_FAN_$(i)
         string
-        prompt "Cooling fan gate $(i) pin" if PARAM_NUM_GATES > $(i)
+        prompt "Managed fan gate $(i) pin" if PARAM_NUM_GATES > $(i) && PARAM_FAN_GATE_$(i)
+    @endrepeat@
+  endmenu
+
+# -------------------------------------
+# Heater fans
+# -------------------------------------
+
+  config PIN_HEATER_FAN
+    string
+    prompt "Heater fan pin        " if MMU_HAS_HEATER_FANS && !MMU_HAS_PER_GATE_CONFIG && !CUSTOM_HEATER_FAN_SETUP
+
+  menu "Heater fan per-gate pins"
+    depends on MMU_HAS_HEATER && MMU_HAS_PER_GATE_CONFIG && !CUSTOM_HEATER_FAN_SETUP
+
+    @repeat var=i min=0 max=11@
+      config PIN_HEATER_FAN_$(i)
+        string
+        prompt "Heater fan gate $(i) pin" if PARAM_NUM_GATES > $(i) && PARAM_HEATER_FAN_GATE_$(i)
     @endrepeat@
   endmenu
 

@@ -63,14 +63,5 @@ class TestMmxDesignAttributes(unittest.TestCase):
         self.assertGreater(
             released.syms["PARAM_FILAMENT_ALWAYS_GRIPPED"].visibility, 0)
 
-    def test_mmx_does_not_force_bowden_move(self):
-        bowden = self.mmx.syms["PARAM_REQUIRE_BOWDEN_MOVE"]
-        self.assertEqual(bowden.str_value, "0")
-        self.assertGreater(bowden.visibility, 0)
-
-        bowden.set_value("1")
-        self.assertEqual(bowden.str_value, "1")
-
-
 if __name__ == "__main__":
     unittest.main()

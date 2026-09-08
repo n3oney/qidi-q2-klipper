@@ -18,6 +18,7 @@ from typing                import Any, Dict, Sequence
 # Happy Hare imports
 from ..mmu_constants       import *
 from ..mmu_base_parameters import TunableParametersBase, ParamSpec
+from .mmu_fan_manager      import FAN_TEMPERATURE_SOURCES
 
 
 class MmuUnitParameters(TunableParametersBase):
@@ -42,8 +43,21 @@ class MmuUnitParameters(TunableParametersBase):
     def _guard_has_heater(self):
         return self._mmu_unit.has_heater()
 
+    def _guard_has_fan(self):
+        return self._mmu_unit.has_fan()
+
     def _guard_has_flowguard(self):
         return self._guard_has_encoder or self._guard_has_buffer
+
+    def _validate_gate_homing_endstop(self, value):
+        if value == SENSOR_EXTRUDER_ENTRY and self._mmu_unit.require_bowden_move:
+            raise ValueError(
+                "gate_homing_endstop '%s' requires require_bowden_move to be 0"
+                % SENSOR_EXTRUDER_ENTRY)
+        if value != SENSOR_EXTRUDER_ENTRY and not self._mmu_unit.require_bowden_move:
+            raise ValueError(
+                "gate_homing_endstop must be '%s' when require_bowden_move is 0 (got '%s')"
+                % (SENSOR_EXTRUDER_ENTRY, value))
 
     def _guard_sync_tunable(self):
         return not self._mmu_unit.filament_always_gripped
@@ -112,8 +126,41 @@ class MmuUnitParameters(TunableParametersBase):
         if new != old:
             self._mmu_unit.sync_feedback.apply_extrude_threshold()
 
+    def _on_fan_threshold_change(self, old, new):
+        manager = getattr(self._mmu_unit, 'fan_manager', None)
+        if new != old and manager is not None:
+            manager.reset_thresholds()
+
+    def _on_fan_polling_change(self, old, new):
+        manager = getattr(self._mmu_unit, 'fan_manager', None)
+        if new != old and manager is not None:
+            manager.refresh()
+
+    def _on_default_fan_temperature_source_change(self, old, new):
+        manager = getattr(self._mmu_unit, 'fan_manager', None)
+        if new != old and manager is not None:
+            manager.reset_temperature_sources()
+
+    def _on_fan_control_enabled(self, old, new):
+        manager = getattr(self._mmu_unit, 'fan_manager', None)
+        if new != old and manager is not None:
+            manager.set_enabled(bool(new))
+
+    def _on_fan_forced(self, old, new):
+        manager = getattr(self._mmu_unit, 'fan_manager', None)
+        if new != old and manager is not None:
+            manager.set_mode(new)
+
 
     # ---- Validators ----
+
+    def _validate_default_fan_on_temp(self, value):
+        if hasattr(self, 'default_fan_off_temp') and value < self.default_fan_off_temp:
+            raise ValueError("default_fan_on_temp must be greater than or equal to default_fan_off_temp")
+
+    def _validate_default_fan_off_temp(self, value):
+        if hasattr(self, 'default_fan_on_temp') and value > self.default_fan_on_temp:
+            raise ValueError("default_fan_off_temp must be less than or equal to default_fan_on_temp")
 
     def _validate_nfc_gate_jog_scan_window(self, value):
         # empty disables MMU_NFC_SCAN; values are targets from the homing datum, not park
@@ -249,7 +296,7 @@ class MmuUnitParameters(TunableParametersBase):
 
     _SPECS: Sequence[ParamSpec] = (
         # Gate loading
-        ParamSpec('gate_homing_endstop',              'choice', SENSOR_ENCODER, section="GATE HOMING", choices={o: o for o in GATE_ENDSTOPS}, on_change=_on_gate_homing_endstop),
+        ParamSpec('gate_homing_endstop',              'choice', SENSOR_ENCODER, section="GATE HOMING", choices={o: o for o in GATE_ENDSTOPS}, validator=_validate_gate_homing_endstop, on_change=_on_gate_homing_endstop),
         ParamSpec('gate_homing_max',                  'float', 100.0, section="GATE HOMING", limits=dict(minval=10), on_change=_on_gate_homing_max),
         ParamSpec('gate_parking_distance',            'float', -10.0, section="GATE HOMING", validator=_validate_gate_parking_distance, on_change=_on_gate_parking_distance),
         ParamSpec('gate_load_attempts',               'int',       1, section="GATE HOMING", limits=dict(minval=1, maxval=20)),
@@ -366,6 +413,14 @@ class MmuUnitParameters(TunableParametersBase):
         ParamSpec('heater_vent_macro',                'str',      '', section="HEATER",                             guard=_guard_has_heater),
         ParamSpec('heater_vent_interval',             'float',   0.0, section="HEATER",    limits=dict(minval=0.0), guard=_guard_has_heater, fmt="%.1f"),
         ParamSpec('heater_rotate_interval',           'float',   5.0, section="HEATER",    limits=dict(minval=1.0), guard=_guard_has_heater, fmt="%.1f"),
+
+        # Fan
+        ParamSpec('default_fan_temperature_source',   'choice', 'environment', section="FAN", choices={o: o for o in ('',) + FAN_TEMPERATURE_SOURCES}, guard=_guard_has_fan, on_change=_on_default_fan_temperature_source_change),
+        ParamSpec('default_fan_on_temp',              'float',  49.0, section="FAN", limits=dict(minval=20.0, maxval=80.0), guard=_guard_has_fan, validator=_validate_default_fan_on_temp, on_change=_on_fan_threshold_change, fmt="%.1f"),
+        ParamSpec('default_fan_off_temp',             'float',  47.0, section="FAN", limits=dict(minval=20.0, maxval=80.0), guard=_guard_has_fan, validator=_validate_default_fan_off_temp, on_change=_on_fan_threshold_change, fmt="%.1f"),
+        ParamSpec('fan_polling_time',                 'float',   5.0, section="FAN", limits=dict(minval=1.0, maxval=30.0),  guard=_guard_has_fan, on_change=_on_fan_polling_change, fmt="%.1f"),
+        ParamSpec('fan_control_enabled',              'int',       1, section="FAN", limits=dict(minval=0, maxval=1),       guard=_guard_has_fan, on_change=_on_fan_control_enabled, fmt="%d"),
+        ParamSpec('fan_forced',                       'int',       2, section="FAN", limits=dict(minval=0, maxval=2),       guard=_guard_has_fan, on_change=_on_fan_forced, fmt="%d"),
 
         # Automatic calibration / tuning options
         ParamSpec('autocal_selector',                 'int',       0, section="AUTOTUNE", limits=dict(minval=0, maxval=1)),

@@ -5,18 +5,16 @@ config MMU_TYPE_EMU_1_0
     (optionally heater) enclosure. It had many features and is an incredible
     choice for new builds. Highly recommended to use with an analog proportional
     sync-feedback buffer like PSF.
-  imply  MMU_HAS_PER_GATE_MCU # Install must also be run with "-e" for PER_GATE_MCU support
   select VIRTUAL_SELECTOR
+  imply  MMU_HAS_PER_GATE_MCU # Install must also be run with "-e" for PER_GATE_MCU support
+  select MMU_HAS_PER_GATE_CONFIG
   imply  MMU_HAS_ENVIRONMENT_SENSOR
-  select MMU_HAS_PER_GATE_ENV_SENSORS
-  select MMU_HAS_PER_GATE_HEATERS
   select MMU_HAS_LEDS
   imply  MMU_HAS_EJECT_BUTTONS
   select MMU_HAS_SENSOR_ENTRY
   select MMU_HAS_SENSOR_EXIT
   select PARAM_VARIABLE_ROTATION_DISTANCES
   select PARAM_VARIABLE_BOWDEN_LENGTHS
-  select PARAM_REQUIRE_BOWDEN_MOVE
   select PARAM_FILAMENT_ALWAYS_GRIPPED
   select PARAM_SYNC_TO_EXTRUDER
   select PARAM_SYNC_FORM_TIP
@@ -69,6 +67,10 @@ endif
 if MMU_TYPE_EMU_1_0
 
   source "Kconfig.num_gates"
+
+  choice CHOICE_DEFAULT_FAN_TEMPERATURE_SOURCE
+    default CHOICE_DEFAULT_FAN_TEMPERATURE_SOURCE_MCU if FAN_HAS_MCU_TEMPERATURE
+  endchoice
 
   if SHOW_MMU_ADDITIONS_WITH_TYPE
     source "Kconfig.mmu_additions"
@@ -171,9 +173,6 @@ if MMU_TYPE_EMU_1_0
       generated_default "neopixel:_$(UNIT_NAME)_gate%i_leds (1,2,3,4)" "" "; " PARAM_NUM_GATES
     
   endif
-
-  config PARAM_FILAMENT_HEATERS 
-    generated_default "$(UNIT_NAME)_heater%i" "" PARAM_NUM_GATES
 
   comment "_"
 

@@ -91,7 +91,7 @@ class TestUartAddressConfiguration(unittest.TestCase):
         kconfig = self.kconfigs["virtual_selector"]
         uart_pin = kconfig.get("PIN_GEAR_UART")
         self.assertEqual(uart_pin, "unit0:gpio9")
-        for gear, expected in enumerate((0, 1, 2, 3)):
+        for gear, expected in zip(range(4), (0, 2, 1, 3)):
             suffix = "" if gear == 0 else "_%d" % gear
             address_symbol = "PARAM_GEAR_UART_ADDRESS%s" % suffix
             pin_symbol = "PIN_GEAR_UART%s" % suffix
@@ -103,7 +103,7 @@ class TestUartAddressConfiguration(unittest.TestCase):
             "virtual_selector", self.profile_syms["virtual_selector"])
         sections = hardware.split("[tmc2209 mmu_stepper unit0_gear")
         self.assertEqual(len(sections), 5)
-        for gear, expected in enumerate(range(4)):
+        for gear, expected in zip(range(4), (0, 2, 1, 3)):
             with self.subTest(rendered_gear=gear):
                 self.assertIn(
                     "uart_pin                 : unit0:gpio9",
@@ -120,6 +120,23 @@ class TestUartAddressConfiguration(unittest.TestCase):
             symbol = "PARAM_GEAR_UART_ADDRESS_%d" % gear
             with self.subTest(symbol=symbol):
                 self.assertEqual(kconfig.get(symbol), "0")
+
+    def test_unsupported_multigear_board_hides_addresses_with_valid_defaults(self):
+        with cfg._env(cfg._SINGLE_UNIT_ENV):
+            kconfig = cfg._kconfig(
+                "unsupported_multigear_uart_addresses",
+                {
+                    "MMU_CUSTOM_TYPE_EVERYTHING": True,
+                    "BOARD_TYPE_MMB_2_0": True,
+                    "PARAM_NUM_GATES": 5,
+                },
+            )
+
+        for gear in range(1, 5):
+            symbol = "PARAM_GEAR_UART_ADDRESS_%d" % gear
+            with self.subTest(symbol=symbol):
+                self.assertEqual(kconfig.get(symbol), "0")
+                self.assertEqual(kconfig.syms[symbol].visibility, 0)
 
     def test_skr_pico_selector_shares_uart_pin_and_uses_driver_address(self):
         kconfig = self.kconfigs["skr_pico"]
