@@ -19,12 +19,45 @@ import re
 import tempfile
 import unittest
 
-from test.hh import cfg, profiles
+import jinja2
+
+from test.hh import bootstrap, cfg, profiles
 
 HARDWARE = 'config/base/mmu_hardware.cfg'
 MMU = 'config/base/mmu.cfg'
 PARAMS = 'config/base/mmu_parameters.cfg'
 MACRO_VARS = 'config/base/mmu_macro_vars.cfg'
+
+
+class TestKlipperTuningRender(unittest.TestCase):
+
+    def test_shipped_defaults_and_custom_values_for_single_and_multi_unit(self):
+        defaults = {
+            'update_trsync': 0,
+            'update_bit_max_time': 1,
+            'update_aht10_commands': 0,
+            'suppress_klipper_warnings': 0,
+        }
+        overrides = {
+            'update_trsync': 1,
+            'update_bit_max_time': 0,
+            'update_aht10_commands': 1,
+            'suppress_klipper_warnings': 1,
+        }
+        for name in ('boxturtle', 'ercf_vvd'):
+            base = profiles.get(name)
+            for label, expected in (('defaults', defaults), ('custom', overrides)):
+                with self.subTest(profile=name, settings=label):
+                    profile = base if label == 'defaults' else base.derive(
+                        name + '_klipper_tuning',
+                        syms={'PARAM_' + key.upper(): value
+                              for key, value in expected.items()})
+                    rendered = cfg.render(profile)
+                    cfg.assert_sane(rendered)
+                    params = cfg.assemble(rendered)['mmu_parameters']
+                    self.assertNotIn('canbus_comms_retries', params)
+                    for key, value in expected.items():
+                        self.assertEqual(params.getint(key), value, key)
 
 
 class TestBoxTurtleRender(unittest.TestCase):
@@ -206,7 +239,7 @@ class TestBoxTurtleRender(unittest.TestCase):
     def test_assemble_tolerates_duplicate_extruder_section(self):
         """
         [extruder] appears in both the printer stub (stepper options, which
-        MmuExtruderWrapper needs at extras/mmu/unit/mmu_extruder_wrapper.py:58-59)
+        MmuExtruderWrapper needs at extras/mmu/unit/mmu_extruder_wrapper.py:64-65)
         and mmu_macro_vars.cfg (extrude limits). RawConfigParser(strict=False) must
         merge rather than raise.
         """
@@ -256,7 +289,7 @@ class TestHardwareConfigurationWarnings(unittest.TestCase):
             return cfg._kconfig(name, syms)
 
     def test_missing_shared_heater_name_is_warned(self):
-        syms = dict(profiles.get('qidi').syms)
+        syms = dict(profiles.get('qidi').syms, PARAM_FILAMENT_HEATER='')
         self.assertTrue(self._kconfig('missing_heater_name', syms).is_enabled('W13'))
 
         syms['PARAM_FILAMENT_HEATER'] = 'qidi_heater'
@@ -296,6 +329,78 @@ class TestCustomHardwareCapabilities(unittest.TestCase):
             extra_params={'CUSTOM_NFC_READER_SETUP': True})
         rendered = cfg.render(profile)
         self.assertNotIn('nfc_deep_read', rendered[PARAMS])
+
+
+class TestBlobifierFirmwareDetection(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        profile = profiles.get('boxturtle').derive(
+            'blobifier_firmware_detection', syms={'MMU_HAS_BLOBIFIER': True})
+        cls.parser = cfg.assemble(cfg.render(profile))
+        env = jinja2.Environment('{%', '%}', '{', '}', undefined=jinja2.StrictUndefined)
+        cls.template = env.from_string(
+            cls.parser['gcode_macro _BLOBIFIER_HOME_STEPPER']['gcode'])
+
+    def test_uses_runtime_firmware_and_preserves_initialization_guard(self):
+        for kalico, syntax in ((0, 'try_home'), (1, '2')):
+            for initialized in (0, 1):
+                with self.subTest(kalico=kalico, initialized=initialized):
+                    # No _BLOBIFIER_VARS.firmware: firmware selection must come from MMU status.
+                    rendered = self.template.render(printer={
+                        'mmu': {'kalico': kalico},
+                        'gcode_macro BLOBIFIER': {'initialized': initialized},
+                    })
+                    commands = [line.strip() for line in rendered.splitlines()
+                                if line.strip().startswith('MANUAL_STEPPER ')]
+                    expected = [] if not initialized else [
+                        'MANUAL_STEPPER STEPPER=stepper_blobifier ENABLE=1 SET_POSITION=30 SYNC=1',
+                        'MANUAL_STEPPER STEPPER=stepper_blobifier MOVE=0 SPEED=20 STOP_ON_ENDSTOP=' + syntax,
+                    ]
+                    self.assertEqual(commands, expected)
+
+    def test_generated_variables_do_not_require_firmware_selection(self):
+        self.assertNotIn('variable_firmware', self.parser['gcode_macro _BLOBIFIER_VARS'])
+
+
+class TestBlobifierHooksRender(unittest.TestCase):
+
+    def test_defaults_custom_hooks_and_disabled_cleaning(self):
+        defaults = {
+            'user_pre_blobifier_extension': '',
+            'clean_macro': 'BLOBIFIER_CLEAN',
+            'user_post_purge_extension': '',
+            'user_post_blobifier_extension': '',
+        }
+        custom = {
+            'user_pre_blobifier_extension': 'MY_PARK',
+            'clean_macro': 'MY_CLEAN PASSES=2',
+            'user_post_purge_extension': 'RESPOND MSG="purge complete"',
+            'user_post_blobifier_extension': 'MY_GANTRY_WIPE',
+        }
+        for name in ('boxturtle', 'ercf_vvd'):
+            for label, enabled, expected in (
+                    ('blobifier_disabled', False, defaults),
+                    ('defaults', True, defaults),
+                    ('custom', True, custom),
+                    ('cleaning_disabled', True, dict(defaults, clean_macro=''))):
+                with self.subTest(profile=name, settings=label):
+                    syms = {'MMU_HAS_BLOBIFIER': enabled}
+                    if label in ('custom', 'cleaning_disabled'):
+                        syms.update({'VAR_BLOBIFIER_' + key.upper(): value
+                                     for key, value in expected.items()})
+                    profile = profiles.get(name).derive(
+                        name + '_blobifier_hooks_' + label, syms=syms)
+                    rendered = cfg.render(profile)
+                    cfg.assert_sane(rendered)
+                    parser = cfg.assemble(rendered, macros=False)
+                    if not enabled:
+                        self.assertNotIn('gcode_macro _BLOBIFIER_VARS', parser)
+                        continue
+                    variables = parser['gcode_macro _BLOBIFIER_VARS']
+                    for key, value in expected.items():
+                        self.assertEqual(ast.literal_eval(variables['variable_' + key]),
+                                         value, key)
 
 
 class TestMenuconfigMacroStrings(unittest.TestCase):
@@ -996,6 +1101,138 @@ esac
         self.assertEqual(base_serial.nodes[0].prompt[0],
                          'Previous selection: %s' %
                          values['PARAM_MMU_SERIAL_DEVICE'])
+
+
+# ---------------------------------------------------------------------------
+# LED chain-name resolution - a render-level guard, because it must also cover
+# machine types the harness does not boot.
+#
+# QuattroBox is a real shipped machine but is not wired up here (no board/gate-homing/
+# NFC pin definitions), so it dies on empty pins at boot long before the LED load -
+# the render path is the only place its generated config can be checked. These are
+# inline fixtures rather than PROFILES-registry entries for that reason (see the note
+# above TWO_UNIT).
+# ---------------------------------------------------------------------------
+
+
+def _quattro_box(version):
+    """A QuattroBox profile for one version (version in {'1_0', '1_1', '2_0'})."""
+    return profiles.Profile('quattro_box_%s' % version, syms={
+        'MMU_FAMILY_QUATTRO_BOX': True,
+        'MMU_TYPE_QUATTRO_BOX_%s' % version: True,
+    })
+
+
+def _vivid():
+    # VVD otherwise only appears as the second unit of ercf_vvd; a single-unit render
+    # fixture is the cleanest way to assert its chain names directly.
+    return profiles.Profile('vivid', syms={
+        'MMU_TYPE_VVD_1_0': True, 'BOARD_TYPE_VVD_1_0': True,
+    })
+
+
+class TestLedChainReferencesResolve(unittest.TestCase):
+    """
+    Every neopixel chain a [mmu_leds <unit>] segment references must be declared by a
+    [neopixel ...] section (or be the user's cabinet chain, present in the printer stub).
+    mmu_leds.py:42 loads each chain with printer.load_object() and raises "MMU LED chain
+    ... cannot be loaded" for a name with no section - a config that renders fine but dies
+    at klippy:ready, which only a boot would otherwise catch.
+
+    The regression this guards: QuattroBox's LED defaults referenced neopixel:$(UNIT_NAME)
+    _leds while mmu_hardware.cfg emits [neopixel _[[UNIT_NAME]]_leds] (leading underscore),
+    so a stock QuattroBox loaded a phantom 1-LED chain and never started. ViViD is the
+    deliberate contrast: it sets CUSTOM_LED_SETUP and declares its own underscore-less
+    [neopixel <unit>_leds_1/2] on its custom board, so its underscore-less references are
+    CORRECT and must keep resolving - the tests below pin that down so a well-intentioned
+    "match the _<unit> convention" edit cannot silently break it.
+    """
+
+    SEGMENTS = ('exit_leds', 'entry_leds', 'status_leds', 'logo_leds')
+
+    def _assembled(self, profile):
+        return cfg.assemble(cfg.render(profile), printer_stub=bootstrap.PRINTER_STUB)
+
+    def _unresolved(self, profile):
+        """(section, segment, chain) for every referenced chain with no [neopixel] section."""
+        parser = self._assembled(profile)
+        declared = {s.split(' ', 1)[1] for s in parser.sections()
+                    if s.startswith('neopixel ')}
+        bad = []
+        for sec in parser.sections():
+            if not sec.startswith('mmu_leds '):
+                continue
+            items = dict(parser.items(sec))
+            for seg in self.SEGMENTS:
+                for part in items.get(seg, '').split(';'):
+                    part = part.strip()
+                    if part.startswith('neopixel:'):
+                        chain = part.split()[0][len('neopixel:'):]
+                        if chain not in declared:
+                            bad.append('%s.%s -> %s' % (sec, seg, chain))
+        return bad
+
+    def test_quattro_box_segments_reference_the_generated_chain(self):
+        """
+        Fail-before/pass-after for the QuattroBox fix. The template emits
+        [neopixel _unit0_leds] and QuattroBox is neither per-gate nor custom, so every
+        segment must reference exactly that name - not the underscore-less unit0_leds the
+        pre-fix defaults used.
+        """
+        for version in ('1_0', '1_1', '2_0'):
+            profile = _quattro_box(version)
+            parser = self._assembled(profile)
+            self.assertIn('neopixel _unit0_leds', parser.sections(),
+                          'quattro_box_%s must get the generated chain' % version)
+            items_by_sec = {s: dict(parser.items(s))
+                            for s in parser.sections() if s.startswith('mmu_leds ')}
+            for sec, items in items_by_sec.items():
+                for seg in self.SEGMENTS:
+                    for part in items.get(seg, '').split(';'):
+                        part = part.strip()
+                        if not part:
+                            continue
+                        self.assertTrue(
+                            part.startswith('neopixel:_unit0_leds'),
+                            '%s %s = %r (expected neopixel:_unit0_leds ...)' % (version, seg, part))
+
+    def test_every_led_chain_reference_resolves(self):
+        """
+        The invariant across every machine type that references a neopixel chain: the
+        QuattroBox fix, ViViD's underscore-less-but-declared chains, the standard _<unit>
+        machines, and the multi-unit ercf_vvd (whose unit0 also references the printer's
+        cabinet_leds) must all have every referenced chain declared.
+        """
+        profiles_to_check = (
+            ('quattro_box_1_0', _quattro_box('1_0')),
+            ('quattro_box_1_1', _quattro_box('1_1')),
+            ('quattro_box_2_0', _quattro_box('2_0')),
+            ('vivid', _vivid()),
+            ('boxturtle', profiles.get('boxturtle')),
+            ('emu', profiles.get('emu')),
+            ('ercf_vvd', profiles.get('ercf_vvd')),
+        )
+        for name, profile in profiles_to_check:
+            with self.subTest(profile=name):
+                self.assertEqual(
+                    self._unresolved(profile), [],
+                    '%s references a neopixel chain with no [neopixel] section: %s'
+                    % (name, self._unresolved(profile)))
+
+    def test_check_actually_catches_a_mismatch(self):
+        """
+        Guard against the resolver going vacuous: force the pre-fix underscore-less value
+        back in on QuattroBox and _unresolved must flag all three segments. Without this,
+        a silent bug in _unresolved would let test_every_led_chain_reference_resolves pass
+        for the wrong reason.
+        """
+        profile = profiles.Profile('quattro_box_prefix', syms={
+            'MMU_FAMILY_QUATTRO_BOX': True, 'MMU_TYPE_QUATTRO_BOX_1_0': True,
+            'PARAM_EXIT_LEDS': 'neopixel:unit0_leds (1-4)',
+            'PARAM_STATUS_LEDS': 'neopixel:unit0_leds (5-14)',
+            'PARAM_LOGO_LEDS': 'neopixel:unit0_leds (15-32)',
+        })
+        self.assertEqual(len(self._unresolved(profile)), 3)
 
 
 if __name__ == '__main__':

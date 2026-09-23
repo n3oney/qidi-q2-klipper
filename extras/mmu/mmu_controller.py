@@ -631,6 +631,7 @@ class MmuController(MmuFilamentMovement):
     def get_status(self, eventtime):
         status = {
             'enabled': self.is_enabled,
+            'kalico': int(self.kalico),
             'num_gates': self.num_gates,
             'is_homed': all(unit.selector.is_homed for unit in self.mmu_machine.units),
             'print_state': self.psm.print_state,
@@ -2550,6 +2551,21 @@ class MmuController(MmuFilamentMovement):
         finally:
             if enabled:
                 self._enable_filament_monitoring()
+
+
+    @contextlib.contextmanager
+    def wrap_suspend_calibration_events(self):
+        # Calibration can select other gates/units. Suppress edges on every sensor
+        # before they queue a callback, while retaining readings and button feedback.
+        helpers = {sensor.runout_helper for sensor in self.sensor_manager.all_sensors_map.values()}
+        for helper in helpers:
+            helper.suspend_events(True)
+        try:
+            with self.wrap_suspend_filament_monitoring():
+                yield self
+        finally:
+            for helper in helpers:
+                helper.suspend_events(False)
 
 
     @contextlib.contextmanager
