@@ -615,7 +615,13 @@ class MmuCompoundEndstop:
 
         self._resolved = False
         self._pending = len(self.endstops)
-        for es in self.endstops:
+        # Arm the physical stop before any NFC poll can yield to the reactor.
+        endstops = ([self.mcu_endstop] + self.virtual_endstops
+                    if self.mcu_endstop is not None else self.endstops)
+        for es in endstops:
+            share_stop = getattr(es, "set_homing_mcu_endstop", None)
+            if share_stop is not None:
+                share_stop(self.mcu_endstop)
             child_completion = es.home_start(
                 print_time, sample_time, sample_count, rest_time, triggered
             )
@@ -695,6 +701,13 @@ class MmuCompoundEndstop:
             except Exception as e:
                 results.append((es, None, e))
 
+        # A host-requested NFC stop is not proof that the MCU received it.
+        # Do not let a tag detection hide a physical dispatch timeout.
+        errors = [(es, err) for es, _t, err in results if err is not None]
+        mcu_errors = [err for es, err in errors if isinstance(es, mcu.MCU_endstop)]
+        if mcu_errors:
+            raise mcu_errors[0]
+
         # Winner = the earliest trigger time among the children that actually triggered.
         # min() over the enumerate index breaks ties by insertion order, which for the NFC
         # compound is [gate switch, reader] - and gate-first is the safe direction, since
@@ -707,17 +720,6 @@ class MmuCompoundEndstop:
         candidates = [(t, i, es) for i, (es, t, err) in enumerate(results)
                       if self._child_triggered(t, err)]
         if not candidates:
-            # Nobody triggered, so surface the most informative failure we have.
-            #
-            # Prefer an exception from a real MCU child: MCU_endstop signals a plain
-            # no-trigger by RETURNING 0., so if it raised at all it is a genuine fault
-            # ("Communication timeout during homing"). A virtual child, by contrast, raises
-            # as its ordinary no-trigger signal, so its error must not be allowed to mask
-            # a hardware fault - which is exactly what re-raising the last error did.
-            errors = [(es, err) for es, _t, err in results if err is not None]
-            mcu_errors = [err for es, err in errors if isinstance(es, mcu.MCU_endstop)]
-            if mcu_errors:
-                raise mcu_errors[0]
             if errors:
                 # A virtual child's own message names the endstop, which beats ours
                 raise errors[0][1]
