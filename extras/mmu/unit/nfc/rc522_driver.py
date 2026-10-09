@@ -542,20 +542,13 @@ class RC522Driver:
         self._probe_reset_state()
 
     def probe_stop(self):
-        """Abandon any exchange in flight and hand the tag back in IDLE.
-
-        The IDLE part matters. Our probe wakes tags with WUPA, so a detected tag is
-        left in READY - and the read_target() that follows starts with _request_a(),
-        i.e. REQA, which READY tags do not answer. Without this the post-move read
-        would fail every time on a tag the probe had just found.
-
-        HALT is not the answer either (tags in HALT ignore REQA too). Instead drop
-        the RF field briefly: unpowered PICCs reset, so they come back up in IDLE
-        and answer REQA normally. Only needed once, on the handoff - within a homing
-        run WUPA keeps working from READY.
-        """
+        """Stop the presence probe and return the tag to IDLE."""
         if self._probe_in_flight:
             self._probe_finish()
+        return self._reset_rf_field()
+
+    def _reset_rf_field(self):
+        """Return tags to IDLE before a new selection."""
         try:
             self._write(_CommandReg, _PCD_IDLE)
             # Field down, then back up. Restore the TX bits unconditionally -
@@ -567,7 +560,7 @@ class RC522Driver:
             self._sleep(0.002)            # Let them power back up into IDLE
         except Exception as e:
             if self._debug >= 3:
-                logger.info("[%s rc522] probe_stop field reset failed: %s",
+                logger.info("[%s rc522] field reset failed: %s",
                             self._name, e)
             # Best effort to leave the antenna on regardless
             try:
@@ -677,6 +670,10 @@ class RC522Driver:
         }
 
     def _select_iso14443a_target(self, timeout=None):
+        # REQA only detects idle tags. A previous SELECT leaves the tag active.
+        # Reset the field before every new selection, not during memory reads.
+        if not self._reset_rf_field():
+            return None
         req = self._request_a(timeout=timeout)
         if req is None:
             return None
