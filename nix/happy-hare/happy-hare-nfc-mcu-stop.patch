@@ -1,0 +1,180 @@
+--- a/extras/mmu/unit/nfc/mmu_nfc_endstop.py
++++ b/extras/mmu/unit/nfc/mmu_nfc_endstop.py
+@@ -7,9 +7,8 @@
+ #       "triggers" when a tag is detected. Lets a gear/filament homing move stop
+ #       as soon as the spool's RFID tag reaches the reader.
+ #
+-# PROTOTYPE - host-polled trigger during a drip-homing move (see MmuNfcManager
+-# poll orchestration). Confirmed viable on RC522 (SPI); PN532/PN7160 (I2C) need
+-# a bench check of per-poll blocking time against the drip budget (~50ms safe).
++# The manager polls for tag presence on the host. Detection also triggers the
++# MCU's homing stop handler so queued steps cannot carry the tag past the reader.
+ #
+ # (\_/)
+ # ( *,*)
+@@ -18,17 +17,17 @@
+ # This file may be distributed under the terms of the GNU GPLv3 license.
+ #
+ 
++import mcu
++
+ from ...mmu_sensor_utils import MmuVirtualEndstopSensor
+ 
+ 
+ class MmuNfcEndstop(MmuVirtualEndstopSensor):
+     """
+-    A per-gate NFC reader presented as a Klipper endstop. It reuses the host
+-    software-endstop machinery of MmuVirtualEndstopSensor (home_start arms a
+-    reactor completion; trigger_handler completes it). The trigger is driven by
+-    the manager's homing poll loop calling trigger_handler(print_time, True) when
+-    the reader reports a tag - so 'home_start' starts that poll and 'home_wait'
+-    stops it.
++    A host-polled NFC endstop with MCU step cancellation. Standalone scans own a
++    trigger dispatch; compound scans share the physical gate endstop's dispatch
++    because a stepper can only have one armed stop handler. The host-request
++    reason stops the motor without reporting a false physical gate hit.
+     """
+ 
+     def __init__(self, config, gate, reader, poll_controller, register=False):
+@@ -38,6 +37,34 @@
+         self.gate = gate
+         self.reader = reader
+         self._poll_controller = poll_controller
++        self._dispatch = None
++        self._homing_mcu_endstop = None
++        self._stop_dispatch = None
++        self._owns_dispatch = False
++
++
++    def add_stepper(self, stepper):
++        super().add_stepper(stepper)
++        if self._dispatch is None:
++            self._dispatch = mcu.TriggerDispatch(stepper.get_mcu())
++        self._dispatch.add_stepper(stepper)
++
++
++    def set_homing_mcu_endstop(self, endstop):
++        # Used for one home only; the compound owns this dispatch's lifecycle.
++        self._homing_mcu_endstop = endstop
++
++
++    def trigger_handler(self, eventtime, state):
++        if self._homing and state and self._last_trigger_time is None:
++            # Use the already-armed dispatch on every participating MCU. These
++            # commands cancel queued steps, not just future host scheduling.
++            for trsync in self._stop_dispatch._trsyncs:
++                trsync._trsync_trigger_cmd.send(
++                    [trsync.get_oid(), mcu.MCU_trsync.REASON_HOST_REQUEST])
++            self._poll_controller.mmu.log_debug(
++                "NFC: gate %d requested MCU stop at tag detection" % self.gate)
++        super().trigger_handler(eventtime, state)
+ 
+ 
+     def _endstop_trigger_time(self, eventtime):
+@@ -50,21 +77,44 @@
+     # Endstop homing interface -----------------------------------------------------
+ 
+     def home_start(self, print_time, sample_time, sample_count, rest_time, triggered):
+-        # Reset detection state so a previous read can't pre-trigger this home,
+-        # then start the manager's tight poll of this gate's reader. Reactor time,
+-        # not the homing print_time - that is the clock the helper gates on.
++        shared, self._homing_mcu_endstop = self._homing_mcu_endstop, None
++        if shared is not None:
++            if any(s not in shared.get_steppers() for s in self.get_steppers()):
++                raise self.printer.command_error(
++                    "NFC and gate endstops must share their homing steppers")
++            self._stop_dispatch = shared._dispatch
++        else:
++            self._stop_dispatch = self._dispatch
++        if self._stop_dispatch is None:
++            raise self.printer.command_error("No stepper bound to NFC endstop")
++        self._owns_dispatch = shared is None
++
+         self.runout_helper.note_filament_present(self.runout_helper.reactor.monotonic(), False)
+-
++        # Presence always triggers, including a backward scan.
++        completion = super().home_start(
++            print_time, sample_time, sample_count, rest_time, True)
++        if self._owns_dispatch:
++            # The MCU completion also stops the move on communication failure.
++            completion = self._stop_dispatch.start(print_time)
+         self._poll_controller.start_homing_poll(self)
+-
+-        # A tag detection is ALWAYS the trigger, independent of move direction. The
+-        # caller derives 'triggered' from the move sign (True forward / False for a
+-        # backward/unload move) - switch-endstop semantics that don't apply to an
+-        # NFC reader - so pin it True. The move direction still comes from the
+-        # distance sign; only the state we trigger on is fixed.
+-        return super().home_start(print_time, sample_time, sample_count, rest_time, True)
++        return completion
+ 
+ 
+     def home_wait(self, home_end_time):
+-        self._poll_controller.stop_homing_poll()
+-        return super().home_wait(home_end_time)
++        try:
++            self._poll_controller.stop_homing_poll()
++            if self._owns_dispatch:
++                try:
++                    self._stop_dispatch.wait_end(home_end_time)
++                finally:
++                    reason = self._stop_dispatch.stop()
++                if reason >= mcu.MCU_trsync.REASON_COMMS_TIMEOUT:
++                    raise self.printer.command_error("Communication timeout during NFC homing")
++                if reason != mcu.MCU_trsync.REASON_HOST_REQUEST:
++                    self._last_trigger_time = None
++            return super().home_wait(home_end_time)
++        finally:
++            self._homing = False
++            self._trigger_completion = None
++            self._stop_dispatch = None
++            self._owns_dispatch = False
+--- a/extras/mmu/mmu_sensor_utils.py
++++ b/extras/mmu/mmu_sensor_utils.py
+@@ -615,7 +615,13 @@
+ 
+         self._resolved = False
+         self._pending = len(self.endstops)
+-        for es in self.endstops:
++        # Arm the physical stop before any NFC poll can yield to the reactor.
++        endstops = ([self.mcu_endstop] + self.virtual_endstops
++                    if self.mcu_endstop is not None else self.endstops)
++        for es in endstops:
++            share_stop = getattr(es, "set_homing_mcu_endstop", None)
++            if share_stop is not None:
++                share_stop(self.mcu_endstop)
+             child_completion = es.home_start(
+                 print_time, sample_time, sample_count, rest_time, triggered
+             )
+@@ -694,6 +700,13 @@
+                 results.append((es, es.home_wait(home_end_time), None))
+             except Exception as e:
+                 results.append((es, None, e))
++
++        # A host-requested NFC stop is not proof that the MCU received it.
++        # Do not let a tag detection hide a physical dispatch timeout.
++        errors = [(es, err) for es, _t, err in results if err is not None]
++        mcu_errors = [err for es, err in errors if isinstance(es, mcu.MCU_endstop)]
++        if mcu_errors:
++            raise mcu_errors[0]
+ 
+         # Winner = the earliest trigger time among the children that actually triggered.
+         # min() over the enumerate index breaks ties by insertion order, which for the NFC
+@@ -707,17 +720,6 @@
+         candidates = [(t, i, es) for i, (es, t, err) in enumerate(results)
+                       if self._child_triggered(t, err)]
+         if not candidates:
+-            # Nobody triggered, so surface the most informative failure we have.
+-            #
+-            # Prefer an exception from a real MCU child: MCU_endstop signals a plain
+-            # no-trigger by RETURNING 0., so if it raised at all it is a genuine fault
+-            # ("Communication timeout during homing"). A virtual child, by contrast, raises
+-            # as its ordinary no-trigger signal, so its error must not be allowed to mask
+-            # a hardware fault - which is exactly what re-raising the last error did.
+-            errors = [(es, err) for es, _t, err in results if err is not None]
+-            mcu_errors = [err for es, err in errors if isinstance(es, mcu.MCU_endstop)]
+-            if mcu_errors:
+-                raise mcu_errors[0]
+             if errors:
+                 # A virtual child's own message names the endstop, which beats ours
+                 raise errors[0][1]
