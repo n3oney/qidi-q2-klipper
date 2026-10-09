@@ -100,6 +100,9 @@
     ./patches/0015-motion-queuing-disconnect-cleanup.patch
     ./patches/0016-toolhead-check-pause-yield.patch
     ./patches/0017-motion-queuing-drip-headroom.patch
+    # Mainline Klipper load cell probe (trigger_analog + sos_filter +
+    # continuous tare + ascent fit) replacing Kalico's load_cell_probe
+    ./patches/0018-load-cell-probe-trigger-analog.patch
   ];
 
 in {

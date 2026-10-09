@@ -1,0 +1,4581 @@
+diff --git a/docs/Config_Reference.md b/docs/Config_Reference.md
+index c3dd8f50..743f2ddf 100644
+--- a/docs/Config_Reference.md
++++ b/docs/Config_Reference.md
+@@ -5957,6 +5957,29 @@ dout_pin:
+ #   in software.
+ ```
+ 
++#### CS1237
++The CS1237 is a 24-bit ADC with software-selectable gain and sample rate. It is
++suitable for load-cell probing (used by the QIDI Q2 toolhead).
++```
++[load_cell]
++sensor_type: cs1237
++sclk_pin:
++#   The pin connected to the CS1237 clock line. This parameter must be
++#   provided.
++dout_pin:
++#   The bidirectional pin connected to the CS1237 data line. This parameter
++#   must be provided.
++#sample_rate: 1280
++#   Valid sample rates are 10, 40, 640, and 1280 samples per second. The
++#   default is 1280.
++#gain: 128
++#   Valid gain values are 1, 2, 64, and 128. The default is 128.
++#channel: A
++#   Valid channels are A, temperature, and short. The default is A.
++#refout_off: False
++#   Disable the CS1237 reference output when True. The default is False.
++```
++
+ #### ADS1220
+ The ADS1220 is a 24 bit ADC supporting up to a 2Khz sample rate configurable in
+ software.
+@@ -6077,25 +6100,27 @@ data_ready_pin:
+ ### [load_cell_probe]
+ Load Cell Probe. This combines the functionality of a [probe] and a [load_cell].
+ 
+-See also [simple_tap_classifier] for tap validation configuration.
++The probe "taps" the bed: it descends until the MCU `trigger_analog`
++detects `trigger_force`, then lifts by `sample_retract_dist` while the
++force samples are collected, and fits the ascent force/Z data to find the
++height at which contact was lost. This is the mainline Klipper design
++(continuous tare + ascent fit); Kalico's retry options from the [probe]
++section (`bad_probe_strategy`, `bad_probe_retries`, ...) still apply.
+ 
+ ```
+ [load_cell_probe]
+ sensor_type:
+ #   This must be one of the supported bulk ADC sensor types and support
+-#   load cell endstops on the mcu.
++#   trigger_analog on the mcu (hx711, hx717, cs1237, ads1220, ads131m0x).
+ #counts_per_gram:
+ #reference_tare_counts:
+ #sensor_orientation:
+ #   These parameters must be configured before the probe will operate.
+ #   See the [load_cell] section for further details.
+ #force_safety_limit: 2000
+-#   The safe force limit for starting a probe. This is relative to the 
+-#   reference_tare_counts which is the sensor's absolute 0 force value.
+-#   Set to 0 to disable. The default is +/-2Kg.
+-#drift_safety_limit: 1000
+-#   The maximum absolute force change allowed while probing. Set to 0 to disable.
+-#   The default is +/-1Kg.
++#   The safe limit for probing force relative to the reference_tare_counts on
++#   the load_cell. Exceeding it while probing aborts the probe. Set to 0 to
++#   disable. The default is +/-2Kg.
+ #trigger_force: 75.0
+ #   The force that the probe will trigger at. 75g is the default.
+ #drift_filter_cutoff_frequency: 0.8
+@@ -6121,56 +6146,29 @@ sensor_type:
+ #notch_filter_quality: 2.0
+ #   Controls how narrow the range of frequencies are that the notch filter
+ #   removes. Larger numbers produce a narrower filter. Minimum value is 0.5 and
+-#   maximum is 3.0. Default: 2.0
++#   maximum is 6.0. Default: 2.0
+ #tare_time:
+ #   The time in seconds used for taring the load_cell before each probe. The
+-#   default value is: 5 / 50 = 0.1. This collects samples from 5 cycles of
+-#   50Hz / 6 cycles of 60Hz mains power to cancel power line noise.
+-#disable_pullback_move: False
+-#   When True, disables the pullback move and tap analysis after probe trigger.
+-#   The probe will use the raw trigger position instead of the calculated Z=0
+-#   from tap analysis. This reduces probe accuracy but may be useful for
+-#   troubleshooting or compatibility testing. The default is False.
+-#pullback_distance: 0.2
+-#   The distance in mm to slowly raise the probe to perform precise Z=0
+-#   measurments. This move occurs immediately after the probe detects contact.
+-#   The distance needs to be approximatly 2x the distance required for the probe
+-#   to break contact with the bed. Valid range is 0.01 to 2.0 mm.
+-#   The default is 0.2 mm.
+-#pullback_speed:
+-#   The speed in mm/s for the pullback move after probe trigger. Valid range is
+-#   0.1 to 1.0 mm/s. The default is set to 1 micron (0.001mm) per sensor sample.
+-#tap_classifier_module:
+-#   Optional module for custom tap validation. The default is TapQualityClassifier.
+-#   Setting a custom classifier overrides TapQualityClassifier with your implementation.
+-#min_tap_quality: 40.0
+-#   The minimum acceptable tap quality score. Valid range is 0 to 100 percent.
+-#   The default is 40%.
+-#decompression_angle:
+-#   The average angle of the decompression line for clean taps. The further the
+-#   measured decompression angle is from this angle, the worse its tap quality score.
+-#   There is no default, this must be measured. It is a number in degrees
+-#   between 0 and 90.
+-#max_approach_force: 50
+-#max_departure_force: 25
+-#max_baseline_force_delta: 25
+-#max_dwell_force_drop: 75
+-#   Maximums for tap quality checks expressed as a percentage.
++#   default value is: 4 / 60 = 0.066. This collects samples from 4 cycles of
++#   60Hz mains power to cancel power line noise.
++#sample_retract_dist: 2.0
++#   The distance the toolhead is lifted after each tap while the ascent
++#   samples are collected. It replaces the generic [probe] retract, which is
++#   not performed a second time.
+ #z_offset:
+ #speed:
+ #samples:
+-#sample_retract_dist:
+ #lift_speed:
+ #samples_result:
+ #samples_tolerance:
+ #samples_tolerance_retries:
+ #activate_gcode:
+ #deactivate_gcode:
++#bad_probe_strategy:
++#bad_probe_retries:
+ #   See the "[probe]" section for a description of the above parameters.
+ ```
+ 
+-See [Tap Quality Components](Load_Cell.md#tap-quality-components) for more details on maximum for tap quality.
+-
+ ## Board specific hardware support
+ 
+ ### [sx1509]
+diff --git a/klippy/extras/load_cell/ads1220.py b/klippy/extras/load_cell/ads1220.py
+index 75a528a3..36bdd151 100644
+--- a/klippy/extras/load_cell/ads1220.py
++++ b/klippy/extras/load_cell/ads1220.py
+@@ -158,7 +158,6 @@ class ADS1220(LoadCellSensor):
+             UPDATE_INTERVAL,
+         )
+         # Command Configuration
+-        self.attach_probe_cmd = None
+         mcu.add_config_cmd(
+             "config_ads1220 oid=%d spi_oid=%d data_ready_pin=%s"
+             % (self.oid, self.spi.get_oid(), self.data_ready_pin)
+@@ -169,14 +168,18 @@ class ADS1220(LoadCellSensor):
+         mcu.register_config_callback(self._build_config)
+         self.query_ads1220_cmd = None
+ 
++    def setup_trigger_analog(self, trigger_analog_oid: int):
++        self.mcu.add_config_cmd(
++            "ads1220_attach_trigger_analog oid=%d trigger_analog_oid=%d"
++            % (self.oid, trigger_analog_oid),
++            is_init=True,
++        )
++
+     def _build_config(self):
+         cmdqueue = self.spi.get_command_queue()
+         self.query_ads1220_cmd = self.mcu.lookup_command(
+             "query_ads1220 oid=%c rest_ticks=%u", cq=cmdqueue
+         )
+-        self.attach_probe_cmd = self.mcu.lookup_command(
+-            "ads1220_attach_load_cell_probe oid=%c load_cell_probe_oid=%c"
+-        )
+         self.ffreader.setup_query_command(
+             "query_ads1220_status oid=%c", oid=self.oid, cq=cmdqueue
+         )
+@@ -199,8 +202,15 @@ class ADS1220(LoadCellSensor):
+     def add_client(self, callback: BulkAdcDataCallback):
+         self.batch_bulk.add_client(callback)
+ 
+-    def attach_load_cell_probe(self, load_cell_probe_oid: int):
+-        self.attach_probe_cmd.send([self.oid, load_cell_probe_oid])
++    def get_status(self, eventtime):
++        return {
++            "errors": self.last_error_count,
++            "overflows": self.ffreader.get_last_overflows(),
++            "sample_rate": self.get_samples_per_second(),
++        }
++
++    def lookup_sensor_error(self, error_code: int) -> str:
++        return "Unknown ads1220 error %d" % (error_code,)
+ 
+     # Measurement decoding
+     def _convert_samples(self, samples):
+diff --git a/klippy/extras/load_cell/ads131m0x.py b/klippy/extras/load_cell/ads131m0x.py
+index 914540d8..3a64c1de 100644
+--- a/klippy/extras/load_cell/ads131m0x.py
++++ b/klippy/extras/load_cell/ads131m0x.py
+@@ -154,8 +154,15 @@ class ADS131MxBase(LoadCellSensor):
+             UPDATE_INTERVAL,
+         )
+         mcu.register_config_callback(self._build_config)
+-        self.attach_probe_cmd = None
+         self.query_ads131m0x_cmd = None
++        self._sensor_errors: Dict[int, str] = {}
++
++    def setup_trigger_analog(self, trigger_analog_oid: int):
++        self.mcu.add_config_cmd(
++            f"ads131m0x_attach_trigger_analog oid={self.oid} "
++            f"trigger_analog_oid={trigger_analog_oid}",
++            is_init=True,
++        )
+ 
+     def _build_config(self):
+         cq = self.spi.get_command_queue()
+@@ -171,12 +178,11 @@ class ADS131MxBase(LoadCellSensor):
+         self.query_ads131m0x_cmd = self.mcu.lookup_command(
+             "query_ads131m0x oid=%c rest_ticks=%u", cq=cq
+         )
+-        self.attach_probe_cmd = self.mcu.lookup_command(
+-            "ads131m0x_attach_load_cell_probe oid=%c load_cell_probe_oid=%c"
+-        )
+         self.ffreader.setup_query_command(
+             "query_ads131m0x_status oid=%c", oid=self.oid, cq=cq
+         )
++        errors = self.mcu.get_enumerations().get("ads131m0x_error:", {})
++        self._sensor_errors = {v: k for k, v in errors.items()}
+ 
+     def _read_channels(self, config: ConfigWrapper):
+         channels = config.getintlist("channels", default=(0,))
+@@ -213,8 +219,17 @@ class ADS131MxBase(LoadCellSensor):
+     def add_client(self, callback: BulkAdcDataCallback):
+         self.batch_bulk.add_client(callback)
+ 
+-    def attach_load_cell_probe(self, load_cell_probe_oid: int):
+-        self.attach_probe_cmd.send([self.oid, load_cell_probe_oid])
++    def get_status(self, eventtime):
++        return {
++            "errors": self.last_error_count,
++            "overflows": self.ffreader.get_last_overflows(),
++            "sample_rate": self.get_samples_per_second(),
++        }
++
++    def lookup_sensor_error(self, error_code: int) -> str:
++        return self._sensor_errors.get(
++            error_code, f"Unknown {self.sensor_type} error {error_code}"
++        )
+ 
+     # Measurement decoding
+     def _convert_samples(self, samples):
+diff --git a/klippy/extras/load_cell/cs1237.py b/klippy/extras/load_cell/cs1237.py
+index 8ef10fd1..0d0710b8 100644
+--- a/klippy/extras/load_cell/cs1237.py
++++ b/klippy/extras/load_cell/cs1237.py
+@@ -73,7 +73,7 @@ class CS1237(LoadCellSensor):
+         )
+         # Command Configuration
+         self.query_cs1237_cmd = None
+-        self.attach_probe_cmd = None
++        self._sensor_errors = {}
+         mcu.add_config_cmd(
+             "config_cs1237 oid=%d config=%d dout_pin=%s sclk_pin=%s"
+             % (self.oid, config_reg, self.dout_pin, self.sclk_pin)
+@@ -83,18 +83,24 @@ class CS1237(LoadCellSensor):
+         )
+         mcu.register_config_callback(self._build_config)
+ 
++    def setup_trigger_analog(self, trigger_analog_oid: int):
++        self.mcu.add_config_cmd(
++            "cs1237_attach_trigger_analog oid=%d trigger_analog_oid=%d"
++            % (self.oid, trigger_analog_oid),
++            is_init=True,
++        )
++
+     def _build_config(self):
+         self.query_cs1237_cmd = self.mcu.lookup_command(
+             "query_cs1237 oid=%c rest_ticks=%u"
+         )
+-        self.attach_probe_cmd = self.mcu.lookup_command(
+-            "cs1237_attach_load_cell_probe oid=%c load_cell_probe_oid=%c"
+-        )
+         self.ffreader.setup_query_command(
+             "query_cs1237_status oid=%c",
+             oid=self.oid,
+             cq=self.mcu.alloc_command_queue(),
+         )
++        errors = self.mcu.get_enumerations().get("cs1237_error:", {})
++        self._sensor_errors = {v: k for k, v in errors.items()}
+ 
+     def get_mcu(self) -> MCU:
+         return self.mcu
+@@ -114,8 +120,17 @@ class CS1237(LoadCellSensor):
+     def add_client(self, callback: BulkAdcDataCallback):
+         self.batch_bulk.add_client(callback)
+ 
+-    def attach_load_cell_probe(self, load_cell_probe_oid: int):
+-        self.attach_probe_cmd.send([self.oid, load_cell_probe_oid])
++    def get_status(self, eventtime):
++        return {
++            "errors": self.last_error_count,
++            "overflows": self.ffreader.get_last_overflows(),
++            "sample_rate": self.sps,
++        }
++
++    def lookup_sensor_error(self, error_code: int) -> str:
++        return self._sensor_errors.get(
++            error_code, "Unknown CS1237 error %d" % (error_code,)
++        )
+ 
+     # Measurement decoding
+     def _convert_samples(self, samples):
+diff --git a/klippy/extras/load_cell/hx71x.py b/klippy/extras/load_cell/hx71x.py
+index b8b43126..257a4cae 100644
+--- a/klippy/extras/load_cell/hx71x.py
++++ b/klippy/extras/load_cell/hx71x.py
+@@ -72,7 +72,6 @@ class HX71xBase(LoadCellSensor):
+         )
+         # Command Configuration
+         self.query_hx71x_cmd = None
+-        self.attach_probe_cmd = None
+         mcu.add_config_cmd(
+             "config_hx71x oid=%d gain_channel=%d dout_pin=%s sclk_pin=%s"
+             % (self.oid, self.gain_channel, self.dout_pin, self.sclk_pin)
+@@ -83,13 +82,17 @@ class HX71xBase(LoadCellSensor):
+ 
+         mcu.register_config_callback(self._build_config)
+ 
++    def setup_trigger_analog(self, trigger_analog_oid: int):
++        self.mcu.add_config_cmd(
++            "hx71x_attach_trigger_analog oid=%d trigger_analog_oid=%d"
++            % (self.oid, trigger_analog_oid),
++            is_init=True,
++        )
++
+     def _build_config(self):
+         self.query_hx71x_cmd = self.mcu.lookup_command(
+             "query_hx71x oid=%c rest_ticks=%u"
+         )
+-        self.attach_probe_cmd = self.mcu.lookup_command(
+-            "hx71x_attach_load_cell_probe oid=%c load_cell_probe_oid=%c"
+-        )
+         self.ffreader.setup_query_command(
+             "query_hx71x_status oid=%c",
+             oid=self.oid,
+@@ -114,8 +117,15 @@ class HX71xBase(LoadCellSensor):
+     def add_client(self, callback: BulkAdcDataCallback):
+         self.batch_bulk.add_client(callback)
+ 
+-    def attach_load_cell_probe(self, load_cell_probe_oid: int):
+-        self.attach_probe_cmd.send([self.oid, load_cell_probe_oid])
++    def get_status(self, eventtime):
++        return {
++            "errors": self.last_error_count,
++            "overflows": self.ffreader.get_last_overflows(),
++            "sample_rate": self.get_samples_per_second(),
++        }
++
++    def lookup_sensor_error(self, error_code: int) -> str:
++        return "Unknown %s error %d" % (self.sensor_type, error_code)
+ 
+     # Measurement decoding
+     def _convert_samples(self, samples):
+diff --git a/klippy/extras/load_cell/interfaces.py b/klippy/extras/load_cell/interfaces.py
+index 6ab0446f..38d0ce41 100644
+--- a/klippy/extras/load_cell/interfaces.py
++++ b/klippy/extras/load_cell/interfaces.py
+@@ -49,13 +49,23 @@ class BulkAdcSensor(Protocol):
+         ...
+ 
+ 
+-class McuLoadCellProbe(Protocol):
+-    """Attach a sensor to a LoadCell object on the MCU"""
++class TriggerAnalogSensor(Protocol):
++    """Attach a sensor to a trigger_analog object on the MCU"""
+ 
+-    def attach_load_cell_probe(self, load_cell_probe_oid: int): ...
++    def setup_trigger_analog(self, trigger_analog_oid: int):
++        """Queue the MCU init command that routes samples to trigger_analog"""
++        ...
++
++    def lookup_sensor_error(self, error_code: int) -> str:
++        """Describe a sensor specific trigger_analog error code"""
++        ...
++
++    def get_status(self, eventtime) -> dict:
++        """Report sensor errors/overflows/sample_rate"""
++        ...
+ 
+ 
+-class LoadCellSensor(BulkAdcSensor, McuLoadCellProbe):
++class LoadCellSensor(BulkAdcSensor, TriggerAnalogSensor):
+     """The complete load cell interface"""
+ 
+     ...
+diff --git a/klippy/extras/load_cell/load_cell.py b/klippy/extras/load_cell/load_cell.py
+index e85da614..c56ba652 100644
+--- a/klippy/extras/load_cell/load_cell.py
++++ b/klippy/extras/load_cell/load_cell.py
+@@ -384,10 +384,14 @@ class LoadCellSampleCollector:
+         self._errors = 0
+         overflows = self._overflows
+         self._overflows = 0
++        if self._mcu.is_fileoutput():
++            samples = [(0.0, 0.0, 0.0)]
+         return samples, (errors, overflows) if errors or overflows else 0
+ 
+     def _collect_until(self, timeout):
+         self.start_collecting()
++        if self._mcu.is_fileoutput():
++            return self._finish_collecting()
+         # calculate print time delay and convert to reactor time
+         now = self._reactor.monotonic()
+         print_time = self._mcu.estimated_print_time(now)
+@@ -656,4 +660,5 @@ class LoadCell:
+                 "tare_force": self.tare_force,
+             }
+         )
++        status.update(self.sensor.get_status(eventtime))
+         return status
+diff --git a/klippy/extras/load_cell/load_cell_probe.py b/klippy/extras/load_cell/load_cell_probe.py
+index 001636c1..e4c0fa9f 100644
+--- a/klippy/extras/load_cell/load_cell_probe.py
++++ b/klippy/extras/load_cell/load_cell_probe.py
+@@ -3,30 +3,49 @@
+ # Copyright (C) 2025  Gareth Farrington <gareth@waves.ky>
+ #
+ # This file may be distributed under the terms of the GNU GPLv3 license.
++#
++# Port of the mainline Klipper "continuous tare" load cell probe (the
++# trigger_analog / sos_filter design plus the ascent least-squares fit)
++# onto Kalico's PrinterProbe / homing interfaces.
+ import math
++import sys
+ from typing import Tuple
+ 
+ import numpy as np
+ 
+-from klippy import mcu
++from klippy import mathutil, mcu
+ from klippy.configfile import ConfigWrapper
++from klippy.extras import trigger_analog
+ from klippy.extras.homing import PrinterHoming
+ from klippy.extras.probe import PrinterProbe
+ from klippy.gcode import GCodeCommand
+ 
+-from . import sos_filter
+ from .interfaces import LoadCellSensor
+-from .load_cell import (
+-    LoadCell,
+-    LoadCellSampleCollector,
+-)
+-from .tap_analysis import TapAnalysisHelper, TapClassifierModule
++from .load_cell import ApiClientHelper, LoadCell, LoadCellSampleCollector
++
++# MCU SOS filter scaled to "fractional grams" for consistent sensor precision
++FRAC_GRAMS_CONV = 32768.0
++
++# Minimum ascent samples needed for piecewise least-squares fit
++FIT_MIN_POINTS = 3
++
++# Time window for collecting ascent data in seconds
++ASCENT_DATA_WINDOW_SECONDS = 0.3
++
++
++class TapAnalysis:
++    def __init__(self, samples):
++        nd_samples = np.asarray(samples, dtype=np.float64)
++        self.time = nd_samples[:, 0]
++        self.force = nd_samples[:, 1]
+ 
+-# constants for fixed point numbers
+-Q2_INT_BITS = 2
+-Q2_FRAC_BITS = 32 - (1 + Q2_INT_BITS)
+-Q16_INT_BITS = 16
+-Q16_FRAC_BITS = 32 - (1 + Q16_INT_BITS)
++    # convert to dictionary for JSON encoder
++    def to_dict(self):
++        return {
++            "time": self.time.tolist(),
++            "force": self.force.tolist(),
++            "is_valid": True,
++        }
+ 
+ 
+ # Access a parameter from config or GCode command via a consistent interface
+@@ -226,29 +245,21 @@ class ContinuousTareFilter:
+ 
+     # create a filter design from the parameters
+     def design_filter(self, error_func):
+-        design = sos_filter.DigitalFilter(
+-            self.sps,
+-            error_func,
+-            self.drift,
+-            self.drift_delay,
+-            self.buzz,
+-            self.buzz_delay,
+-            self.notches,
+-            self.notch_quality,
+-        )
+-        fixed_filter = sos_filter.FixedPointSosFilter(
+-            design.get_filter_sections(),
+-            design.get_initial_state(),
+-            Q2_INT_BITS,
+-            Q16_INT_BITS,
+-        )
+-        return fixed_filter
++        df = trigger_analog.DigitalFilter(self.sps, error_func)
++        if self.drift:
++            df.add_highpass(self.drift, self.drift_delay)
++        if self.buzz:
++            df.add_lowpass(self.buzz, self.buzz_delay)
++        for notch in self.notches:
++            df.add_notch(notch, self.notch_quality)
++        return df
+ 
+ 
+-# Combine ContinuousTareFilter and SosFilter into an easy-to-use class
++# Combine ContinuousTareFilter and MCU_SosFilter into an easy-to-use class
+ class ContinuousTareFilterHelper:
+-    def __init__(self, config, sensor, cmd_queue):
++    def __init__(self, config, sensor, sos_filter):
+         self._sensor = sensor
++        self._sos_filter = sos_filter
+         self._sps = self._sensor.get_samples_per_second()
+         max_filter_frequency = math.floor(self._sps / 2.0)
+         # setup filter parameters
+@@ -288,9 +299,8 @@ class ContinuousTareFilterHelper:
+         self._config_design = self._build_filter()
+         # filter design currently inside the MCU
+         self._active_design = self._config_design
+-        self._sos_filter = self._create_filter(
+-            self._active_design.design_filter(config.error), cmd_queue
+-        )
++        design = self._active_design.design_filter(config.error)
++        self._sos_filter.set_filter_design(design)
+ 
+     def _build_filter(self, gcmd=None):
+         drift = self._drift_param.get(gcmd)
+@@ -310,23 +320,17 @@ class ContinuousTareFilterHelper:
+             notch_quality,
+         )
+ 
+-    def _create_filter(self, fixed_filter, cmd_queue):
+-        return sos_filter.SosFilter(
+-            self._sensor.get_mcu(), cmd_queue, fixed_filter, 4
+-        )
+-
+     def update_from_command(self, gcmd):
++        if gcmd is None:
++            return
+         gcmd_filter = self._build_filter(gcmd)
+         # if filters are identical, no change required
+         if self._active_design == gcmd_filter:
+             return
+         # update MCU filter from GCode command
+-        self._sos_filter.change_filter(
+-            self._active_design.design_filter(gcmd.error)
+-        )
+-
+-    def get_sos_filter(self) -> sos_filter.SosFilter:
+-        return self._sos_filter
++        self._active_design = gcmd_filter
++        design = self._active_design.design_filter(gcmd.error)
++        self._sos_filter.set_filter_design(design)
+ 
+ 
+ # check results from the collector for errors and raise an exception is found
+@@ -340,44 +344,35 @@ def check_sensor_errors(results, printer):
+     return samples
+ 
+ 
++# compute Z position at a given print_time using stepper history
++def _lookup_z_pos(toolhead, pos_time):
++    kin = toolhead.get_kinematics()
++    steppers = kin.get_steppers()
++    kin_spos = {
++        s.get_name(): s.mcu_to_commanded_position(
++            s.get_past_mcu_position(pos_time)
++        )
++        for s in steppers
++    }
++    return kin.calc_position(kin_spos)[2]
++
++
+ class LoadCellProbeConfigHelper:
+-    def __init__(
+-        self,
+-        config: ConfigWrapper,
+-        load_cell_inst: LoadCell,
+-    ):
++    def __init__(self, config: ConfigWrapper, load_cell_inst: LoadCell):
+         self._printer = config.get_printer()
+         self._load_cell: LoadCell = load_cell_inst
+         self._sensor = load_cell_inst.get_sensor()
+-        self._rest_time = 1.0 / float(self._sensor.get_samples_per_second())
+-        # Collect 5 x 50hz power cycles of data to average across power noise
++        # Collect 4 x 60hz power cycles of data to average across power noise
+         self._tare_time_param = floatParamHelper(
+-            config, "tare_time", default=5.0 / 50.0, minval=0.01, maxval=1.0
++            config, "tare_time", default=4.0 / 60.0, minval=0.01, maxval=1.0
+         )
+         # triggering options
+-        self._trigger_force_param = intParamHelper(
++        self._trigger_force_param = floatParamHelper(
+             config, "trigger_force", default=75, minval=10, maxval=250
+         )
+-        self._force_safety_limit_param = intParamHelper(
+-            config, "force_safety_limit", minval=0, default=2000
+-        )
+-        self._drift_safety_limit = intParamHelper(
+-            config, "drift_safety_limit", minval=0, default=1000
+-        )
+-        # pullback move
+-        self._disable_pullback_move = config.getboolean(
+-            "disable_pullback_move", False
+-        )
+-        self._pullback_distance_param = floatParamHelper(
+-            config, "pullback_distance", minval=0.01, maxval=2.0, default=0.2
+-        )
+-        sps = self._sensor.get_samples_per_second()
+-        self._pullback_speed_param = floatParamHelper(
+-            config,
+-            "pullback_speed",
+-            minval=0.1,
+-            maxval=1.0,
+-            default=sps * 0.001,
++        # Kalico compatibility: 0 disables the safety band (mainline min 100)
++        self._force_safety_limit_param = floatParamHelper(
++            config, "force_safety_limit", minval=0, maxval=10000, default=2000
+         )
+ 
+     def get_tare_samples(self, gcmd=None) -> int:
+@@ -385,243 +380,70 @@ class LoadCellProbeConfigHelper:
+         sps = self._sensor.get_samples_per_second()
+         return max(2, math.ceil(tare_time * sps))
+ 
+-    def get_trigger_force_grams(self, gcmd=None) -> int:
++    def get_trigger_force_grams(self, gcmd=None) -> float:
+         return self._trigger_force_param.get(gcmd)
+ 
+-    def get_safety_limit_grams(self, gcmd=None) -> int:
++    def get_safety_limit_grams(self, gcmd=None) -> float:
+         return self._force_safety_limit_param.get(gcmd)
+ 
+-    def get_drift_safety_limit(self, gcmd=None) -> int:
+-        return self._drift_safety_limit.get(gcmd)
+-
+-    def get_pullback_speed(self, gcmd=None) -> float:
+-        return self._pullback_speed_param.get(gcmd)
+-
+-    def get_pullback_distance(self, gcmd=None) -> float:
+-        return self._pullback_distance_param.get(gcmd)
+-
+-    def is_pullback_move_disabled(self) -> bool:
+-        return self._disable_pullback_move
+-
+-    def get_rest_time(self) -> float:
+-        return self._rest_time
+-
+-    def get_reference_safety_range(self, gcmd=None) -> Tuple[int, int]:
++    def get_safety_range(self, gcmd=None) -> Tuple[int, int]:
++        sensor_min, sensor_max = self._load_cell.get_sensor().get_range()
++        limit = self.get_safety_limit_grams(gcmd)
++        if limit == 0:
++            # disabled: accept the full sensor range
++            return sensor_min, sensor_max
+         counts_per_gram = self._load_cell.get_counts_per_gram()
+         # calculate the safety band
+         zero = self._load_cell.get_reference_tare_counts()
+-        safety_counts = int(counts_per_gram * self.get_safety_limit_grams(gcmd))
++        safety_counts = int(counts_per_gram * limit)
+         safety_min = int(zero - safety_counts)
+         safety_max = int(zero + safety_counts)
+         # don't allow a safety range outside the sensor's real range
+-        sensor_min, sensor_max = self._load_cell.get_sensor().get_range()
+         if safety_min <= sensor_min or safety_max >= sensor_max:
+             cmd_err = self._printer.command_error
+-            raise cmd_err(
+-                "Load Cell Probe Error: force_safety_limit exceeds"
+-                " sensor range!"
+-            )
++            raise cmd_err("Load cell force_safety_limit exceeds sensor range!")
+         return safety_min, safety_max
+ 
+-    # check if tare_counts is within the force_safety_limit
+-    def assert_force_safety_limit(self, tare_counts, gcmd=None):
+-        limit = self.get_safety_limit_grams(gcmd)
+-        # zero limit disables this check
+-        if limit == 0:
+-            return
+-        safety_min, safety_max = self.get_reference_safety_range(gcmd)
+-        if tare_counts <= safety_min or tare_counts >= safety_max:
+-            cmd_err = self._printer.command_error
+-            force = round(self._load_cell.counts_to_grams(tare_counts), 1)
+-            raise cmd_err(
+-                "Load Cell Probe Error: force of {}g exceeds "
+-                "force_safety_limit ({}g) before probing!".format(force, limit)
+-            )
+-
+-    def get_probe_drift_range(self, tare_counts, gcmd=None) -> Tuple[int, int]:
+-        counts_per_gram = self._load_cell.get_counts_per_gram()
+-        drift_min: int = -(2**31)
+-        drift_max: int = 2**31 - 1
+-        drift_force = self.get_drift_safety_limit(gcmd)
+-        if drift_force > 0:
+-            drift_counts = int(counts_per_gram * drift_force)
+-            drift_min = int(tare_counts - drift_counts)
+-            drift_max = int(tare_counts + drift_counts)
+-            sensor_min, sensor_max = self._load_cell.get_sensor().get_range()
+-            if drift_min <= sensor_min or drift_max >= sensor_max:
+-                cmd_err = self._printer.command_error
+-                raise cmd_err(
+-                    "Load Cell Probe Error: drift_safety_limit exceeds"
+-                    " sensor range!"
+-                )
+-        return drift_min, drift_max
+-
+-    # calculate 1/counts_per_gram in Q2 fixed point
++    # calculate 1/counts_per_gram
+     def get_grams_per_count(self):
+         counts_per_gram = self._load_cell.get_counts_per_gram()
+         # The counts_per_gram could be so large that it becomes 0.0 when
+-        # converted to Q2 format. This would mean the ADC range only measures a
+-        # few grams which seems very unlikely. Treat this as an error:
+-        if counts_per_gram >= 2**Q2_FRAC_BITS:
++        # sent to the mcu. This would mean the ADC range only measures
++        # a few grams which seems very unlikely. Treat this as an error:
++        if counts_per_gram >= (1 << 29):
+             raise OverflowError("counts_per_gram value is too large to filter")
+-        return sos_filter.to_fixed_32((1.0 / counts_per_gram), Q2_INT_BITS)
+-
++        return 1.0 / counts_per_gram
+ 
+-# McuLoadCellProbe is the interface to `load_cell_probe` on the MCU
+-# This also manages the SosFilter so all commands use one command queue
+-class McuLoadCellProbe:
+-    WATCHDOG_MAX = 3
+-    ERROR_SAFETY_RANGE = mcu.MCU_trsync.REASON_COMMS_TIMEOUT + 1
+-    ERROR_OVERFLOW = mcu.MCU_trsync.REASON_COMMS_TIMEOUT + 2
+-    ERROR_WATCHDOG = mcu.MCU_trsync.REASON_COMMS_TIMEOUT + 3
+ 
++# Execute probing moves using the MCU_trigger_analog
++class LoadCellProbingMove:
+     def __init__(
+         self,
+         config: ConfigWrapper,
+         load_cell_inst: LoadCell,
+-        sos_filter_inst: sos_filter.SosFilter,
+-        config_helper: LoadCellProbeConfigHelper,
+-        trigger_dispatch: mcu.TriggerDispatch,
+-    ):
+-        self._printer = config.get_printer()
+-        self._load_cell = load_cell_inst
+-        self._sos_filter = sos_filter_inst
+-        self._config_helper = config_helper
+-        self._sensor = load_cell_inst.get_sensor()
+-        self._mcu: mcu.MCU = self._sensor.get_mcu()
+-        # configure MCU objects
+-        self._dispatch = trigger_dispatch
+-        self._cmd_queue = self._dispatch.get_command_queue()
+-        self._oid = self._mcu.create_oid()
+-        self._config_commands()
+-        self._home_cmd = None
+-        self._query_cmd = None
+-        self._set_range_cmd = None
+-        self._mcu.register_config_callback(self._build_config)
+-        self._printer.register_event_handler("klippy:connect", self._on_connect)
+-
+-    def _config_commands(self):
+-        self._sos_filter.create_filter()
+-        self._mcu.add_config_cmd(
+-            "config_load_cell_probe oid=%d sos_filter_oid=%d"
+-            % (self._oid, self._sos_filter.get_oid())
+-        )
+-
+-    def _build_config(self):
+-        self._query_cmd = self._mcu.lookup_query_command(
+-            "load_cell_probe_query_state oid=%c",
+-            "load_cell_probe_state oid=%c is_homing_trigger=%c "
+-            "trigger_ticks=%u",
+-            oid=self._oid,
+-            cq=self._cmd_queue,
+-        )
+-        self._set_range_cmd = self._mcu.lookup_command(
+-            "load_cell_probe_set_range"
+-            " oid=%c safety_counts_min=%i safety_counts_max=%i tare_counts=%i"
+-            " trigger_grams=%u grams_per_count=%i",
+-            cq=self._cmd_queue,
+-        )
+-        self._home_cmd = self._mcu.lookup_command(
+-            "load_cell_probe_home oid=%c trsync_oid=%c trigger_reason=%c"
+-            " error_reason=%c clock=%u rest_ticks=%u timeout=%u",
+-            cq=self._cmd_queue,
+-        )
+-
+-    # the sensor data stream is connected on the MCU at the ready event
+-    def _on_connect(self):
+-        self._sensor.attach_load_cell_probe(self._oid)
+-
+-    def get_oid(self):
+-        return self._oid
+-
+-    def get_mcu(self):
+-        return self._mcu
+-
+-    def get_load_cell(self) -> LoadCell:
+-        return self._load_cell
+-
+-    def get_dispatch(self):
+-        return self._dispatch
+-
+-    def set_endstop_range(self, tare_counts: int, gcmd=None):
+-        # update the load cell so it reflects the new tare value
+-        self._load_cell.tare(tare_counts)
+-        # update internal tare value
+-        safety_min, safety_max = self._config_helper.get_probe_drift_range(
+-            tare_counts, gcmd
+-        )
+-        args = [
+-            self._oid,
+-            safety_min,
+-            safety_max,
+-            tare_counts,
+-            self._config_helper.get_trigger_force_grams(gcmd),
+-            self._config_helper.get_grams_per_count(),
+-        ]
+-        self._set_range_cmd.send(args)
+-        self._sos_filter.reset_filter()
+-
+-    def home_start(self, print_time):
+-        clock = self._mcu.print_time_to_clock(print_time)
+-        rest_time = self._config_helper.get_rest_time()
+-        rest_ticks = self._mcu.seconds_to_clock(rest_time)
+-        self._home_cmd.send(
+-            [
+-                self._oid,
+-                self._dispatch.get_oid(),
+-                mcu.MCU_trsync.REASON_ENDSTOP_HIT,
+-                self.ERROR_SAFETY_RANGE,
+-                clock,
+-                rest_ticks,
+-                self.WATCHDOG_MAX,
+-            ],
+-            reqclock=clock,
+-        )
+-
+-    def clear_home(self):
+-        params = self._query_cmd.send([self._oid])
+-        # The time of the first sample that triggered is in "trigger_ticks"
+-        trigger_ticks = self._mcu.clock32_to_clock64(params["trigger_ticks"])
+-        # clear trsync from load_cell_endstop
+-        self._home_cmd.send([self._oid, 0, 0, 0, 0, 0, 0, 0])
+-        return self._mcu.clock_to_print_time(trigger_ticks)
+-
+-
+-# Execute probing moves using the McuLoadCellProbe
+-class LoadCellPrimitives:
+-    ERROR_MAP = {
+-        mcu.MCU_trsync.REASON_COMMS_TIMEOUT: "Communication timeout during "
+-        "homing",
+-        McuLoadCellProbe.ERROR_SAFETY_RANGE: "Load Cell Probe Error: force "
+-        "exceeded drift_safety_limit before triggering!",
+-        McuLoadCellProbe.ERROR_OVERFLOW: "Load Cell Probe Error: fixed point "
+-        "math overflow",
+-        McuLoadCellProbe.ERROR_WATCHDOG: "Load Cell Probe Error: timed out "
+-        "waiting for sensor data",
+-    }
+-
+-    def __init__(
+-        self,
+-        config: ConfigWrapper,
+-        mcu_load_cell_probe: McuLoadCellProbe,
++        mcu_trigger_analog: trigger_analog.MCU_trigger_analog,
+         continuous_tare_filter_helper: ContinuousTareFilterHelper,
+         config_helper: LoadCellProbeConfigHelper,
+     ):
+         self._printer = config.get_printer()
+-        self._mcu_load_cell_probe = mcu_load_cell_probe
++        self._load_cell = load_cell_inst
++        self._mcu_trigger_analog = mcu_trigger_analog
+         self._continuous_tare_filter_helper = continuous_tare_filter_helper
+         self._config_helper = config_helper
+-        self._load_cell = mcu_load_cell_probe.get_load_cell()
+-        self._dispatch = mcu_load_cell_probe.get_dispatch()
++        self._mcu: mcu.MCU = mcu_trigger_analog.get_mcu()
++        self._dispatch = mcu_trigger_analog.get_dispatch()
+         # internal state tracking
+-        self._last_trigger_time = 0
++        self._tare_counts = 0
+ 
+     def get_mcu(self):
+-        return self._mcu_load_cell_probe.get_mcu()
++        return self._mcu
+ 
+     def get_dispatch(self):
+         return self._dispatch
+ 
++    def get_load_cell(self) -> LoadCell:
++        return self._load_cell
++
+     def _start_collector(self) -> LoadCellSampleCollector:
+         toolhead = self._printer.lookup_object("toolhead")
+         # homing uses the toolhead last move time which gets special handling
+@@ -633,203 +455,307 @@ class LoadCellPrimitives:
+ 
+     # pauses for the last move to complete and then
+     # sets the endstop tare value and range
+-    def tare(self, gcmd=None):
++    def _pause_and_tare(self, gcmd=None):
+         collector = self._start_collector()
+         num_samples = self._config_helper.get_tare_samples(gcmd)
+         # use collect_min collected samples are not wasted
+         results = collector.collect_min(num_samples)
+         tare_samples = check_sensor_errors(results, self._printer)
+-        tare_counts = int(
+-            np.average(np.array(tare_samples)[:, 2].astype(float))
+-        )
+-        self._config_helper.assert_force_safety_limit(tare_counts, gcmd)
++        tare_counts = np.average(np.array(tare_samples)[:, 2].astype(float))
++        self._tare_counts = int(tare_counts)
+         # update sos_filter with any gcode parameter changes
+         self._continuous_tare_filter_helper.update_from_command(gcmd)
+-        self._mcu_load_cell_probe.set_endstop_range(tare_counts, gcmd)
+-
+-    def home_start(self, print_time):
+-        # do not permit homing if the load cell is not calibrated
++        # update the load cell so it reflects the new tare value
++        self._load_cell.tare(tare_counts)
++        # update raw range
++        safety_min, safety_max = self._config_helper.get_safety_range(gcmd)
++        self._mcu_trigger_analog.set_raw_range(safety_min, safety_max)
++        # update internal tare value
++        gpc = self._config_helper.get_grams_per_count() * FRAC_GRAMS_CONV
++        sos_filter = self._mcu_trigger_analog.get_sos_filter()
++        sos_filter.set_offset_scale(int(-tare_counts), gpc)
++        # update trigger
++        trigger_val = self._config_helper.get_trigger_force_grams(gcmd)
++        trigger_frac_grams = int(trigger_val * FRAC_GRAMS_CONV)
++        self._mcu_trigger_analog.set_trigger("abs_ge", trigger_frac_grams)
++
++    def _check_calibrated(self):
++        # do not permit probing if the load cell is not calibrated
+         if not self._load_cell.is_calibrated():
+             raise self._printer.command_error("Load Cell not calibrated")
+-        # start trsync
+-        trigger_completion = self._dispatch.start(print_time)
+-        self._mcu_load_cell_probe.home_start(print_time)
+-        return trigger_completion
+-
+-    def home_wait(self, home_end_time):
+-        self._dispatch.wait_end(home_end_time)
+-        # trigger has happened, now to find out why...
+-        res = self._dispatch.stop()
+-        # clear the homing state so it stops processing samples
+-        self._last_trigger_time = self._mcu_load_cell_probe.clear_home()
+-        if res >= mcu.MCU_trsync.REASON_COMMS_TIMEOUT:
+-            error = "Load Cell Probe Error: unknown reason code %i" % (res,)
+-            if res in self.ERROR_MAP:
+-                error = self.ERROR_MAP[res]
+-            raise self._printer.command_error(error)
+-        if res != mcu.MCU_trsync.REASON_ENDSTOP_HIT:
+-            return 0.0
+-        return self._last_trigger_time
+-
+-    def add_stepper(self, stepper):
+-        self._dispatch.add_stepper(stepper)
+-
+-    def get_steppers(self):
+-        return self.get_dispatch().get_steppers()
+-
+-    def query_endstop(self, print_time):
+-        return False
+ 
+-    # Probe towards z_min until the load_cell_probe on the MCU triggers
+-    # returns the running collector instance along with the halt position
++    # Probe towards pos until the trigger_analog on the MCU triggers
++    # returns the trigger position along with the running collector
+     def probing_move(
+-        self, mcu_probe, pos, speed, gcmd
+-    ) -> tuple[list[float], LoadCellSampleCollector]:
++        self, pos, speed, gcmd=None
++    ) -> Tuple[list, LoadCellSampleCollector]:
++        self._check_calibrated()
+         # tare the sensor just before probing
+-        self.tare(gcmd)
++        self._pause_and_tare(gcmd)
+         # start collector after tare samples are consumed
+         collector = self._start_collector()
+         # do homing move
+-        printer_homing: PrinterHoming = self._printer.lookup_object("homing")
++        phoming: PrinterHoming = self._printer.lookup_object("homing")
+         try:
+-            return printer_homing.probing_move(mcu_probe, pos, speed), collector
++            epos = phoming.probing_move(self._mcu_trigger_analog, pos, speed)
+         except self._printer.command_error:
+             collector.stop_collecting()
+             raise
++        return epos, collector
+ 
+-    # Wait for the MCU to trigger with no movement
+-    def probing_test(self, gcmd, timeout):
+-        self.tare(gcmd)
+-        toolhead = self._printer.lookup_object("toolhead")
+-        print_time = toolhead.get_last_move_time()
+-        self.home_start(print_time)
+-        return self.home_wait(print_time + timeout)
+-
+-    def get_status(self, eventtime):
+-        status = self._load_cell.get_status(eventtime)
+-        status.update(
+-            {
+-                "last_trigger_time": self._last_trigger_time,
+-            }
+-        )
+-        return status
+-
+-
+-# Handle homing the z axis with the load cell probe
+-class HomingMove:
+-    def __init__(
+-        self,
+-        config: ConfigWrapper,
+-        load_cell_primitives: LoadCellPrimitives,
+-    ):
+-        self.printer = config.get_printer()
+-        self._load_cell_primitives = load_cell_primitives
+-        # pwrapper methods
+-        self.get_mcu = load_cell_primitives.get_mcu
+-        self.add_stepper = load_cell_primitives.add_stepper
+-        self.get_steppers = load_cell_primitives.get_steppers
+-        self.home_wait = load_cell_primitives.home_wait
+-
+-    # Overrides for the MCU_endstop interface
++    # MCU_endstop.home_start() used when homing Z via probe:z_virtual_endstop
+     def home_start(
+         self, print_time, sample_time, sample_count, rest_time, triggered=True
+     ):
+-        self._load_cell_primitives.tare()
+-        toolhead = self.printer.lookup_object("toolhead")
+-        # taring requires time, so print_time must be updated
++        self._check_calibrated()
++        self._pause_and_tare()
++        # taring takes time, so print_time must be refreshed
++        toolhead = self._printer.lookup_object("toolhead")
+         print_time = toolhead.get_last_move_time()
+-        return self._load_cell_primitives.home_start(print_time)
++        return self._mcu_trigger_analog.home_start(
++            print_time, sample_time, sample_count, rest_time, triggered
++        )
+ 
+-    def query_endstop(self, print_time):
+-        return False
++    def home_wait(self, home_end_time):
++        return self._mcu_trigger_analog.home_wait(home_end_time)
+ 
++    # Wait for the MCU to trigger with no movement
++    def probing_test(self, gcmd, timeout):
++        self._check_calibrated()
++        self._pause_and_tare(gcmd)
++        toolhead = self._printer.lookup_object("toolhead")
++        print_time = toolhead.get_last_move_time()
++        self._mcu_trigger_analog.home_start(print_time, 0.0, 0, 0.0)
++        return self._mcu_trigger_analog.home_wait(print_time + timeout)
+ 
+-# Perform a single complete tap, broadcast results to the socket
++    def get_status(self, eventtime):
++        trig_time = self._mcu_trigger_analog.get_last_trigger_time()
++        return {
++            "tare_counts": self._tare_counts,
++            "last_trigger_time": trig_time,
++        }
++
++
++# Given a list of (grams, z) pairs, find the coefficients z_contact,
++# grams_contact, depress_slope, slope that best fit the data to the
++# formulas `grams = grams_contact + depress_slope*(z-z_contact)` when
++# z<=z_contact and `grams = grams_contact` when z>=z_contact. This
++# implements a form of non-linear least squares.
++class LCBestFit:
++    def __init__(self, printer):
++        self._printer = printer
++
++    def _calc_least_squares(self, samples, est_z_contact):
++        len_samples = len(samples)
++        eqs = [[0.0] * 2 for i in range(len_samples)]
++        ans = [[0.0] for i in range(len_samples)]
++        for i, (step_z, sensor_grams) in enumerate(samples):
++            a = ans[i]
++            eq = eqs[i]
++            if step_z <= est_z_contact:
++                # 1*c0 + (z-ezc)*c1 = grams
++                eq[0] = 1.0
++                eq[1] = step_z - est_z_contact
++            else:
++                # 1*c0 = grams
++                eq[0] = 1.0
++                eq[1] = 0.0
++            a[0] = sensor_grams
++        eqst = mathutil.mat_transp(eqs)
++        eqst_eqs = mathutil.mat_mat_mul(eqst, eqs)
++        eqst_ans = mathutil.mat_mat_mul(eqst, ans)
++        coeffs = mathutil.gaussian_solve(eqst_eqs, eqst_ans)
++        if coeffs is None:
++            return sys.float_info.max, [[0.0]] * 2
++        rel_err = -sum([c[0] * a[0] for c, a in zip(coeffs, eqst_ans)])
++        return rel_err, coeffs
++
++    def find_best_fit(self, data):
++        # Change base of grams/z measurements to improve numerical stability
++        base_z = 0.5 * (data[0][1] + data[-1][1])
++        base_grams = 0.5 * (data[0][0] + data[-1][0])
++        samples = [(d[1] - base_z, d[0] - base_grams) for d in data]
++
++        def _run_fit(sample_set):
++            """Run the binary search fit on the given sample set."""
++            min_z = best_z = sample_set[0][0]
++            max_z = sample_set[-1][0]
++            best_err = sys.float_info.max
++            best_coeffs = [[0.0]] * 2
++            while max_z - min_z > 0.000050:
++                mid_z = (min_z + max_z) * 0.5
++                if best_z < mid_z:
++                    guess_z = (best_z + max_z) * 0.5
++                else:
++                    guess_z = (min_z + best_z) * 0.5
++                guess_err, guess_coeffs = self._calc_least_squares(
++                    sample_set, guess_z
++                )
++                if guess_err < best_err:
++                    if guess_z > best_z:
++                        min_z = best_z
++                    else:
++                        max_z = best_z
++                    best_z = guess_z
++                    best_err = guess_err
++                    best_coeffs = guess_coeffs
++                else:
++                    if guess_z > best_z:
++                        max_z = guess_z
++                    else:
++                        min_z = guess_z
++            return best_z, best_coeffs
++
++        est_z, coeffs = _run_fit(samples)
++
++        # Count number of samples below the estimated z_contact
++        n_below = len([s for s in samples if s[0] <= est_z])
++        depress_slope = coeffs[1][0]
++
++        return base_z + est_z, n_below, len(samples) - n_below, depress_slope
++
++
++# Perform a single complete tap: probe down, lift while sampling, fit the
++# ascent force/z data to find the true contact height
+ class TappingMove:
+     def __init__(
+         self,
+         config: ConfigWrapper,
+-        load_cell_primitives: LoadCellPrimitives,
+-        tap_analysis_helper: TapAnalysisHelper,
++        load_cell_probing_move: LoadCellProbingMove,
+         config_helper: LoadCellProbeConfigHelper,
+     ):
+         self._printer = config.get_printer()
+-        self._load_cell_primitives = load_cell_primitives
+-        self._tap_analysis_helper = tap_analysis_helper
++        self._load_cell_probing_move = load_cell_probing_move
+         self._config_helper = config_helper
++        # the lift after contact reuses the [probe] retract options
++        speed = config.getfloat("speed", 5.0, above=0.0)
++        self._lift_speed = config.getfloat("lift_speed", speed, above=0.0)
++        self._sample_retract_dist = config.getfloat(
++            "sample_retract_dist", 2.0, above=0.0
++        )
+         # track results of the last tap
+-        self._last_analysis = None
+         self._last_result = None
+         self._is_last_result_valid = False
+-        # wrappers for MCU_endstop use for probing. tap() overrides the
+-        # MCU_endstop instance to be this object
+-        self.get_mcu = load_cell_primitives.get_mcu
+-        self.add_stepper = load_cell_primitives.add_stepper
+-        self.get_steppers = load_cell_primitives.get_steppers
+-        self.home_wait = load_cell_primitives.home_wait
+-        self.query_endstop = load_cell_primitives.query_endstop
++        # webhooks support
++        self._clients = ApiClientHelper(self._printer)
++        name = config.get_name()
++        header = {"header": ["probe_tap_event"]}
++        self._clients.add_mux_endpoint(
++            "load_cell_probe/dump_taps", "load_cell_probe", name, header
++        )
++        self._best_fit = LCBestFit(self._printer)
+ 
+-    def home_start(
+-        self, print_time, sample_time, sample_count, rest_time, triggered=True
+-    ):
+-        return self._load_cell_primitives.home_start(print_time)
++    def _get_lift_params(self, gcmd) -> Tuple[float, float]:
++        if gcmd is None:
++            return self._sample_retract_dist, self._lift_speed
++        lift_dist = gcmd.get_float(
++            "SAMPLE_RETRACT_DIST", self._sample_retract_dist, above=0.0
++        )
++        lift_speed = gcmd.get_float("LIFT_SPEED", self._lift_speed, above=0.0)
++        return lift_dist, lift_speed
+ 
+-    # Perform the pullback move and returns the time when the move will end
+-    def pullback_move(self, gcmd):
+-        toolhead = self._printer.lookup_object("toolhead")
+-        pullback_pos = toolhead.get_position()
+-        pullback_pos[2] += self._config_helper.get_pullback_distance(gcmd)
+-        pos = [None, None, pullback_pos[2]]
+-        toolhead.manual_move(pos, self._config_helper.get_pullback_speed(gcmd))
+-        toolhead.flush_step_generation()
+-        pullback_end = toolhead.get_last_move_time()
+-        return pullback_end
+-
+-    # perform a complete tapping cycle
+-    def probing_move(self, pos, speed, gcmd) -> tuple[list[float], bool]:
++    # Interface used by PrinterProbe: perform a complete tapping cycle
++    def probing_move(self, pos, speed, gcmd) -> Tuple[list, bool]:
+         self._is_last_result_valid = False
+-        # do the probing/homing move
+-        epos, collector = self._load_cell_primitives.probing_move(
+-            self, pos, speed, gcmd
++        # do the descending move
++        epos, collector = self._load_cell_probing_move.probing_move(
++            pos, speed, gcmd
+         )
+-        # when pullback is disabled, skip the pullback move and tap analysis
+-        if self._config_helper.is_pullback_move_disabled():
++        try:
++            corrected_z, samples = self._lift_and_fit(gcmd, collector, epos)
++        except self._printer.command_error:
+             collector.stop_collecting()
+-            self._is_last_result_valid = True
+-            return epos, self._is_last_result_valid
+-        # do the pullback move
+-        pullback_end_time = self.pullback_move(gcmd)
+-        # collect samples from the tap
+-        results = collector.collect_until(pullback_end_time)
+-        # calculate how long we waited to get the data
+-        t_end = self._printer.get_reactor().monotonic()
+-        t_end = self.get_mcu().estimated_print_time(t_end)
+-        collection_time = t_end - pullback_end_time
+-        # check for data errors
++            raise
++        # Replace the probe result with the fitted Z position
++        epos[2] = corrected_z
++        # broadcast tap event data:
++        self._clients.send({"tap": TapAnalysis(samples).to_dict()})
++        self._is_last_result_valid = True
++        self._last_result = epos[2]
++        return epos, self._is_last_result_valid
++
++    def _lift_and_fit(self, gcmd, collector, epos):
++        toolhead = self._printer.lookup_object("toolhead")
++        # Lift the toolhead while collecting the samples we will use for
++        # the fit. The ascent data shall cover both the contact region
++        # (force still applied) and free-air region (no force = tare).
++        ascent_start_time = toolhead.get_last_move_time()
++        lift_dist, lift_speed = self._get_lift_params(gcmd)
++        lift_z = toolhead.get_position()[2] + lift_dist
++        toolhead.manual_move([None, None, lift_z], lift_speed)
++        # Collect samples until the end of the ascent
++        move_end = toolhead.get_last_move_time()
++        results = collector.collect_until(move_end)
+         samples = check_sensor_errors(results, self._printer)
+-        trigger_force = self._config_helper.get_trigger_force_grams(gcmd)
+-        # Analyze the tap data
+-        tap_analysis = self._tap_analysis_helper.analyze(
+-            samples, trigger_force, collection_time, gcmd
++        # Perform fit on the ascent data
++        corrected_z = self._analyze_ascent(
++            samples, ascent_start_time, toolhead, epos[2]
+         )
+-        self._last_analysis = tap_analysis
+-        self._is_last_result_valid = tap_analysis.is_valid()
+-        # if the tap is valid, replace the z position with the calculated one
+-        if self._is_last_result_valid:
+-            epos[2] = tap_analysis.get_tap_pos()[2]
+-        return epos, self._is_last_result_valid
++        return corrected_z, samples
+ 
+     def get_status(self, eventtime):
+-        status = self._load_cell_primitives.get_status(eventtime)
+-        status["is_last_tap_valid"] = self._is_last_result_valid
+-        return status
++        return {
++            "last_z_result": self._last_result,
++            "is_last_tap_valid": self._is_last_result_valid,
++        }
++
++    def _analyze_ascent(self, all_samples, ascent_start_time, toolhead, raw_z):
++        # Collect samples actually belonging to the ascent. We use a limited
++        # time window to minimise the influence of baseline wandering.
++        ascent_end_time = ascent_start_time + ASCENT_DATA_WINDOW_SECONDS
++        data = [
++            (s[1], _lookup_z_pos(toolhead, s[0]))
++            for s in all_samples
++            if ascent_start_time <= s[0] <= ascent_end_time
++        ]
++
++        if self._load_cell_probing_move.get_mcu().is_fileoutput():
++            # In debugging mode: inject dummy data
++            data = [
++                (0.0, 0.0),
++                (10.0, 0.1),
++                (20.0, 0.2),
++                (25.0, 0.3),
++                (25.0, 0.4),
++                (25.0, 0.5),
++            ]
++
++        # Check that we have enough samples early to avoid exceptions
++        if len(data) < 2 * FIT_MIN_POINTS:
++            raise self._printer.command_error(
++                "Insufficient ascent samples (%d total, need >= %d "
++                "each) for piecewise fit" % (len(data), 2 * FIT_MIN_POINTS)
++            )
++
++        # Perform the actual fit
++        z_contact, below_count, above_count, depress_slope = (
++            self._best_fit.find_best_fit(data)
++        )
++
++        # We require at least 3 samples on each side of the split point to
++        # ensure a good fit and precise tare compensation.
++        if below_count < FIT_MIN_POINTS or above_count < FIT_MIN_POINTS:
++            raise self._printer.command_error(
++                "Insufficient ascent samples (%d below, %d above, need >= %d "
++                "each) for piecewise fit"
++                % (below_count, above_count, FIT_MIN_POINTS)
++            )
++
++        if self._load_cell_probing_move.get_mcu().is_fileoutput():
++            # In debugging mode: check fit result
++            if abs(z_contact - 0.25) > 0.01:
++                raise self._printer.command_error(
++                    "Load cell probe fit result incorrect"
++                )
++
++        return z_contact
+ 
+ 
+ class LoadCellProbeCommands:
+     def __init__(
+         self,
+         config: ConfigWrapper,
+-        load_cell_probing_move: LoadCellPrimitives,
++        load_cell_probing_move: LoadCellProbingMove,
+     ):
+         self._printer = config.get_printer()
+         self._load_cell_probing_move = load_cell_probing_move
+@@ -916,28 +842,30 @@ class ProbeActivationHelper:
+             )
+ 
+ 
++# MCU_endstop / ProbeEndstopWrapper facade handed to PrinterProbe and to
++# the homing code (via probe:z_virtual_endstop)
+ class LoadCellEndstopWrapper:
+     def __init__(
+         self,
+         config: ConfigWrapper,
+-        homing_move: HomingMove,
++        load_cell_probing_move: LoadCellProbingMove,
+         tapping_move: TappingMove,
+     ):
+         self._printer = config.get_printer()
+         self._z_offset = config.getfloat("z_offset")
+         self._tapping_move = tapping_move
++        dispatch = load_cell_probing_move.get_dispatch()
+         # Register for MCU identification to add Z steppers
+         self._printer.register_event_handler(
+             "klippy:mcu_identify", self._handle_mcu_identify
+         )
+         # Wrappers for MCU_endstop interface.
+         # Printer homing uses this object as the MCU_endstop
+-        self.get_mcu = homing_move.get_mcu
+-        self.add_stepper = homing_move.add_stepper
+-        self.get_steppers = homing_move.get_steppers
+-        self.home_wait = homing_move.home_wait
+-        self.home_start = homing_move.home_start
+-        self.query_endstop = homing_move.query_endstop
++        self.get_mcu = load_cell_probing_move.get_mcu
++        self.add_stepper = dispatch.add_stepper
++        self.get_steppers = dispatch.get_steppers
++        self.home_start = load_cell_probing_move.home_start
++        self.home_wait = load_cell_probing_move.home_wait
+         # wrappers for probe ProbeEndstopWrapper interface
+         self.probing_move = tapping_move.probing_move
+         self._probe_activation_helper = ProbeActivationHelper(config)
+@@ -952,64 +880,82 @@ class LoadCellEndstopWrapper:
+             if stepper.is_active_axis("z"):
+                 self.add_stepper(stepper)
+ 
++    def query_endstop(self, print_time):
++        return False
++
+     # Interface for ProbeEndstopWrapper
+     def get_position_endstop(self):
+         return self._z_offset
+ 
+     def get_status(self, eventtime):
+-        status = self._tapping_move.get_status(eventtime)
+-        status.update(self._tapping_move.get_status(eventtime))
+-        return status
++        return self._tapping_move.get_status(eventtime)
+ 
+ 
+-class LoadCellPrinterProbe:
++# PrinterProbe whose retract is performed inside the tap (the ascent lift)
++class LoadCellProbe(PrinterProbe):
+     def __init__(
+         self,
+         config: ConfigWrapper,
+-        sensor: LoadCellSensor,
+-        tap_classifier: TapClassifierModule,
++        mcu_probe: LoadCellEndstopWrapper,
++        load_cell_inst: LoadCell,
++        load_cell_probing_move: LoadCellProbingMove,
++        tapping_move: TappingMove,
+     ):
++        super().__init__(config, mcu_probe)
++        self._load_cell = load_cell_inst
++        self._load_cell_probing_move = load_cell_probing_move
++        self._tapping_move = tapping_move
++
++    # The tap already lifts the toolhead by sample_retract_dist while it
++    # collects the ascent samples, so the generic retract must not lift again
++    def _retract(self, gcmd: GCodeCommand):
++        pass
++
++    def get_status(self, eventtime):
++        status = self._tapping_move.get_status(eventtime)
++        status.update(self._load_cell_probing_move.get_status(eventtime))
++        status.update(self._load_cell.get_status(eventtime))
++        status.update(super().get_status(eventtime))
++        return status
++
++
++class LoadCellPrinterProbe:
++    def __init__(self, config: ConfigWrapper, sensor: LoadCellSensor):
+         self._printer = config.get_printer()
+         self._load_cell = LoadCell(config, sensor)
+         # Read all user configuration and build modules
+-        name = config.get_name()
+-        self._tap_analysis_helper = TapAnalysisHelper(
+-            self._printer, name, tap_classifier
+-        )
+         config_helper = LoadCellProbeConfigHelper(config, self._load_cell)
+-        self._mcu = self._load_cell.get_sensor().get_mcu()
+-        trigger_dispatch = mcu.TriggerDispatch(self._mcu)
++        self._mcu = sensor.get_mcu()
++        self._mcu_trigger_analog = trigger_analog.MCU_trigger_analog(sensor)
++        cmd_queue = self._mcu_trigger_analog.get_dispatch().get_command_queue()
++        sos_filter = trigger_analog.MCU_SosFilter(self._mcu, cmd_queue, 4)
++        self._mcu_trigger_analog.setup_sos_filter(sos_filter)
+         continuous_tare_filter_helper = ContinuousTareFilterHelper(
+-            config, sensor, trigger_dispatch.get_command_queue()
++            config, sensor, sos_filter
+         )
+-        # Probe Interface
+-        self._mcu_load_cell_probe = McuLoadCellProbe(
++        load_cell_probing_move = LoadCellProbingMove(
+             config,
+             self._load_cell,
+-            continuous_tare_filter_helper.get_sos_filter(),
+-            config_helper,
+-            trigger_dispatch,
+-        )
+-        load_cell_primitives = LoadCellPrimitives(
+-            config,
+-            self._mcu_load_cell_probe,
++            self._mcu_trigger_analog,
+             continuous_tare_filter_helper,
+             config_helper,
+         )
+-        homing_move = HomingMove(config, load_cell_primitives)
+         self._tapping_move = TappingMove(
+-            config,
+-            load_cell_primitives,
+-            self._tap_analysis_helper,
+-            config_helper,
++            config, load_cell_probing_move, config_helper
+         )
+         # printer integration
+-        LoadCellProbeCommands(config, load_cell_primitives)
++        LoadCellProbeCommands(config, load_cell_probing_move)
+         wrapper = LoadCellEndstopWrapper(
+-            config, homing_move, self._tapping_move
++            config, load_cell_probing_move, self._tapping_move
+         )
+-        printer_probe = PrinterProbe(config, wrapper)
+-        self._printer.add_object("probe", printer_probe)
++        self._printer_probe = LoadCellProbe(
++            config,
++            wrapper,
++            self._load_cell,
++            load_cell_probing_move,
++            self._tapping_move,
++        )
++        self._printer.add_object("probe", self._printer_probe)
+ 
+     def get_status(self, eventtime):
+-        return self._tapping_move.get_status(eventtime)
++        return self._printer_probe.get_status(eventtime)
+diff --git a/klippy/extras/load_cell/sos_filter.py b/klippy/extras/load_cell/sos_filter.py
+deleted file mode 100644
+index 13a014d3..00000000
+--- a/klippy/extras/load_cell/sos_filter.py
++++ /dev/null
+@@ -1,302 +0,0 @@
+-# Second Order Sections Filter
+-#
+-# Copyright (C) 2025 Gareth Farrington <gareth@waves.ky>
+-#
+-# This file may be distributed under the terms of the GNU GPLv3 license.
+-from __future__ import annotations
+-
+-from collections.abc import Callable
+-from typing import Optional, Union
+-
+-from klippy.mcu import MCU
+-
+-MAX_INT32 = 2**31
+-MIN_INT32 = -(2**31) - 1
+-
+-
+-def assert_is_int32(value: int, error: str) -> int:
+-    if value > MAX_INT32 or value < MIN_INT32:
+-        raise OverflowError(error)
+-    return value
+-
+-
+-# convert a floating point value to a 32 bit fixed point representation
+-# checks for overflow
+-def to_fixed_32(value: int, int_bits: int) -> int:
+-    fractional_bits = 32 - (1 + int_bits)
+-    fixed_val = int(value * (2**fractional_bits))
+-    return assert_is_int32(fixed_val, "Fixed point Q%i overflow" % (int_bits,))
+-
+-
+-# Digital filter designer and container
+-class DigitalFilter:
+-    def __init__(
+-        self,
+-        sps: Union[float, int],
+-        cfg_error: Callable[[str], ...],
+-        highpass: Optional[float] = None,
+-        highpass_order: int = 1,
+-        lowpass: Optional[float] = None,
+-        lowpass_order: int = 1,
+-        notches: Optional[list[float]] = None,
+-        notch_quality: float = 2.0,
+-    ):
+-        self.filter_sections: list = []
+-        self.initial_state: list = []
+-        self.sample_frequency: float = float(sps)
+-        # an empty filter can be created without SciPi/numpy
+-        if not (highpass or lowpass or notches):
+-            return
+-        try:
+-            import scipy.signal as signal
+-        except:
+-            raise cfg_error("DigitalFilter requires the SciPy module")
+-        if highpass:
+-            self.filter_sections.append(
+-                self._butter(highpass, "highpass", highpass_order)
+-            )
+-        if lowpass:
+-            self.filter_sections.append(
+-                self._butter(lowpass, "lowpass", lowpass_order)
+-            )
+-        for notch_freq in notches:
+-            self.filter_sections.append(self._notch(notch_freq, notch_quality))
+-        if len(self.filter_sections) > 0:
+-            self.initial_state = signal.sosfilt_zi(self.filter_sections)
+-
+-    def _butter(self, frequency: float, btype, order: int):
+-        import scipy.signal as signal
+-
+-        return signal.butter(
+-            order,
+-            Wn=frequency,
+-            btype=btype,
+-            fs=self.sample_frequency,
+-            output="sos",
+-        )[0]
+-
+-    def _notch(self, freq, quality):
+-        import scipy.signal as signal
+-
+-        b, a = signal.iirnotch(freq, Q=quality, fs=self.sample_frequency)
+-        return signal.tf2sos(b, a)[0]
+-
+-    def get_filter_sections(self):
+-        return self.filter_sections
+-
+-    def get_initial_state(self):
+-        return self.initial_state
+-
+-
+-# container that accepts SciPy formatted SOS filter data and converts it to a
+-# selected fixed point representation. This data could come from DigitalFilter,
+-# static data, config etc.
+-class FixedPointSosFilter:
+-    # filter_sections is an array of SciPy formatted SOS filter sections (sos)
+-    # initial_state is an array of SciPy formatted SOS state sections (zi)
+-    def __init__(
+-        self,
+-        filter_sections=None,
+-        initial_state=None,
+-        coeff_int_bits: int = 2,
+-        value_int_bits: int = 15,
+-    ):
+-        filter_sections = [] if filter_sections is None else filter_sections
+-        initial_state = [] if initial_state is None else initial_state
+-        num_sections = len(filter_sections)
+-        num_state = len(initial_state)
+-        if num_state != num_sections:
+-            raise ValueError(
+-                "The number of filter sections (%i) and state "
+-                "sections (%i) must be equal" % (num_sections, num_state)
+-            )
+-        self._coeff_int_bits = self._validate_int_bits(coeff_int_bits)
+-        self._value_int_bits = self._validate_int_bits(value_int_bits)
+-        self._filter = self._convert_filter(filter_sections)
+-        self._state = self._convert_state(initial_state)
+-
+-    def get_filter_sections(self):
+-        return self._filter
+-
+-    def get_initial_state(self):
+-        return self._state
+-
+-    def get_coeff_int_bits(self) -> int:
+-        return self._coeff_int_bits
+-
+-    def get_value_int_bits(self) -> int:
+-        return self._value_int_bits
+-
+-    def get_num_sections(self) -> int:
+-        return len(self._filter)
+-
+-    @staticmethod
+-    def _validate_int_bits(int_bits: int) -> int:
+-        if int_bits < 1 or int_bits > 30:
+-            raise ValueError(
+-                "The number of integer bits (%i) must be a"
+-                " value between 1 and 30" % (int_bits,)
+-            )
+-        return int_bits
+-
+-    # convert the SciPi SOS filters to fixed point format
+-    def _convert_filter(self, filter_sections):
+-        sos_fixed = []
+-        for section in filter_sections:
+-            nun_coeff = len(section)
+-            if nun_coeff != 6:
+-                raise ValueError(
+-                    "The number of filter coefficients is %i"
+-                    ", must be 6" % (nun_coeff,)
+-                )
+-            fixed_section = []
+-            for col, coeff in enumerate(section):
+-                if col != 3:  # omit column 3
+-                    fixed_coeff = to_fixed_32(coeff, self._coeff_int_bits)
+-                    fixed_section.append(fixed_coeff)
+-                elif coeff != 1.0:  # double check colum 3 is always 1.0
+-                    raise ValueError(
+-                        "Coefficient 3 is expected to be 1.0"
+-                        " but was %f" % (coeff,)
+-                    )
+-            sos_fixed.append(fixed_section)
+-        return sos_fixed
+-
+-    # convert the SOS filter state matrix (zi) to fixed point format
+-    def _convert_state(self, filter_state):
+-        sos_state = []
+-        for section in filter_state:
+-            nun_states = len(section)
+-            if nun_states != 2:
+-                raise ValueError(
+-                    "The number of state elements is %i, must be 2"
+-                    % (nun_states,)
+-                )
+-            fixed_state = []
+-            for col, value in enumerate(section):
+-                fixed_state.append(to_fixed_32(value, self._value_int_bits))
+-            sos_state.append(fixed_state)
+-        return sos_state
+-
+-
+-# Control an `sos_filter` object on the MCU
+-class SosFilter:
+-    # fixed_point_filter should be an FixedPointSosFilter instance. A filter of
+-    # size 0 will create a passthrough filter.
+-    # max_sections should be the largest number of sections you expect
+-    # to use at runtime. The default is the size of the fixed_point_filter.
+-    def __init__(
+-        self,
+-        mcu: MCU,
+-        cmd_queue,
+-        fixed_point_filter: FixedPointSosFilter,
+-        max_sections: Optional[int] = None,
+-    ):
+-        self._mcu = mcu
+-        self._cmd_queue = cmd_queue
+-        self._oid: int = self._mcu.create_oid()
+-        self._filter: FixedPointSosFilter = fixed_point_filter
+-        self._max_sections = max_sections
+-        if self._max_sections is None:
+-            self._max_sections = self._filter.get_num_sections()
+-        self._cmd_set_section = [
+-            "sos_filter_set_section oid=%d section_idx=%d"
+-            " sos0=%i sos1=%i sos2=%i sos3=%i sos4=%i",
+-            "sos_filter_set_section oid=%c section_idx=%c"
+-            " sos0=%i sos1=%i sos2=%i sos3=%i sos4=%i",
+-        ]
+-        self._cmd_config_state = [
+-            "sos_filter_set_state oid=%d section_idx=%d state0=%i state1=%i",
+-            "sos_filter_set_state oid=%c section_idx=%c state0=%i state1=%i",
+-        ]
+-        self._cmd_activate = [
+-            "sos_filter_set_active oid=%d n_sections=%d coeff_int_bits=%d",
+-            "sos_filter_set_active oid=%c n_sections=%c coeff_int_bits=%c",
+-        ]
+-        self._mcu.register_config_callback(self._build_config)
+-
+-    def _build_config(self):
+-        cmds = [
+-            self._cmd_set_section,
+-            self._cmd_config_state,
+-            self._cmd_activate,
+-        ]
+-        for cmd in cmds:
+-            cmd.append(self._mcu.lookup_command(cmd[1], cq=self._cmd_queue))
+-
+-    def get_oid(self) -> int:
+-        return self._oid
+-
+-    # create an uninitialized filter object on the MCU
+-    def create_filter(self):
+-        self._mcu.add_config_cmd(
+-            "config_sos_filter oid=%d max_sections=%d"
+-            % (self._oid, self._max_sections)
+-        )
+-        self._configure_filter(is_init=True)
+-
+-    # either setup an init command or send the command based on a flag
+-    def _cmd(self, command, args, is_init=False):
+-        if is_init:
+-            self._mcu.add_config_cmd(command[0] % args, is_init=True)
+-        else:
+-            command[2].send(args)
+-
+-    def _set_filter_sections(self, is_init=False):
+-        for i, section in enumerate(self._filter.get_filter_sections()):
+-            args = (
+-                self._oid,
+-                i,
+-                section[0],
+-                section[1],
+-                section[2],
+-                section[3],
+-                section[4],
+-            )
+-            self._cmd(self._cmd_set_section, args, is_init)
+-
+-    def _set_filter_state(self, is_init=False):
+-        for i, state in enumerate(self._filter.get_initial_state()):
+-            args = (self._oid, i, state[0], state[1])
+-            self._cmd(self._cmd_config_state, args, is_init)
+-
+-    def _activate_filter(self, is_init=False):
+-        args = (
+-            self._oid,
+-            self._filter.get_num_sections(),
+-            self._filter.get_coeff_int_bits(),
+-        )
+-        self._cmd(self._cmd_activate, args, is_init)
+-
+-    # configure the filter sections on the mcu
+-    # filters should be an array of filter sections in SciPi SOS format
+-    # sos_filter_state should be an array of zi filter state elements
+-    def _configure_filter(self, is_init=False):
+-        num_sections = self._filter.get_num_sections()
+-        if num_sections > self._max_sections:
+-            raise ValueError(
+-                "Too many filter sections: %i, The max is %i"
+-                % (
+-                    num_sections,
+-                    self._max_sections,
+-                )
+-            )
+-        # convert to fixed point to find errors
+-        # no errors, state is accepted
+-        # configure MCU filter and activate
+-        self._set_filter_sections(is_init)
+-        self._set_filter_state(
+-            is_init,
+-        )
+-        self._activate_filter(is_init)
+-
+-    # Change the filter coefficients and state at runtime
+-    # fixed_point_filter should be an FixedPointSosFilter instance
+-    def change_filter(self, fixed_point_filter: FixedPointSosFilter):
+-        self._filter = fixed_point_filter
+-        self._configure_filter(False)
+-
+-    # Resets the filter state back to initial conditions at runtime
+-    def reset_filter(self):
+-        self._set_filter_state(False)
+-        self._activate_filter(False)
+diff --git a/klippy/extras/load_cell/tap_analysis.py b/klippy/extras/load_cell/tap_analysis.py
+deleted file mode 100644
+index af8cc509..00000000
+--- a/klippy/extras/load_cell/tap_analysis.py
++++ /dev/null
+@@ -1,715 +0,0 @@
+-# Tap Analysis
+-#
+-# Copyright (C) 2025  Gareth Farrington <gareth@waves.ky>
+-#
+-# This file may be distributed under the terms of the GNU GPLv3 license.
+-from __future__ import annotations
+-
+-import logging
+-import math
+-import time
+-from typing import Optional
+-
+-import numpy as np
+-
+-from klippy.gcode import GCodeCommand
+-
+-from .load_cell import ApiClientHelper
+-
+-
+-class TapClassifierModule(object):
+-    def classify(self, tap_analysis: TapAnalysis, gcmd: Optional[GCodeCommand]):
+-        pass
+-
+-
+-# Capture and preserve a Trapezoidal Move as a python type
+-class TrapezoidalMove:
+-    print_time: float
+-    move_t: float
+-    start_v: float
+-    accel: float
+-    start_x: float
+-    start_y: float
+-    start_z: float
+-    x_r: float
+-    y_r: float
+-    z_r: float
+-
+-    def __init__(self, move, time_offset=0.0):
+-        # copy c data to python memory
+-        self.print_time = float(move.print_time) - time_offset
+-        self.move_t = float(move.move_t)
+-        self.start_v = float(move.start_v)
+-        self.accel = float(move.accel)
+-        self.start_x = float(move.start_x)
+-        self.start_y = float(move.start_y)
+-        self.start_z = float(move.start_z)
+-        self.x_r = float(move.x_r)
+-        self.y_r = float(move.y_r)
+-        self.z_r = float(move.z_r)
+-
+-    def to_dict(self) -> dict[str, float]:
+-        return {
+-            "print_time": float(self.print_time),
+-            "move_t": float(self.move_t),
+-            "start_v": float(self.start_v),
+-            "accel": float(self.accel),
+-            "start_x": float(self.start_x),
+-            "start_y": float(self.start_y),
+-            "start_z": float(self.start_z),
+-            "x_r": float(self.x_r),
+-            "y_r": float(self.y_r),
+-            "z_r": float(self.z_r),
+-        }
+-
+-
+-# point on a time/force graph
+-class ForcePoint(object):
+-    time: float
+-    force: float
+-
+-    def __init__(self, time_t, force):
+-        self.time = float(time_t)
+-        self.force = float(force)
+-
+-    def to_dict(self) -> dict[str, float]:
+-        return {"time": self.time, "force": self.force}
+-
+-
+-# slope/intercept based line where x is time and y is force
+-class ForceLine:
+-    slope: float
+-    intercept: float
+-
+-    def __init__(self, slope, intercept):
+-        self.slope = float(slope)
+-        self.intercept = float(intercept)
+-
+-    # measure angles between lines at the 25g = 0.1s (100ms) scale
+-    # Note: this is the same scale used by Prusa
+-    # returns +/- 0-180. Positive values represent clockwise rotation
+-    def angle(
+-        self,
+-        line: "ForceLine",
+-        time_scale: float = 0.1,
+-        gram_scale: float = 25.0,
+-    ) -> float:
+-        scaling_factor = time_scale / gram_scale
+-        this_slope = self.slope * scaling_factor
+-        other_slope = line.slope * scaling_factor
+-        radians = math.atan2(this_slope, 1) - math.atan2(other_slope, 1)
+-        return math.degrees(radians)
+-
+-    def find_force(self, time: float) -> float:
+-        return self.slope * time + self.intercept
+-
+-    def find_time(self, force: float) -> float:
+-        return (force - self.intercept) / self.slope
+-
+-    def intersection(self, line: "ForceLine") -> ForcePoint:
+-        numerator = -self.intercept + line.intercept
+-        denominator = self.slope - line.slope
+-        # lines are parallel, will not intersect
+-        if denominator == 0.0:
+-            # to get debuggable data we want to return a clearly bad value here
+-            return ForcePoint(0.0, 0.0)
+-        intersection_time = numerator / denominator
+-        intersection_force = self.find_force(intersection_time)
+-        return ForcePoint(intersection_time, intersection_force)
+-
+-    def to_dict(self) -> dict[str, float]:
+-        return {"slope": self.slope, "intercept": self.intercept}
+-
+-
+-#########################
+-# Math Support Functions
+-
+-
+-# helper class for working with a time/force graph
+-# work with subsections to find elbows and best fit lines
+-class ForceGraph:
+-    def __init__(self, time_nd_64: np.ndarray, force_nd_64: np.ndarray):
+-        self.time = time_nd_64
+-        self.force = force_nd_64
+-        # linear implementation:
+-        self._cum_x = np.cumsum(self.time)
+-        self._cum_y = np.cumsum(self.force)
+-        self._cum_xx = np.cumsum(self.time * self.time)
+-        self._cum_xy = np.cumsum(self.time * self.force)
+-        self._cum_yy = np.cumsum(self.force * self.force)
+-
+-    def _get_segment_sum(self, arr, start_idx, end_idx):
+-        prior_sum = 0 if start_idx == 0 else arr[start_idx - 1]
+-        return arr[end_idx] - prior_sum
+-
+-    def _get_segment_stats(self, start_idx, end_idx):
+-        """
+-        Get statistics for segment [start_idx:end_idx] using cumulative sums
+-        """
+-        n = end_idx - start_idx
+-        sum_x = self._get_segment_sum(self._cum_x, start_idx, end_idx)
+-        sum_y = self._get_segment_sum(self._cum_y, start_idx, end_idx)
+-        sum_xx = self._get_segment_sum(self._cum_xx, start_idx, end_idx)
+-        sum_xy = self._get_segment_sum(self._cum_xy, start_idx, end_idx)
+-        sum_yy = self._get_segment_sum(self._cum_yy, start_idx, end_idx)
+-        return n, sum_x, sum_y, sum_xx, sum_xy, sum_yy
+-
+-    def _least_squares(self, start_idx, end_idx):
+-        """
+-        Compute slope/intercept and RSS for a segment of the data
+-        """
+-        n = (end_idx - start_idx) + 1
+-        if n < 2:
+-            raise ValueError("Error: fewer than 2 points used")
+-
+-        sum_x = self._get_segment_sum(self._cum_x, start_idx, end_idx)
+-        sum_y = self._get_segment_sum(self._cum_y, start_idx, end_idx)
+-        sum_xx = self._get_segment_sum(self._cum_xx, start_idx, end_idx)
+-        sum_xy = self._get_segment_sum(self._cum_xy, start_idx, end_idx)
+-        sum_yy = self._get_segment_sum(self._cum_yy, start_idx, end_idx)
+-
+-        denom = n * sum_xx - sum_x * sum_x
+-        if abs(denom) < 1e-10:
+-            # replicate Numpy behaviour for all x values being equal
+-            mean_y = sum_y / n
+-            slope = 0.0
+-            intercept = mean_y
+-            # RSS is just variance in y
+-            rss = sum_yy - n * mean_y * mean_y
+-            return [slope, intercept], max(0.0, rss)
+-        slope = (n * sum_xy - sum_x * sum_y) / denom
+-        intercept = (sum_y - slope * sum_x) / n
+-        rss = (
+-            sum_yy
+-            - 2 * slope * sum_xy
+-            - 2 * intercept * sum_y
+-            + slope * slope * sum_xx
+-            + 2 * slope * intercept * sum_x
+-            + n * intercept * intercept
+-        )
+-        return [slope, intercept], max(0.0, rss)
+-
+-    # search exhaustively for the 2 lines that best fit the data
+-    # return the elbow index
+-    def _two_lines_best_fit(self, start_idx, end_idx):
+-        best_error = float("inf")
+-        best_fit_index = -1
+-        for i in range(1 + start_idx, end_idx - 1):
+-            params1, r1 = self._least_squares(start_idx, i)
+-            params2, r2 = self._least_squares(i + 1, end_idx)
+-            if params1 is not None and params2 is not None:
+-                error = r1 + r2
+-                if error < best_error:
+-                    best_error = error
+-                    best_fit_index = i
+-        # the index returns is the first point in the second line
+-        return best_fit_index
+-
+-    def find_elbow(self, start_idx, end_idx):
+-        return self._two_lines_best_fit(start_idx, end_idx)
+-
+-    # finds the index nearest to a time
+-    def index_near(self, instant):
+-        idx = int(np.searchsorted(self.time, instant))
+-        return min(idx, len(self.time) - 1)
+-
+-    # construct a line from 2 points
+-    def _points_to_line(self, a, b):
+-        slope = (b.force - a.force) / (b.time - a.time)
+-        intercept = a.force - (slope * a.time)
+-        return ForceLine(slope, intercept)
+-
+-    # construct a line using a subset of the graph
+-    def line(self, start_idx, end_idx):
+-        params, rss = self._least_squares(start_idx, end_idx)
+-        return ForceLine(params[0], params[1])
+-
+-    # given a line and a range, calculate the standard deviation of the noise
+-    def noise_std(self, start_idx, end_idx, line):
+-        f = self.force[start_idx:end_idx]
+-        t = self.time[start_idx:end_idx]
+-        noise = []
+-        for i in range(len(f)):
+-            noise.append(f[i] - line.find_force(t[i]))
+-        return np.std(noise, dtype=np.float64)
+-
+-    # true if the reference force won't be confused for noise in the graph chunk
+-    # reference force must be more than 3 standard deviations away from the line
+-    # at the reference index
+-    def is_clear_signal(
+-        self, start_idx, end_idx, line, reference_idx, force_idx
+-    ):
+-        noise = self.noise_std(start_idx, end_idx, line)
+-        noise_3_std = noise * 3
+-        base_force = line.find_force(self.time[reference_idx])
+-        return abs(base_force - self.force[force_idx]) > noise_3_std
+-
+-    # return the first index that exceeds the median force between
+-    # start and end index
+-    def _split_by_force(self, start_idx, end_idx):
+-        start_f = self.force[start_idx]
+-        end_f = self.force[end_idx]
+-        median_f = (start_f + end_f) / 2.0
+-        scan = range(start_idx, end_idx)
+-        # if force is ascending, swap the scan direction
+-        if start_f > end_f:
+-            scan = reversed(scan)
+-        for i in scan:
+-            if self.force[i] > median_f:
+-                return i
+-        return None
+-
+-    # break a tap event down into 6 points and 5 lines:
+-    #           |*----*\
+-    #           |       \
+-    #    *-----*|        \*-----*
+-    def tap_decompose(
+-        self,
+-        homing_end_time,
+-        pullback_start_time,
+-        pullback_cruise_time,
+-        pullback_cruise_duration,
+-    ):
+-        homing_end_idx = self.index_near(homing_end_time)
+-        # use the pullback duration to trim the amount of approach data used
+-        homing_start_time = homing_end_time - pullback_cruise_duration
+-        homing_start_idx = self.index_near(homing_start_time)
+-        # locate the point where the probe made contact with the bed
+-        contact_elbow_idx = self.find_elbow(homing_start_idx, homing_end_idx)
+-
+-        pullback_start_idx = self.index_near(pullback_start_time)
+-        pullback_cruise_idx = self.index_near(pullback_cruise_time)
+-        # limit use of additional data after the pullback move ends
+-        pullback_end_time = pullback_cruise_time + (
+-            pullback_cruise_duration * 1.5
+-        )
+-        pullback_end_idx = self.index_near(pullback_end_time)
+-
+-        # l1 is the approach line
+-        l1 = self.line(homing_start_idx, contact_elbow_idx)
+-        # sometime after contact_elbow_idx is the peak force and the start of
+-        # the dwell line
+-        dwell_end = self.time[contact_elbow_idx] + pullback_cruise_duration
+-        dwell_end_idx = min(pullback_start_idx, self.index_near(dwell_end))
+-        dwell_start_idx = self.find_elbow(contact_elbow_idx, dwell_end_idx)
+-        # l2 is the compression line
+-        # also +1 the last index in case its sequential [1, 2]
+-        l2 = self.line(contact_elbow_idx, dwell_start_idx + 1)
+-        # l3 is the dwell line
+-        l3 = self.line(dwell_start_idx, pullback_start_idx)
+-
+-        # find the approximate elbow location
+-        break_contact_idx = self.find_elbow(
+-            pullback_cruise_idx, pullback_end_idx
+-        )
+-        # l5 is the line after decompression ends
+-        l5 = self.line(break_contact_idx, pullback_end_idx)
+-        # split the points between the elbow and the start of movement by force
+-        midpoint_idx = self._split_by_force(
+-            pullback_cruise_idx, break_contact_idx
+-        )
+-        # elbow finding success depends on their being good signal-to-noise
+-        # this checks if there will be enough clear data to analyze
+-        use_curve_optimization = False
+-        if midpoint_idx is not None:
+-            clear_dwell = self.is_clear_signal(
+-                dwell_start_idx,
+-                dwell_end_idx,
+-                l3,
+-                dwell_end_idx,
+-                midpoint_idx - 1,
+-            )
+-            clear_decomp = self.is_clear_signal(
+-                break_contact_idx,
+-                pullback_end_idx,
+-                l5,
+-                break_contact_idx,
+-                midpoint_idx,
+-            )
+-            use_curve_optimization = clear_dwell and clear_decomp
+-        if use_curve_optimization:
+-            # perform iterative refinement
+-            l4_start = self.line(pullback_cruise_idx, midpoint_idx)
+-            # real break contact index
+-            break_contact_idx = self.find_elbow(midpoint_idx, pullback_end_idx)
+-            l4_end = self.line(midpoint_idx, break_contact_idx)
+-            l5 = self.line(break_contact_idx, pullback_end_idx)
+-            # a synthetic l4 is built from 2 points:
+-            l4 = self._points_to_line(
+-                l4_start.intersection(l3), l4_end.intersection(l5)
+-            )
+-        else:
+-            # noise is too high, don't use the curve optimization
+-            l4 = self.line(pullback_cruise_idx, break_contact_idx)
+-            # log for user debugging
+-            logging.info("TapAnalysis: curve optimization not used")
+-
+-        return [l1, l2, l3, l4, l5], homing_start_idx, pullback_end_idx
+-
+-
+-class TapValidationError(Exception):
+-    error_code: str
+-
+-    def __init__(self, error_code: str, message: str):
+-        super().__init__(message)
+-        self.error_code = error_code
+-        pass
+-
+-    def to_dict(self) -> dict[str, str]:
+-        return {"error_code": self.error_code, "message": str(self)}
+-
+-
+-# Move index constants. The PROBE_START move may be deleted from the trapq if
+-# the probe takes longer than 30s. Indexing from the end of the list
+-# is always consistent:
+-PROBE_START = -6
+-PROBE_CRUISE = -5
+-PROBE_HALT = -4
+-PULLBACK_START = -3
+-PULLBACK_CRUISE = -2
+-PULLBACK_END = -1
+-
+-
+-class TapAnalysis:
+-    def __init__(self, samples: list[float], trigger_force):
+-        self._is_valid = False
+-        self._tap_pos: Optional[tuple[float, float, float]] = None
+-        self._tap_points: list[ForcePoint] = []
+-        self._tap_lines: list[ForceLine] = []
+-        self._tap_angles: list[float] = []
+-        self._elapsed: float = 0.0
+-        self._collection_time: float = 0.0
+-        self._error: Optional[TapValidationError] = None
+-        self._home_end_time: Optional[float] = None
+-        self._pullback_start_time: Optional[float] = None
+-        self._pullback_end_time: Optional[float] = None
+-        self._pullback_cruise_time: Optional[float] = None
+-        self._pullback_duration: Optional[float] = None
+-        self._homing_start_index: int = 0
+-        self._pullback_end_index: int = -1
+-        nd_samples = np.asarray(samples, dtype=np.float64)
+-        self._time_offset = float(nd_samples[0, 0])
+-        self._time = nd_samples[:, 0] - self._time_offset
+-        self._force = nd_samples[:, 1]
+-        self._force_graph = ForceGraph(self._time, self._force)
+-        self._trigger_force = trigger_force
+-        self._moves: list[TrapezoidalMove] = []
+-
+-    @staticmethod
+-    def _move_dist(move: TrapezoidalMove, print_time: float):
+-        move_t = move.move_t
+-        move_time = max(0.0, min(move_t, print_time - move.print_time))
+-        dist = (move.start_v + (0.5 * move.accel) * move_time) * move_time
+-        return dist
+-
+-    @staticmethod
+-    def _move_pos(move: TrapezoidalMove, dist: float):
+-        return (
+-            move.start_x + (move.x_r * dist),
+-            move.start_y + (move.y_r * dist),
+-            move.start_z + (move.z_r * dist),
+-        )
+-
+-    # get an XYZ position from the toolhead position history
+-    # positions before/after the captured history are assumed to be stationary
+-    def get_toolhead_position(self, print_time):
+-        for i, move in enumerate(self._moves):
+-            start_time = move.print_time
+-            # time before first move, assume printer was stationary
+-            if i == 0 and print_time < start_time:
+-                return self._move_pos(move, 0)
+-            end_time = float("inf")
+-            if i < (len(self._moves) - 1):
+-                end_time = self._moves[i + 1].print_time
+-            if start_time <= print_time < end_time:
+-                # we have found the move
+-                dist = self._move_dist(move, print_time)
+-                pos = self._move_pos(move, dist)
+-                return pos
+-            else:
+-                continue
+-        # time is after last move, assume printer was stationary
+-        move = self._moves[-1]
+-        dist = self._move_dist(move, print_time)
+-        return self._move_pos(move, dist)
+-
+-    def log_trapq(self):
+-        logging.info("TapAnalysis - Trapezoidal Movement Queue contents:")
+-        for i, move in enumerate(self._moves):
+-            logging.info(f"Move {i}: {move.to_dict()}")
+-
+-    # adjust move_t of PROBE_CRUISE to match the toolhead position of PROBE_HALT
+-    def _recalculate_homing_end(self):
+-        homing_move = self._moves[PROBE_CRUISE]
+-        halt_move = self._moves[PROBE_HALT]
+-        # acceleration should be 0! This is the 'coasting' move:
+-        if homing_move.accel != 0.0:
+-            raise TapValidationError(
+-                "COASTING_MOVE_ACCELERATION",
+-                "Probing move is accelerating/decelerating which is invalid",
+-            )
+-        # how long did it take to get to end_z?
+-        homing_move.move_t = abs(
+-            (halt_move.start_z - homing_move.start_z) / homing_move.start_v
+-        )
+-        return homing_move.print_time + homing_move.move_t
+-
+-    # extract and save TrapQueue moves
+-    def _extract_trapq(self, printer):
+-        trapq = printer.lookup_object("motion_report").trapqs["toolhead"]
+-        moves, _ = trapq.extract_trapq(float(self._time[0] + self._time_offset))
+-        for move in moves:
+-            self._moves.append(TrapezoidalMove(move, self._time_offset))
+-
+-    # perform analysis, throws exceptions
+-    def analyze(self, printer):
+-        self._extract_trapq(printer)
+-        num_moves = len(self._moves)
+-        if num_moves < 5:
+-            raise TapValidationError(
+-                "TOO_FEW_PROBING_MOVES",
+-                "5 Probing moves expected but there were fewer",
+-            )
+-        elif num_moves > 6:
+-            raise TapValidationError(
+-                "TOO_MANY_PROBING_MOVES",
+-                "More than 6 probing moves were found during the tap",
+-            )
+-        self._home_end_time = self._recalculate_homing_end()
+-        self._pullback_start_time = self._moves[PULLBACK_START].print_time
+-        self._pullback_end_time = (
+-            self._moves[PULLBACK_END].print_time
+-            + self._moves[PULLBACK_END].move_t
+-        )
+-        self._pullback_cruise_time = self._moves[PULLBACK_CRUISE].print_time
+-        self._pullback_duration = (
+-            self._pullback_end_time - self._pullback_start_time
+-        )
+-        lines, i, j = self._force_graph.tap_decompose(
+-            self._home_end_time,
+-            self._pullback_start_time,
+-            self._pullback_cruise_time,
+-            self._pullback_duration,
+-        )
+-        self._homing_start_index = i
+-        self._pullback_end_index = j
+-        self.set_tap_lines(lines)
+-        self._validate_order()
+-        self._validate_tap_shape()
+-        self._validate_break_contact_time()
+-        self._is_valid = True
+-
+-    # validate that a set of ForcePoint objects are in chronological order
+-    def _validate_order(self):
+-        p = self._tap_points
+-        if not (
+-            p[0].time
+-            < p[1].time
+-            < p[2].time
+-            < p[3].time
+-            < p[4].time
+-            < p[5].time
+-        ):
+-            raise TapValidationError(
+-                "TAP_CHRONOLOGY", "Tap points are out of chronological order"
+-            )
+-
+-    # Validate that the rotations between lines form a tap shape
+-    def _validate_tap_shape(self):
+-        a1, a2, a3, a4 = self._tap_angles
+-        # with two polarities there are 2 valid tap shapes:
+-        if not (
+-            (a1 > 0 and a2 < 0 and a3 < 0 and a4 > 0)
+-            or (a1 < 0 and a2 > 0 and a3 > 0 and a4 < 0)
+-        ):
+-            raise TapValidationError(
+-                "TAP_SHAPE_INVALID", "Force data does not form a tap shape"
+-            )
+-
+-    # The proposed break contact point must fall inside the
+-    # first 3/4s of the pullback move
+-    def _validate_break_contact_time(self):
+-        break_contact_time = self._tap_points[4].time
+-        start_t = self._pullback_start_time
+-        end_t = self._pullback_end_time
+-        safety_margin = (end_t - start_t) / 4.0
+-        if break_contact_time < start_t:
+-            raise TapValidationError(
+-                "TAP_BREAK_CONTACT_TOO_EARLY",
+-                "Tap break-contact time is too early",
+-            )
+-        elif break_contact_time > end_t:
+-            raise TapValidationError(
+-                "TAP_BREAK_CONTACT_TOO_LATE",
+-                "Tap break-contact time is too late",
+-            )
+-        elif break_contact_time > (end_t - safety_margin):
+-            raise TapValidationError(
+-                "TAP_PULLBACK_TOO_SHORT",
+-                "Tap break-contact time is too late, pullback move may be too "
+-                "short",
+-            )
+-
+-    def _calculate_points(self):
+-        l1, l2, l3, l4, l5 = self._tap_lines
+-        # Line intersections:
+-        p0 = ForcePoint(
+-            self._time[self._homing_start_index],
+-            l1.find_force(float(self._time[self._homing_start_index])),
+-        )
+-        p1 = l1.intersection(l2)
+-        p2 = l2.intersection(l3)
+-        p3 = l3.intersection(l4)
+-        p4 = l4.intersection(l5)
+-        p5 = ForcePoint(
+-            self._time[self._pullback_end_index],
+-            l5.find_force(float(self._time[self._pullback_end_index])),
+-        )
+-        self._tap_points = [p0, p1, p2, p3, p4, p5]
+-
+-    def _calculate_angles(self):
+-        l1, l2, l3, l4, l5 = self._tap_lines
+-        self._tap_angles = [
+-            l1.angle(l2),
+-            l2.angle(l3),
+-            l3.angle(l4),
+-            l4.angle(l5),
+-        ]
+-
+-    # 'read only' fields:
+-    def get_time(self) -> list[float]:
+-        return self._time.tolist()
+-
+-    def get_force(self) -> list[float]:
+-        return self._force.tolist()
+-
+-    def get_trigger_force(self) -> float:
+-        return self._trigger_force
+-
+-    def get_moves(self) -> list[TrapezoidalMove]:
+-        return self._moves
+-
+-    def get_home_end_time(self) -> float:
+-        return self._home_end_time
+-
+-    def get_pullback_start_time(self) -> float:
+-        return self._pullback_start_time
+-
+-    def get_pullback_end_time(self) -> float:
+-        return self._pullback_end_time
+-
+-    def get_tap_points(self) -> list[ForcePoint]:
+-        return self._tap_points
+-
+-    def get_tap_pos(self) -> Optional[tuple[float, float, float]]:
+-        return self._tap_pos
+-
+-    def get_tap_angles(self) -> list[float]:
+-        return self._tap_angles
+-
+-    # read/write fields
+-    def get_tap_lines(self) -> list[ForceLine]:
+-        return self._tap_lines
+-
+-    # Allow TapClassifier modules to overwrite the lines
+-    # This also causes the tap points, angles and tap pos to be recalculated
+-    def set_tap_lines(self, tap_lines: list[ForceLine]):
+-        self._tap_lines = tap_lines
+-        self._calculate_points()
+-        self._calculate_angles()
+-        break_contact_time = self._tap_points[4].time
+-        self._tap_pos = self.get_toolhead_position(break_contact_time)
+-
+-    def is_valid(self) -> bool:
+-        return self._is_valid
+-
+-    def set_is_valid(self, is_valid: bool):
+-        self._is_valid = is_valid
+-
+-    def get_validation_error(self) -> TapValidationError:
+-        return self._error
+-
+-    def set_validation_error(self, error: TapValidationError):
+-        self._error = error
+-
+-    def get_elapsed(self) -> float:
+-        return self._elapsed
+-
+-    def set_elapsed(self, elapsed: float):
+-        self._elapsed = elapsed
+-
+-    def get_collection_time(self):
+-        return self._collection_time
+-
+-    def set_collection_time(self, collection_time):
+-        self._collection_time = collection_time
+-
+-    # convert to dictionary for JSON encoder
+-    def to_dict(self):
+-        return {
+-            "time": self.get_time(),
+-            "force": self._force.tolist(),
+-            "tap_points": [point.to_dict() for point in self.get_tap_points()],
+-            "tap_lines": [line.to_dict() for line in self.get_tap_lines()],
+-            "tap_angles": self.get_tap_angles(),
+-            "tap_pos": self.get_tap_pos(),
+-            "moves": [move.to_dict() for move in self._moves],
+-            "home_end_time": self.get_home_end_time(),
+-            "pullback_start_time": self.get_pullback_start_time(),
+-            "pullback_end_time": self.get_pullback_end_time(),
+-            "collection_time": self.get_collection_time(),
+-            "elapsed": self.get_elapsed(),
+-            "is_valid": self.is_valid(),
+-            "error": None if self._error is None else self._error.to_dict(),
+-        }
+-
+-
+-# Orchestrate TapAnalysis and TapClassifier. Handle timing, error capture,
+-# event broadcast, clients & logging
+-class TapAnalysisHelper:
+-    def __init__(self, printer, name, tap_classifier):
+-        self._printer = printer
+-        self._tap_classifier = tap_classifier
+-        # webhooks support
+-        self._clients = ApiClientHelper(printer)
+-        header = {"header": ["probe_tap_event"]}
+-        self._clients.add_mux_endpoint(
+-            "load_cell_probe/dump_taps", "load_cell_probe", name, header
+-        )
+-
+-    def analyze(self, samples, trigger_force, collection_time, gcmd):
+-        t_start = time.time()
+-        tap_analysis = TapAnalysis(samples, trigger_force)
+-        try:
+-            tap_analysis.analyze(self._printer)
+-        except TapValidationError as ve:
+-            tap_analysis.set_is_valid(False)
+-            tap_analysis.set_validation_error(ve)
+-            tap_analysis.log_trapq()
+-        # tap classifier always gets to process the data
+-        try:
+-            self._tap_classifier.classify(tap_analysis, gcmd)
+-        except TapValidationError as ve:
+-            tap_analysis.set_is_valid(False)
+-            tap_analysis.set_validation_error(ve)
+-        # total elapsed time for all calculations
+-        tap_analysis.set_elapsed(time.time() - t_start)
+-        tap_analysis.set_collection_time(collection_time)
+-        # broadcast tap event data:
+-        self._clients.send({"tap": tap_analysis.to_dict()})
+-        self._log_errors(tap_analysis)
+-        return tap_analysis
+-
+-    # log errors to event log
+-    @staticmethod
+-    def _log_errors(tap_analysis):
+-        # if the tap is valid, don't log any errors
+-        if tap_analysis.is_valid():
+-            return
+-        # log errors
+-        ve = tap_analysis.get_validation_error()
+-        logging.info("Bad tap detected: %s - %s" % (ve.error_code, ve))
+-
+-    # get internal tap events
+-    def add_client(self, callback):
+-        self._clients.add_client(callback)
+diff --git a/klippy/extras/load_cell/tap_quality_classifier.py b/klippy/extras/load_cell/tap_quality_classifier.py
+deleted file mode 100644
+index 762212b3..00000000
+--- a/klippy/extras/load_cell/tap_quality_classifier.py
++++ /dev/null
+@@ -1,263 +0,0 @@
+-# Simple Tap Classifier
+-#
+-# Copyright (C) 2025  Gareth Farrington <gareth@waves.ky>
+-#
+-# This file may be distributed under the terms of the GNU GPLv3 license.
+-from __future__ import annotations
+-
+-import math
+-from typing import Any, Optional
+-
+-from klippy.configfile import ConfigWrapper, PrinterConfig
+-from klippy.extras.load_cell.tap_analysis import (
+-    ForcePoint,
+-    TapAnalysis,
+-    TapClassifierModule,
+-    TapValidationError,
+-)
+-from klippy.gcode import GCodeCommand
+-
+-
+-class TapQualityClassifierConfig:
+-    minimum_tap_quality: float = 40.0
+-    decompression_angle: Optional[float] = None
+-    max_baseline_force_delta: float = 0.25
+-    max_departure_force: float = 0.25
+-    max_approach_force: float = 0.5
+-    max_dwell_force_drop: float = 0.75
+-
+-    def __init__(self, config: ConfigWrapper):
+-        self._config = config
+-        self._config_name = config.get_name()
+-        self._printer = config.get_printer()
+-        self._cfg_minimum_tap_quality = config.getfloat(
+-            "min_tap_quality",
+-            minval=0.0,
+-            maxval=100.0,
+-            default=40.0,
+-        )
+-        self._cfg_decompression_angle: Optional[float] = config.getfloat(
+-            "decompression_angle", above=0.0, below=90.0, default=None
+-        )
+-        self._cfg_max_approach_force: float = (
+-            config.getfloat(
+-                "max_approach_force", minval=0.0, maxval=100.0, default=50.0
+-            )
+-            / 100.0
+-        )
+-        self._cfg_max_baseline_force_delta: float = (
+-            config.getfloat(
+-                "max_baseline_force_delta",
+-                minval=0.0,
+-                maxval=100.0,
+-                default=25.0,
+-            )
+-            / 100.0
+-        )
+-        self._cfg_max_departure_force: float = (
+-            config.getfloat(
+-                "max_departure_force", minval=0.0, maxval=100.0, default=25.0
+-            )
+-            / 100.0
+-        )
+-        self._cfg_max_dwell_force_drop: float = (
+-            config.getfloat(
+-                "max_dwell_force_drop", minval=0.0, maxval=100.0, default=75.0
+-            )
+-            / 100.0
+-        )
+-        self.minimum_tap_quality = self._cfg_minimum_tap_quality
+-        self.decompression_angle = self._cfg_decompression_angle
+-        self.max_baseline_force_delta = self._cfg_max_baseline_force_delta
+-        self.max_approach_force = self._cfg_max_approach_force
+-        self.max_departure_force = self._cfg_max_departure_force
+-        self.max_dwell_force_drop = self._cfg_max_dwell_force_drop
+-
+-    def customize(self, gcmd: GCodeCommand):
+-        self.minimum_tap_quality = gcmd.get_float(
+-            "MIN_TAP_QUALITY",
+-            minval=0.0,
+-            maxval=100.0,
+-            default=self._cfg_minimum_tap_quality,
+-        )
+-        self.decompression_angle = gcmd.get_float(
+-            "DECOMPRESSION_ANGLE",
+-            above=0.0,
+-            below=90.0,
+-            default=self._cfg_decompression_angle,
+-        )
+-
+-    def _save_config(self, field, value: Any):
+-        configfile: PrinterConfig = self._printer.lookup_object("configfile")
+-        configfile.set(self._config_name, field, value)
+-
+-    def set_minimum_tap_quality(self, minimum_tap_quality: float):
+-        minimum_tap_quality = round(float(minimum_tap_quality), 1)
+-        if not (0.0 <= minimum_tap_quality <= 100.0):
+-            raise self._printer.config_error(
+-                "min_tap_quality must be between 0.0 and 100.0"
+-            )
+-        self._cfg_minimum_tap_quality = self.minimum_tap_quality = (
+-            minimum_tap_quality
+-        )
+-        self._save_config("min_tap_quality", self.minimum_tap_quality)
+-
+-    def set_decompression_angle(self, decompression_angle: float):
+-        decompression_angle = round(float(decompression_angle), 1)
+-        if not (0.0 < decompression_angle < 90.0):
+-            raise self._printer.config_error(
+-                "decompression_angle must be between 0.0 and 90.0"
+-            )
+-        self._cfg_decompression_angle = self.decompression_angle = (
+-            decompression_angle
+-        )
+-        self._save_config("decompression_angle", self.decompression_angle)
+-
+-
+-# Simple tap classifier rules:
+-# 1) The compression force must greater than the trigger force
+-# 2) Tap quality metric must be more than the minimum_tap_quality
+-class TapQualityClassifier(TapClassifierModule):
+-    def __init__(self, config: ConfigWrapper):
+-        self.printer = config.get_printer()
+-        self.config: TapQualityClassifierConfig = TapQualityClassifierConfig(
+-            config
+-        )
+-
+-    def set_minimum_tap_quality(self, minimum_tap_quality: float):
+-        self.config.set_minimum_tap_quality(minimum_tap_quality)
+-
+-    def set_decompression_angle(self, decompression_angle: float):
+-        self.config.set_decompression_angle(decompression_angle)
+-
+-    @staticmethod
+-    def _slope_to_degrees(slope: float, time_scale=0.1, gram_scale=25):
+-        scaling_factor = time_scale / gram_scale
+-        this_slope = 0.0
+-        other_slope = slope * scaling_factor
+-        radians = math.atan2(this_slope, 1) - math.atan2(other_slope, 1)
+-        return math.degrees(radians)
+-
+-    @staticmethod
+-    def _clamp(value: float, threshold: float) -> float:
+-        if value > threshold:
+-            value = 1.0
+-        return value
+-
+-    @staticmethod
+-    def _calc_force_range(points: list[ForcePoint]):
+-        min_force = float("inf")
+-        max_force = float("-inf")
+-        for point in points:
+-            force = point.force
+-            min_force = min(min_force, force)
+-            max_force = max(max_force, force)
+-        return max_force - min_force
+-
+-    def classify(self, tap_analysis: TapAnalysis, gcmd: GCodeCommand):
+-        # This module cant rescue bad data
+-        if not tap_analysis.is_valid():
+-            return
+-
+-        # if the user does not configure an angle, don't classify the tap
+-        if self.config.decompression_angle is None:
+-            return
+-
+-        # unpack tap points with names
+-        tap_points = tap_analysis.get_tap_points()
+-        approach_start_point = tap_points[0]
+-        approach_end_point = compression_start_point = tap_points[1]
+-        compression_end_point = dwell_start_point = tap_points[2]
+-        dwell_end_point = tap_points[3]
+-        decompression_end_point = departure_start_point = tap_points[4]
+-        departure_end_point = tap_points[5]
+-
+-        # only the compression force in the compression line
+-        compression_force = abs(
+-            compression_end_point.force - compression_start_point.force
+-        )
+-
+-        # compression check: did we meet the minimum force requirement?
+-        if compression_force < tap_analysis.get_trigger_force():
+-            raise TapValidationError(
+-                "LOW_COMPRESSION_FORCE",
+-                f"Compression force, {compression_force}g, was less than the "
+-                f"trigger force ({tap_analysis.get_trigger_force()}g)",
+-            )
+-
+-        if gcmd is not None:
+-            self.config.customize(gcmd)
+-
+-        # These 2 metrics are expected to approach 0.0 in an ideal tap. If
+-        # they are large that usually indicates the tap is fouled.
+-        # They are clamped such that if they exceed 0.25, they become 1.0
+-        # this causes the quality score to drop to 0.0
+-        baseline_delta_pct = self._clamp(
+-            abs(compression_start_point.force - decompression_end_point.force)
+-            / compression_force,
+-            self.config.max_baseline_force_delta,
+-        )
+-        departure_force_pct = self._clamp(
+-            abs(departure_end_point.force - departure_start_point.force)
+-            / compression_force,
+-            self.config.max_departure_force,
+-        )
+-
+-        # The approach force would also ideally be 0, but it can be subject to
+-        # bowden tube forces which we must allow. A larger 0.5 cutoff is used
+-        # to allow for this.
+-        approach_force_pct = self._clamp(
+-            abs(approach_end_point.force - approach_start_point.force)
+-            / compression_force,
+-            self.config.max_approach_force,
+-        )
+-
+-        # Dwell force drop is loosely clamped because it can drop quite a lot
+-        # in an acceptable tap
+-        dwell_force_drop_pct = self._clamp(
+-            abs(dwell_start_point.force - dwell_end_point.force)
+-            / compression_force,
+-            self.config.max_dwell_force_drop,
+-        )
+-
+-        # Normalize the decompression angle to the configured
+-        # mean angle for this printer
+-        lines = tap_analysis.get_tap_lines()
+-        decompression_line = lines[3]
+-        decomp_angle = abs(self._slope_to_degrees(decompression_line.slope))
+-        decompression_angle = self.config.decompression_angle
+-        if decompression_angle is None:
+-            decompression_angle = 80.0
+-        normalized_decompression_angle = (
+-            abs(decomp_angle - decompression_angle) / decompression_angle
+-        )
+-
+-        # Calculate tap quality score
+-        tap_quality: float = 100.0 * (
+-            # Using (1.0 - x) converts the scores from 0 = good to 1 = good
+-            (1.0 - approach_force_pct)
+-            * (1.0 - departure_force_pct)
+-            * (1.0 - baseline_delta_pct)
+-            * (1.0 - dwell_force_drop_pct)
+-            * (1.0 - normalized_decompression_angle)
+-        )
+-
+-        # TODO: should this be a debugging option? logged?
+-        # log info to console for now...
+-        gcode = self.printer.lookup_object("gcode")
+-        gcode.respond_info(
+-            f"Tap Quality: {round(tap_quality, 1)}%, Decompression angle: "
+-            f" {round(abs(self._slope_to_degrees(decompression_line.slope)), 1)}"
+-        )
+-
+-        # tap quality check
+-        if tap_quality < self.config.minimum_tap_quality:
+-            raise TapValidationError(
+-                "LOW_TAP_QUALITY",
+-                f"Tap quality, {tap_quality}%, was less than the minimum tap "
+-                f"quality {self.config.minimum_tap_quality}%",
+-            )
+-
+-
+-def load_config(config):
+-    return TapQualityClassifier(config)
+diff --git a/klippy/extras/load_cell_probe.py b/klippy/extras/load_cell_probe.py
+index e7f35d4e..67cddf53 100644
+--- a/klippy/extras/load_cell_probe.py
++++ b/klippy/extras/load_cell_probe.py
+@@ -5,8 +5,6 @@
+ # This file may be distributed under the terms of the GNU GPLv3 license.
+ from klippy.extras.load_cell import ads131m0x, ads1220, cs1237, hx71x
+ from klippy.extras.load_cell.load_cell_probe import LoadCellPrinterProbe
+-from klippy.extras.load_cell.tap_analysis import TapClassifierModule
+-from klippy.extras.load_cell.tap_quality_classifier import TapQualityClassifier
+ from klippy.printer import Printer, SubsystemComponentCollection
+ 
+ 
+@@ -20,21 +18,10 @@ def register_components(subsystem: SubsystemComponentCollection):
+     )
+     for name, sensor in sensors.items():
+         subsystem.register_component("load_cell_probe_sensors", name, sensor)
+-    key = "load_cell_probe_tap_classifiers"
+-    subsystem.register_component(key, "empty", TapClassifierModule)
+-    subsystem.register_component(key, "tap_quality", TapQualityClassifier)
+ 
+ 
+ def load_config(config):
+     printer: Printer = config.get_printer()
+     sensors = printer.lookup_components("load_cell_probe_sensors")
+     sensor_class = config.getchoice("sensor_type", sensors)
+-    tap_classifiers = printer.lookup_components(
+-        "load_cell_probe_tap_classifiers"
+-    )
+-    tap_classifier = config.getchoice(
+-        "tap_classifier", tap_classifiers, default="tap_quality"
+-    )
+-    return LoadCellPrinterProbe(
+-        config, sensor_class(config), tap_classifier(config)
+-    )
++    return LoadCellPrinterProbe(config, sensor_class(config))
+diff --git a/klippy/extras/trigger_analog.py b/klippy/extras/trigger_analog.py
+new file mode 100644
+index 00000000..0b239e4c
+--- /dev/null
++++ b/klippy/extras/trigger_analog.py
+@@ -0,0 +1,495 @@
++# Wrapper around mcu trigger_analog objects
++#
++# Copyright (C) 2025 Gareth Farrington <gareth@waves.ky>
++# Copyright (C) 2026  Kevin O'Connor <kevin@koconnor.net>
++#
++# This file may be distributed under the terms of the GNU GPLv3 license.
++from klippy import mcu
++
++######################################################################
++# SOS filters (Second Order Sectional)
++######################################################################
++
++MAX_INT32 = (2**31) - 1
++MIN_INT32 = -(2**31)
++
++
++def assert_is_int32(value, frac_bits):
++    if value > MAX_INT32 or value < MIN_INT32:
++        raise OverflowError(
++            "Fixed point Q%d.%d overflow" % (31 - frac_bits, frac_bits)
++        )
++    return value
++
++
++# convert a floating point value to a 32 bit fixed point representation
++# checks for overflow
++def to_fixed_32(value, frac_bits=0):
++    fixed_val = int(round(value * (2**frac_bits)))
++    return assert_is_int32(fixed_val, frac_bits)
++
++
++# Determine maximum frac bits for a list of values
++def calc_frac_bits(values):
++    if all([v == int(v) for v in values]):
++        return 0
++    mv = max([abs(v) for v in values])
++    frac_bits = 31 - int(mv).bit_length()  # 63 - int(mv * (1<<32)).bit_length()
++    if frac_bits <= 0:
++        return 0
++    try:
++        validate = [to_fixed_32(v, frac_bits) for v in values]
++    except OverflowError as e:
++        # Handle rare case where rounding causes an overflow
++        return frac_bits - 1
++    return frac_bits
++
++
++# Pre-generated SOS filters (avoid Scipy package for common installs)
++GeneratedSOS = {
++    ("lowpass", 400.0 / 25.0, 4): [
++        [
++            0.0009334986129548442,
++            0.0018669972259096883,
++            0.0009334986129548442,
++            1.0,
++            -1.3651172372392975,
++            0.4775922500725171,
++        ],
++        [1.0, 2.0, 1.0, 1.0, -1.6117270964574348, 0.7445208382054344],
++    ],
++}
++
++
++# Helper tool to pre-generate SOS filters.  Run with something like:
++#  python -c 'import trigger_analog as m; m.pre_gen_filt("lowpass", 400, 25, 4)'
++def pre_gen_filt(btype, sps, freq, order):
++    global GeneratedSOS
++    GeneratedSOS = {}
++    # Create filter
++    df = DigitalFilter(sps, ImportError)
++    fs = df._butter(freq, btype, order)
++    # Write filter info to stdout
++    msgs = []
++    msgs.append(
++        "    ('%s', %s/%s, %d): ["
++        % (btype, repr(float(sps)), repr(float(freq)), order)
++    )
++    for data in fs:
++        coeffs = ", ".join([repr(float(c)) for c in data])
++        msgs.append(
++            "        [%s]," % coeffs,
++        )
++    msgs.append("    ],")
++    msgs.append("")
++    import sys
++
++    sys.stdout.write("\n".join(msgs))
++
++
++# Digital filter designer and container
++class DigitalFilter:
++    def __init__(self, sps, cfg_error):
++        self.filter_sections = []
++        self.initial_state = None
++        self.sample_frequency = sps
++        self.cfg_error = cfg_error
++
++    def get_scipy_signal(self):
++        try:
++            import scipy.signal as signal
++        except:
++            raise self.cfg_error("DigitalFilter require the SciPy module")
++        return signal
++
++    def add_highpass(self, highpass, highpass_order):
++        f = self._butter(highpass, "highpass", highpass_order)
++        self.filter_sections.extend(f)
++
++    def add_lowpass(self, lowpass, lowpass_order):
++        f = self._butter(lowpass, "lowpass", lowpass_order)
++        self.filter_sections.extend(f)
++
++    def add_notch(self, notch_freq, notch_quality):
++        signal = self.get_scipy_signal()
++        b, a = signal.iirnotch(
++            notch_freq, Q=notch_quality, fs=self.sample_frequency
++        )
++        f = signal.tf2sos(b, a)[0]
++        self.filter_sections.append(f)
++
++    def add_derivative(self):
++        # Sample to sample difference (derivative) as stage in SOS filter
++        self.filter_sections.append((1.0, -1.0, 0.0, 1.0, 0.0, 0.0))
++
++    def setup_initial_state(self):
++        if not self.filter_sections:
++            return
++        signal = self.get_scipy_signal()
++        self.initial_state = signal.sosfilt_zi(self.filter_sections)
++
++    def _butter(self, frequency, btype, order):
++        key = (btype, float(self.sample_frequency) / frequency, int(order))
++        if key in GeneratedSOS:
++            return GeneratedSOS[key]
++        signal = self.get_scipy_signal()
++        return signal.butter(
++            order,
++            Wn=frequency,
++            btype=btype,
++            fs=self.sample_frequency,
++            output="sos",
++        )
++
++    def get_filter_sections(self):
++        return self.filter_sections
++
++    def get_initial_state(self):
++        if self.initial_state is None:
++            return [[0.0, 0.0]] * len(self.filter_sections)
++        return self.initial_state
++
++    def get_size(self):
++        return len(self.filter_sections)
++
++
++# Control an `sos_filter` object on the MCU
++class MCU_SosFilter:
++    # max_sections should be the largest number of sections you expect
++    # to use at runtime.
++    def __init__(self, mcu, cmd_queue, max_sections):
++        self._mcu = mcu
++        self._cmd_queue = cmd_queue
++        self._max_sections = max_sections
++        # SOS filter "design"
++        self._design = None
++        self._coeff_frac_bits = 0
++        self._last_calc_frac_bits = None
++        self._start_value = 0.0
++        # Offset and scaling
++        self._offset = 0
++        self._scale = 1.0
++        self._auto_offset = False
++        # MCU commands
++        self._oid = self._mcu.create_oid()
++        self._set_section_cmd = self._set_state_cmd = None
++        self._set_active_cmd = self._set_offset_scale_cmd = None
++        self._last_sent_coeffs = [None] * self._max_sections
++        self._last_sent_offset_scale = None
++        self._mcu.add_config_cmd(
++            "config_sos_filter oid=%d max_sections=%d"
++            % (self._oid, self._max_sections)
++        )
++        self._mcu.register_config_callback(self._build_config)
++
++    def _build_config(self):
++        self._set_section_cmd = self._mcu.lookup_command(
++            "sos_filter_set_section oid=%c section_idx=%c"
++            " sos0=%i sos1=%i sos2=%i sos3=%i sos4=%i",
++            cq=self._cmd_queue,
++        )
++        self._set_state_cmd = self._mcu.lookup_command(
++            "sos_filter_set_state oid=%c section_idx=%c state0=%i state1=%i",
++            cq=self._cmd_queue,
++        )
++        self._set_offset_scale_cmd = self._mcu.lookup_command(
++            "sos_filter_set_offset_scale oid=%c offset=%i"
++            " scale=%i scale_frac_bits=%c auto_offset=%c",
++            cq=self._cmd_queue,
++        )
++        self._set_active_cmd = self._mcu.lookup_command(
++            "sos_filter_set_active oid=%c n_sections=%c coeff_frac_bits=%c",
++            cq=self._cmd_queue,
++        )
++
++    def get_oid(self):
++        return self._oid
++
++    # Determine the frac_bits to use for sos filter coefficients
++    def _calc_coeff_frac_bits(self, filter_sections):
++        coeffs = sum([list(f) for f in filter_sections], [])
++        if not filter_sections or coeffs == self._last_calc_frac_bits:
++            return
++        self._coeff_frac_bits = calc_frac_bits(coeffs)
++        self._last_calc_frac_bits = coeffs
++
++    # convert the SciPi SOS filters to fixed point format
++    def _convert_filter(self):
++        if self._design is None:
++            return []
++        filter_sections = self._design.get_filter_sections()
++        self._calc_coeff_frac_bits(filter_sections)
++        sos_fixed = []
++        for section in filter_sections:
++            nun_coeff = len(section)
++            if nun_coeff != 6:
++                raise ValueError(
++                    "The number of filter coefficients is %i"
++                    ", must be 6" % (nun_coeff,)
++                )
++            fixed_section = []
++            for col, coeff in enumerate(section):
++                if col != 3:  # omit column 3
++                    fixed_coeff = to_fixed_32(coeff, self._coeff_frac_bits)
++                    fixed_section.append(fixed_coeff)
++                elif coeff != 1.0:  # double check column 3 is always 1.0
++                    raise ValueError(
++                        "Coefficient 3 is expected to be 1.0"
++                        " but was %f" % (coeff,)
++                    )
++            sos_fixed.append(fixed_section)
++        return sos_fixed
++
++    # convert the SOS filter state matrix (zi) to fixed point format
++    def _convert_state(self):
++        if self._design is None:
++            return []
++        filter_state = self._design.get_initial_state()
++        sos_state = []
++        for section in filter_state:
++            nun_states = len(section)
++            if nun_states != 2:
++                raise ValueError(
++                    "The number of state elements is %i, must be 2"
++                    % (nun_states,)
++                )
++            fixed_state = []
++            for col, value in enumerate(section):
++                adjval = value * self._start_value
++                fixed_state.append(to_fixed_32(adjval))
++            sos_state.append(fixed_state)
++        return sos_state
++
++    # Set expected state when filter first starts (avoids filter
++    # "ringing" if sensor data has a known static offset)
++    def set_start_state(self, start_value):
++        self._start_value = start_value
++
++    # Set conversion of a raw value 1 to a 1.0 value processed by sos filter
++    def set_offset_scale(self, offset=0, scale=1.0, auto_offset=False):
++        self._offset = offset
++        self._scale = scale
++        self._auto_offset = auto_offset
++
++    # Change the filter coefficients and state at runtime
++    def set_filter_design(self, design):
++        self._design = design
++
++    # Resets the filter state back to initial conditions at runtime
++    def reset_filter(self):
++        # Generate filter parameters
++        sos_fixed = self._convert_filter()
++        sos_state = self._convert_state()
++        num_sections = len(sos_fixed)
++        if num_sections > self._max_sections:
++            raise ValueError(
++                "Too many filter sections: %i, The max is %i"
++                % (
++                    num_sections,
++                    self._max_sections,
++                )
++            )
++        if len(sos_state) != num_sections:
++            raise ValueError(
++                "The number of filter sections (%i) and state "
++                "sections (%i) must be equal" % (num_sections, len(sos_state))
++            )
++        # Send section coefficients (if they have changed)
++        for i, section in enumerate(sos_fixed):
++            args = (
++                self._oid,
++                i,
++                section[0],
++                section[1],
++                section[2],
++                section[3],
++                section[4],
++            )
++            if args == self._last_sent_coeffs[i]:
++                continue
++            self._set_section_cmd.send(args)
++            self._last_sent_coeffs[i] = args
++        # Send section initial states
++        for i, state in enumerate(sos_state):
++            self._set_state_cmd.send([self._oid, i, state[0], state[1]])
++        # Send offset/scale (if they have changed)
++        scale_frac_bits = calc_frac_bits([self._scale])
++        su = to_fixed_32(self._scale, scale_frac_bits)
++        args = (self._oid, self._offset, su, scale_frac_bits, self._auto_offset)
++        if args != self._last_sent_offset_scale or self._auto_offset:
++            self._set_offset_scale_cmd.send(args)
++            self._last_sent_offset_scale = args
++        # Activate filter
++        if self._max_sections:
++            self._set_active_cmd.send(
++                [self._oid, num_sections, self._coeff_frac_bits]
++            )
++
++
++######################################################################
++# Trigger Analog
++######################################################################
++
++
++# MCU_trigger_analog is the interface to `trigger_analog` on the MCU
++class MCU_trigger_analog:
++    MONITOR_MAX = 3
++    REASON_TRIGGER_ANALOG = mcu.MCU_trsync.REASON_COMMS_TIMEOUT + 1
++
++    def __init__(self, sensor_inst):
++        self._printer = sensor_inst.get_mcu().get_printer()
++        self._sensor = sensor_inst
++        self._mcu = self._sensor.get_mcu()
++        self._sos_filter = None
++        self._dispatch = mcu.TriggerDispatch(self._mcu)
++        self._last_trigger_time = 0.0
++        # Raw range checking
++        self._raw_min = self._raw_max = 0
++        self._last_range_args = None
++        # Trigger type
++        self._trigger_type = "unspecified"
++        self._trigger_value = 0.0
++        self._last_trigger_args = None
++        # Error codes from MCU
++        self._error_map = {}
++        self._sensor_specific_error = 0
++        # Configure MCU objects
++        self._oid = self._mcu.create_oid()
++        self._home_cmd = self._query_state_cmd = None
++        self._set_raw_range_cmd = self._set_trigger_cmd = None
++        self._mcu.register_config_callback(self._build_config)
++
++    def setup_sos_filter(self, sos_filter):
++        self._sos_filter = sos_filter
++
++    def _build_config(self):
++        self._sensor.setup_trigger_analog(self._oid)
++        cmd_queue = self._dispatch.get_command_queue()
++        if self._sos_filter is None:
++            self.setup_sos_filter(MCU_SosFilter(self._mcu, cmd_queue, 0))
++        self._mcu.add_config_cmd(
++            "config_trigger_analog oid=%d sos_filter_oid=%d"
++            % (self._oid, self._sos_filter.get_oid())
++        )
++        # Lookup commands
++        self._query_state_cmd = self._mcu.lookup_query_command(
++            "trigger_analog_query_state oid=%c",
++            "trigger_analog_state oid=%c homing=%c homing_clock=%u",
++            oid=self._oid,
++            cq=cmd_queue,
++        )
++        self._set_raw_range_cmd = self._mcu.lookup_command(
++            "trigger_analog_set_raw_range oid=%c raw_min=%i raw_max=%i",
++            cq=cmd_queue,
++        )
++        self._set_trigger_cmd = self._mcu.lookup_command(
++            "trigger_analog_set_trigger oid=%c trigger_analog_type=%c"
++            " trigger_value=%i",
++            cq=cmd_queue,
++        )
++        self._home_cmd = self._mcu.lookup_command(
++            "trigger_analog_home oid=%c trsync_oid=%c trigger_reason=%c"
++            " error_reason=%c clock=%u monitor_ticks=%u monitor_max=%u",
++            cq=cmd_queue,
++        )
++        # Load errors from mcu
++        errors = self._mcu.get_enumerations().get("trigger_analog_error:", {})
++        self._error_map = {v: k for k, v in errors.items()}
++        self._sensor_specific_error = errors.get("SENSOR_SPECIFIC", 0)
++
++    def get_oid(self):
++        return self._oid
++
++    def get_mcu(self):
++        return self._mcu
++
++    def get_sos_filter(self):
++        return self._sos_filter
++
++    def get_dispatch(self):
++        return self._dispatch
++
++    def get_last_trigger_time(self):
++        return self._last_trigger_time
++
++    def set_trigger(self, trigger_type, trigger_value):
++        self._trigger_type = trigger_type
++        self._trigger_value = trigger_value
++
++    def set_raw_range(self, raw_min, raw_max):
++        self._raw_min = raw_min
++        self._raw_max = raw_max
++
++    def _reset_filter(self):
++        # Update raw range parameters in mcu (if they have changed)
++        args = [self._oid, self._raw_min, self._raw_max]
++        if args != self._last_range_args:
++            self._set_raw_range_cmd.send(args)
++            self._last_range_args = args
++        # Update trigger in mcu (if it has changed)
++        args = [self._oid, self._trigger_type, self._trigger_value]
++        if args != self._last_trigger_args:
++            self._set_trigger_cmd.send(args)
++            self._last_trigger_args = args
++        # Update sos filter in mcu
++        self._sos_filter.reset_filter()
++
++    def _clear_home(self):
++        self._home_cmd.send([self._oid, 0, 0, 0, 0, 0, 0, 0])
++        params = self._query_state_cmd.send([self._oid])
++        trigger_ticks = self._mcu.clock32_to_clock64(params["homing_clock"])
++        return self._mcu.clock_to_print_time(trigger_ticks)
++
++    def get_steppers(self):
++        return self._dispatch.get_steppers()
++
++    def home_start(
++        self, print_time, sample_time, sample_count, rest_time, triggered=True
++    ):
++        self._last_trigger_time = 0.0
++        self._reset_filter()
++        trigger_completion = self._dispatch.start(print_time)
++        clock = self._mcu.print_time_to_clock(print_time)
++        sensor_update = 1.0 / self._sensor.get_samples_per_second()
++        sm_ticks = self._mcu.seconds_to_clock(sensor_update)
++        self._home_cmd.send(
++            [
++                self._oid,
++                self._dispatch.get_oid(),
++                mcu.MCU_trsync.REASON_ENDSTOP_HIT,
++                self.REASON_TRIGGER_ANALOG,
++                clock,
++                sm_ticks,
++                self.MONITOR_MAX,
++            ],
++            reqclock=clock,
++        )
++        return trigger_completion
++
++    def home_wait(self, home_end_time):
++        self._dispatch.wait_end(home_end_time)
++        # trigger has happened, now to find out why...
++        res = self._dispatch.stop()
++        # clear the homing state so it stops processing samples
++        trigger_time = self._clear_home()
++        if res >= mcu.MCU_trsync.REASON_COMMS_TIMEOUT:
++            if res == mcu.MCU_trsync.REASON_COMMS_TIMEOUT:
++                raise self._printer.command_error(
++                    "Communication timeout during homing"
++                )
++            error_code = res - self.REASON_TRIGGER_ANALOG
++            if error_code >= self._sensor_specific_error:
++                sensor_err = error_code - self._sensor_specific_error
++                error_msg = self._sensor.lookup_sensor_error(sensor_err)
++            else:
++                defmsg = "Unknown code %i" % (error_code,)
++                error_msg = self._error_map.get(error_code, defmsg)
++            raise self._printer.command_error(
++                "Trigger analog error: %s" % (error_msg,)
++            )
++        if res != mcu.MCU_trsync.REASON_ENDSTOP_HIT:
++            return 0.0
++        if self._mcu.is_fileoutput():
++            trigger_time = home_end_time
++        self._last_trigger_time = trigger_time
++        return trigger_time
+diff --git a/klippy/mathutil.py b/klippy/mathutil.py
+index 43b84fe1..157a13dd 100644
+--- a/klippy/mathutil.py
++++ b/klippy/mathutil.py
+@@ -6,6 +6,7 @@
+ import logging
+ import math
+ import multiprocessing
++import operator
+ import traceback
+ 
+ from . import queuelogger
+@@ -160,3 +161,64 @@ def matrix_sub(m1, m2):
+ 
+ def matrix_mul(m1, s):
+     return [m1[0] * s, m1[1] * s, m1[2] * s]
++
++
++######################################################################
++# Matrix helper functions for NxM matrices
++######################################################################
++
++
++# Transpose a matrix
++def mat_transp(a):
++    return [[a_j[i] for a_j in a] for i in range(len(a[0]))]
++
++
++# Multiply two matrices
++def mat_mat_mul(a, b):
++    if len(a[0]) != len(b):
++        return None
++    bt = mat_transp(b)
++    return [[sum(map(operator.mul, a_i, bt_j)) for bt_j in bt] for a_i in a]
++
++
++def gaussian_solve(a, rhs, allow_underdetermined=False):
++    res = list(rhs)
++    m = list(a)
++    rows_m = len(m)
++    # Perform the LU-decomposition through Gaussian elimination
++    for i in range(rows_m - 1, -1, -1):
++        # Find a pivot and swap the corresponding rows
++        abs_col = [abs(m_j[i]) for m_j in m[: i + 1]]
++        j = abs_col.index(max(abs_col))
++        if i != j:
++            m[i], m[j] = m[j], m[i]
++            res[i], res[j] = res[j], res[i]
++
++        # Scale the i-th row (and drop last column)
++        m_i = m[i]
++        if abs(m_i[i]) < 1e-10:
++            if not allow_underdetermined:
++                return None
++            recipr = 0.0
++        else:
++            recipr = 1.0 / m_i[i]
++        m[i] = m_i = [m_i_j * recipr for m_i_j in m_i[:i]]
++        res[i] = res_i = [res_i_k * recipr for res_i_k in res[i]]
++
++        # Zero-out the last column in rows prior to i, and remove last column
++        for j in range(i):
++            m_j = m[j]
++            c = m_j[i]
++            m[j] = [m_j_k - c * m_i_k for m_j_k, m_i_k in zip(m_j, m_i)]
++            res[j] = [
++                res_j_k - c * res_i_k for res_j_k, res_i_k in zip(res[j], res_i)
++            ]
++
++    # Solve the system with the lower-triangular matrix
++    rest = mat_transp(res)
++    if not rest:
++        return res
++    for rest_k in rest:
++        for i in range(1, rows_m):
++            rest_k[i] -= sum(map(operator.mul, m[i], rest_k[:i]))
++    return mat_transp(rest)
+diff --git a/src/Kconfig b/src/Kconfig
+index faf66483..efed0387 100644
+--- a/src/Kconfig
++++ b/src/Kconfig
+@@ -212,13 +212,13 @@ config NEED_SENSOR_BULK
+         || WANT_HX71X || WANT_CS1237 || WANT_ADS1220 || WANT_ADS131M0X \
+         || WANT_LDC1612 || WANT_SENSOR_ANGLE
+     default y
+-config NEED_LOAD_CELL_PROBE
++config WANT_TRIGGER_ANALOG
+     bool
+     depends on WANT_HX71X || WANT_CS1237 || WANT_ADS1220 || WANT_ADS131M0X
+     default y
+ config NEED_SOS_FILTER
+     bool
+-    depends on NEED_LOAD_CELL_PROBE
++    depends on WANT_TRIGGER_ANALOG
+     default y
+ config WANT_OPTIMIZE_SIZE
+     bool
+diff --git a/src/Makefile b/src/Makefile
+index e917fedd..e8b0d42f 100644
+--- a/src/Makefile
++++ b/src/Makefile
+@@ -30,4 +30,4 @@ src-$(CONFIG_WANT_ADS131M0X) += sensor_ads131m0x.c
+ src-$(CONFIG_WANT_SENSOR_ANGLE) += sensor_angle.c
+ src-$(CONFIG_NEED_SENSOR_BULK) += sensor_bulk.c
+ src-$(CONFIG_NEED_SOS_FILTER) += sos_filter.c
+-src-$(CONFIG_NEED_LOAD_CELL_PROBE) += load_cell_probe.c
++src-$(CONFIG_WANT_TRIGGER_ANALOG) += trigger_analog.c
+diff --git a/src/load_cell_probe.c b/src/load_cell_probe.c
+deleted file mode 100644
+index 8f2a3dff..00000000
+--- a/src/load_cell_probe.c
++++ /dev/null
+@@ -1,298 +0,0 @@
+-// Load Cell based end stops.
+-//
+-// Copyright (C) 2025  Gareth Farrington <gareth@waves.ky>
+-//
+-// This file may be distributed under the terms of the GNU GPLv3 license.
+-
+-#include "basecmd.h" // oid_alloc
+-#include "command.h" // DECL_COMMAND
+-#include "sched.h" // shutdown
+-#include "trsync.h" // trsync_do_trigger
+-#include "board/misc.h" // timer_read_time
+-#include "sos_filter.h" // fixedQ12_t
+-#include "load_cell_probe.h" //load_cell_probe_report_sample
+-#include <stdint.h> // int32_t
+-#include <stdlib.h> // abs
+-
+-// Q2.29
+-typedef int32_t fixedQ2_t;
+-#define FIXEDQ2 2
+-#define FIXEDQ2_FRAC_BITS ((32 - FIXEDQ2) - 1)
+-
+-// Q32.29 - a Q2.29 value stored in int64
+-typedef int64_t fixedQ32_t;
+-#define FIXEDQ32_FRAC_BITS FIXEDQ2_FRAC_BITS
+-
+-// Q16.15
+-typedef int32_t fixedQ16_t;
+-#define FIXEDQ16 16
+-#define FIXEDQ16_FRAC_BITS ((32 - FIXEDQ16) - 1)
+-
+-// Q48.15 - a Q16.15 value stored in int64
+-typedef int64_t fixedQ48_t;
+-#define FIXEDQ48_FRAC_BITS FIXEDQ16_FRAC_BITS
+-
+-#define MAX_TRIGGER_GRAMS ((1UL << FIXEDQ16) - 1)
+-#define ERROR_SAFETY_RANGE 0
+-#define ERROR_OVERFLOW 1
+-#define ERROR_WATCHDOG 2
+-
+-// Flags
+-enum {FLAG_IS_HOMING = 1 << 0
+-    , FLAG_IS_HOMING_TRIGGER = 1 << 1
+-    , FLAG_AWAIT_HOMING = 1 << 2
+-    };
+-
+-// Endstop Structure
+-struct load_cell_probe {
+-    struct timer time;
+-    uint32_t trigger_grams, trigger_ticks, last_sample_ticks, rest_ticks;
+-    uint32_t homing_start_time;
+-    struct trsync *ts;
+-    int32_t safety_counts_min, safety_counts_max, tare_counts;
+-    uint8_t flags, trigger_reason, error_reason, watchdog_max
+-            , watchdog_count;
+-    fixedQ16_t trigger_grams_fixed;
+-    fixedQ2_t grams_per_count;
+-    struct sos_filter *sf;
+-};
+-
+-static inline uint8_t
+-overflows_int32(int64_t value) {
+-    return value > (int64_t)INT32_MAX || value < (int64_t)INT32_MIN;
+-}
+-
+-// returns the integer part of a fixedQ48_t
+-static inline int64_t
+-round_fixedQ48(const int64_t fixed_value) {
+-    return fixed_value >> FIXEDQ48_FRAC_BITS;
+-}
+-
+-// Convert sensor counts to grams
+-static inline fixedQ48_t
+-counts_to_grams(struct load_cell_probe *lcp, const int32_t counts) {
+-    // tearing ensures readings are referenced to 0.0g
+-    const int32_t delta = counts - lcp->tare_counts;
+-    // convert sensor counts to grams by multiplication: 124 * 0.051 = 6.324
+-    // this optimizes to single cycle SMULL instruction
+-    const fixedQ32_t product = (int64_t)delta * (int64_t)lcp->grams_per_count;
+-    // after multiplication there are 30 fraction bits, reduce to 15
+-    // caller verifies this wont overflow a 32bit int when truncated
+-    const fixedQ48_t grams = product >>
+-                                (FIXEDQ32_FRAC_BITS - FIXEDQ48_FRAC_BITS);
+-    return grams;
+-}
+-
+-static inline uint8_t
+-is_flag_set(const uint8_t mask, struct load_cell_probe *lcp)
+-{
+-    return !!(mask & lcp->flags);
+-}
+-
+-static inline void
+-set_flag(uint8_t mask, struct load_cell_probe *lcp)
+-{
+-    lcp->flags |= mask;
+-}
+-
+-static inline void
+-clear_flag(uint8_t mask, struct load_cell_probe *lcp)
+-{
+-    lcp->flags &= ~mask;
+-}
+-
+-void
+-try_trigger(struct load_cell_probe *lcp, uint32_t ticks)
+-{
+-    uint8_t is_homing_triggered = is_flag_set(FLAG_IS_HOMING_TRIGGER, lcp);
+-    if (!is_homing_triggered) {
+-        // the first triggering sample when homing sets the trigger time
+-        lcp->trigger_ticks = ticks;
+-        // this flag latches until a reset, disabling further triggering
+-        set_flag(FLAG_IS_HOMING_TRIGGER, lcp);
+-        trsync_do_trigger(lcp->ts, lcp->trigger_reason);
+-    }
+-}
+-
+-void
+-trigger_error(struct load_cell_probe *lcp, uint8_t error_code)
+-{
+-    trsync_do_trigger(lcp->ts, lcp->error_reason + error_code);
+-}
+-
+-// Used by Sensors to report new raw ADC sample
+-void
+-load_cell_probe_report_sample(struct load_cell_probe *lcp
+-                                , const int32_t sample)
+-{
+-    // only process samples when homing
+-    uint8_t is_homing = is_flag_set(FLAG_IS_HOMING, lcp);
+-    if (!is_homing) {
+-        return;
+-    }
+-
+-    // save new sample
+-    uint32_t ticks = timer_read_time();
+-    lcp->last_sample_ticks = ticks;
+-    lcp->watchdog_count = 0;
+-
+-    // do not trigger before homing start time
+-    uint8_t await_homing = is_flag_set(FLAG_AWAIT_HOMING, lcp);
+-    if (await_homing && timer_is_before(ticks, lcp->homing_start_time)) {
+-        return;
+-    }
+-    clear_flag(FLAG_AWAIT_HOMING, lcp);
+-
+-    // check for safety limit violations
+-    const uint8_t is_safety_trigger = sample <= lcp->safety_counts_min
+-                                        || sample >= lcp->safety_counts_max;
+-    // too much force, this is an error while homing
+-    if (is_safety_trigger) {
+-        trigger_error(lcp, ERROR_SAFETY_RANGE);
+-        return;
+-    }
+-
+-    // convert sample to grams
+-    const fixedQ48_t raw_grams = counts_to_grams(lcp, sample);
+-    if (overflows_int32(raw_grams)) {
+-        trigger_error(lcp, ERROR_OVERFLOW);
+-        return;
+-    }
+-
+-    // perform filtering
+-    const fixedQ16_t filtered_grams = sosfilt(lcp->sf, (fixedQ16_t)raw_grams);
+-
+-    // update trigger state
+-    if (abs(filtered_grams) >= lcp->trigger_grams_fixed) {
+-        try_trigger(lcp, lcp->last_sample_ticks);
+-    }
+-}
+-
+-// Timer callback that monitors for timeouts
+-static uint_fast8_t
+-watchdog_event(struct timer *t)
+-{
+-    struct load_cell_probe *lcp = container_of(t, struct load_cell_probe
+-                                        , time);
+-    uint8_t is_homing = is_flag_set(FLAG_IS_HOMING, lcp);
+-    uint8_t is_homing_trigger = is_flag_set(FLAG_IS_HOMING_TRIGGER, lcp);
+-    // the watchdog stops when not homing or when trsync becomes triggered
+-    if (!is_homing || is_homing_trigger) {
+-        return SF_DONE;
+-    }
+-
+-    if (lcp->watchdog_count > lcp->watchdog_max) {
+-        trigger_error(lcp, ERROR_WATCHDOG);
+-    }
+-    lcp->watchdog_count += 1;
+-
+-    // A sample was recently delivered, continue monitoring
+-    lcp->time.waketime += lcp->rest_ticks;
+-    return SF_RESCHEDULE;
+-}
+-
+-static void
+-set_endstop_range(struct load_cell_probe *lcp
+-                , int32_t safety_counts_min, int32_t safety_counts_max
+-                , int32_t tare_counts, uint32_t trigger_grams
+-                , fixedQ2_t grams_per_count)
+-{
+-    if (!(safety_counts_max >= safety_counts_min)) {
+-        shutdown("Safety range reversed");
+-    }
+-    if (trigger_grams > MAX_TRIGGER_GRAMS) {
+-        shutdown("trigger_grams too large");
+-    }
+-    // grams_per_count must be a positive fraction in Q2 format
+-    const fixedQ2_t one = 1UL << FIXEDQ2_FRAC_BITS;
+-    if (grams_per_count < 0 || grams_per_count >= one) {
+-        shutdown("grams_per_count is invalid");
+-    }
+-    lcp->safety_counts_min = safety_counts_min;
+-    lcp->safety_counts_max = safety_counts_max;
+-    lcp->tare_counts = tare_counts;
+-    lcp->trigger_grams = trigger_grams;
+-    lcp->trigger_grams_fixed = trigger_grams << FIXEDQ16_FRAC_BITS;
+-    lcp->grams_per_count = grams_per_count;
+-}
+-
+-// Create a load_cell_probe
+-void
+-command_config_load_cell_probe(uint32_t *args)
+-{
+-    struct load_cell_probe *lcp = oid_alloc(args[0]
+-                            , command_config_load_cell_probe, sizeof(*lcp));
+-    lcp->flags = 0;
+-    lcp->trigger_ticks = 0;
+-    lcp->watchdog_max = 0;
+-    lcp->watchdog_count = 0;
+-    lcp->sf = sos_filter_oid_lookup(args[1]);
+-    set_endstop_range(lcp, 0, 0, 0, 0, 0);
+-}
+-DECL_COMMAND(command_config_load_cell_probe, "config_load_cell_probe"
+-                                               " oid=%c sos_filter_oid=%c");
+-
+-// Lookup a load_cell_probe
+-struct load_cell_probe *
+-load_cell_probe_oid_lookup(uint8_t oid)
+-{
+-    return oid_lookup(oid, command_config_load_cell_probe);
+-}
+-
+-// Set the triggering range and tare value
+-void
+-command_load_cell_probe_set_range(uint32_t *args)
+-{
+-    struct load_cell_probe *lcp = load_cell_probe_oid_lookup(args[0]);
+-    set_endstop_range(lcp, args[1], args[2], args[3], args[4]
+-                , (fixedQ16_t)args[5]);
+-}
+-DECL_COMMAND(command_load_cell_probe_set_range, "load_cell_probe_set_range"
+-    " oid=%c safety_counts_min=%i safety_counts_max=%i tare_counts=%i"
+-    " trigger_grams=%u grams_per_count=%i");
+-
+-// Home an axis
+-void
+-command_load_cell_probe_home(uint32_t *args)
+-{
+-    struct load_cell_probe *lcp = load_cell_probe_oid_lookup(args[0]);
+-    sched_del_timer(&lcp->time);
+-    // clear the homing trigger flag
+-    clear_flag(FLAG_IS_HOMING_TRIGGER, lcp);
+-    clear_flag(FLAG_IS_HOMING, lcp);
+-    lcp->trigger_ticks = 0;
+-    lcp->ts = NULL;
+-    // 0 samples indicates homing is finished
+-    if (args[3] == 0) {
+-        // Disable end stop checking
+-        return;
+-    }
+-    lcp->ts = trsync_oid_lookup(args[1]);
+-    lcp->trigger_reason = args[2];
+-    lcp->error_reason = args[3];
+-    lcp->time.waketime = args[4];
+-    lcp->homing_start_time = args[4];
+-    lcp->rest_ticks = args[5];
+-    lcp->watchdog_max = args[6];
+-    lcp->watchdog_count = 0;
+-    lcp->time.func = watchdog_event;
+-    set_flag(FLAG_IS_HOMING, lcp);
+-    set_flag(FLAG_AWAIT_HOMING, lcp);
+-    sched_add_timer(&lcp->time);
+-}
+-DECL_COMMAND(command_load_cell_probe_home,
+-             "load_cell_probe_home oid=%c trsync_oid=%c trigger_reason=%c"
+-             " error_reason=%c clock=%u rest_ticks=%u timeout=%u");
+-
+-void
+-command_load_cell_probe_query_state(uint32_t *args)
+-{
+-    uint8_t oid = args[0];
+-    struct load_cell_probe *lcp = load_cell_probe_oid_lookup(args[0]);
+-    sendf("load_cell_probe_state oid=%c is_homing_trigger=%c trigger_ticks=%u"
+-            , oid
+-            , is_flag_set(FLAG_IS_HOMING_TRIGGER, lcp)
+-            , lcp->trigger_ticks);
+-}
+-DECL_COMMAND(command_load_cell_probe_query_state
+-                , "load_cell_probe_query_state oid=%c");
+diff --git a/src/load_cell_probe.h b/src/load_cell_probe.h
+deleted file mode 100644
+index e67c16e5..00000000
+--- a/src/load_cell_probe.h
++++ /dev/null
+@@ -1,10 +0,0 @@
+-#ifndef __LOAD_CELL_PROBE_H
+-#define __LOAD_CELL_PROBE_H
+-
+-#include <stdint.h> // uint8_t
+-
+-struct load_cell_probe *load_cell_probe_oid_lookup(uint8_t oid);
+-void load_cell_probe_report_sample(struct load_cell_probe *lce
+-                        , int32_t sample);
+-
+-#endif // load_cell_probe.h
+diff --git a/src/sensor_ads1220.c b/src/sensor_ads1220.c
+index 0727cf3f..4e0d157a 100644
+--- a/src/sensor_ads1220.c
++++ b/src/sensor_ads1220.c
+@@ -11,7 +11,7 @@
+ #include "command.h" // DECL_COMMAND
+ #include "sched.h" // sched_add_timer
+ #include "sensor_bulk.h" // sensor_bulk_report
+-#include "load_cell_probe.h" // load_cell_probe_report_sample
++#include "trigger_analog.h" // trigger_analog_update
+ #include "spicmds.h" // spidev_transfer
+ #include <stdint.h>
+ 
+@@ -22,7 +22,7 @@ struct ads1220_adc {
+     struct spidev_s *spi;
+     uint8_t pending_flag;
+     struct sensor_bulk sb;
+-    struct load_cell_probe *lce;
++    struct trigger_analog *ta;
+ };
+ 
+ #define BYTES_PER_SAMPLE 4
+@@ -92,9 +92,7 @@ ads1220_read_adc(struct ads1220_adc *ads1220, uint8_t oid)
+         counts |= 0xFF000000;
+ 
+     // endstop is optional, report if enabled and no errors
+-    if (ads1220->lce) {
+-        load_cell_probe_report_sample(ads1220->lce, counts);
+-    }
++    trigger_analog_update(ads1220->ta, counts);
+ 
+     add_sample(ads1220, oid, counts);
+ }
+@@ -114,13 +112,15 @@ DECL_COMMAND(command_config_ads1220, "config_ads1220 oid=%c"
+     " spi_oid=%c data_ready_pin=%u");
+ 
+ void
+-ads1220_attach_load_cell_probe(uint32_t *args) {
++ads1220_attach_trigger_analog(uint32_t *args) {
+     uint8_t oid = args[0];
+     struct ads1220_adc *ads1220 = oid_lookup(oid, command_config_ads1220);
+-    ads1220->lce = load_cell_probe_oid_lookup(args[1]);
++    ads1220->ta = trigger_analog_oid_lookup(args[1]);
+ }
+-DECL_COMMAND(ads1220_attach_load_cell_probe,
+-    "ads1220_attach_load_cell_probe oid=%c load_cell_probe_oid=%c");
++#if CONFIG_WANT_TRIGGER_ANALOG
++DECL_COMMAND(ads1220_attach_trigger_analog,
++    "ads1220_attach_trigger_analog oid=%c trigger_analog_oid=%c");
++#endif
+ 
+ // start/stop capturing ADC data
+ void
+diff --git a/src/sensor_ads131m0x.c b/src/sensor_ads131m0x.c
+index d721a656..c03737a4 100644
+--- a/src/sensor_ads131m0x.c
++++ b/src/sensor_ads131m0x.c
+@@ -11,7 +11,7 @@
+ #include "command.h" // DECL_COMMAND
+ #include "sched.h" // sched_add_timer
+ #include "sensor_bulk.h" // sensor_bulk_report
+-#include "load_cell_probe.h" // load_cell_probe_report_sample
++#include "trigger_analog.h" // trigger_analog_update
+ #include "spicmds.h" // spidev_transfer
+ #include <stdint.h>
+ 
+@@ -28,12 +28,19 @@ struct ads131m0x_adc {
+     uint8_t sample_bytes;
+     uint8_t frame_size;
+     struct sensor_bulk sb;
+-    struct load_cell_probe *lce;
++    struct trigger_analog *ta;
+ };
+ 
+ // Error codes sent as sample values (use high bits to distinguish from valid data)
+ #define SAMPLE_ERROR_CRC     (1L << 31)
+ #define SAMPLE_ERROR_RESET   (1L << 30)
++
++// Sensor specific errors reported to trigger_analog while homing
++enum {
++    SE_ERROR_CRC = 1, SE_ERROR_RESET = 2
++};
++DECL_ENUMERATION("ads131m0x_error:", "SENSOR_ERROR_CRC", SE_ERROR_CRC);
++DECL_ENUMERATION("ads131m0x_error:", "SENSOR_ERROR_RESET", SE_ERROR_RESET);
+ #define BYTES_PER_SAMPLE     4
+ #define SENSOR_WORD_SIZE     3
+ #define MAX_ADC_CHANNELS     4
+@@ -118,8 +125,7 @@ publish_samples(struct ads131m0x_adc *adc, uint8_t oid, uint8_t *msg)
+         sum += counts;
+         buffer_append_int32(&adc->sb, counts);
+     }
+-    if (adc->lce)
+-        load_cell_probe_report_sample(adc->lce, sum);
++    trigger_analog_update(adc->ta, sum);
+     ads131m0x_flush(adc, oid);
+ }
+ 
+@@ -166,9 +172,11 @@ ads131m0x_read_adc(struct ads131m0x_adc *adc, uint8_t oid)
+     if (msg[0] & STATUS_RESET_BIT)
+         adc->hard_error_latch = SAMPLE_ERROR_RESET;
+     if (adc->hard_error_latch) {
++        trigger_analog_note_error(adc->ta, SE_ERROR_RESET);
+         publish_error(adc, oid, adc->hard_error_latch);
+     }
+     else if (has_crc_error(adc, msg)) {
++        trigger_analog_note_error(adc->ta, SE_ERROR_CRC);
+         publish_error(adc, oid, SAMPLE_ERROR_CRC);
+     }
+     else {
+@@ -207,13 +215,15 @@ DECL_COMMAND(command_config_ads131m0x,
+     " sensor_channel_count=%c channel_mask=%c");
+ 
+ void
+-ads131m0x_attach_load_cell_probe(uint32_t *args) {
++ads131m0x_attach_trigger_analog(uint32_t *args) {
+     uint8_t oid = args[0];
+     struct ads131m0x_adc *adc = oid_lookup(oid, command_config_ads131m0x);
+-    adc->lce = load_cell_probe_oid_lookup(args[1]);
++    adc->ta = trigger_analog_oid_lookup(args[1]);
+ }
+-DECL_COMMAND(ads131m0x_attach_load_cell_probe,
+-    "ads131m0x_attach_load_cell_probe oid=%c load_cell_probe_oid=%c");
++#if CONFIG_WANT_TRIGGER_ANALOG
++DECL_COMMAND(ads131m0x_attach_trigger_analog,
++    "ads131m0x_attach_trigger_analog oid=%c trigger_analog_oid=%c");
++#endif
+ 
+ void
+ command_query_ads131m0x(uint32_t *args)
+diff --git a/src/sensor_cs1237.c b/src/sensor_cs1237.c
+index 8efe966b..3c27b875 100644
+--- a/src/sensor_cs1237.c
++++ b/src/sensor_cs1237.c
+@@ -8,7 +8,7 @@
+ // https://codeberg.org/kuwoyuki/klipper-q2
+ // Interrupt-driven acquisition based on Anycubic's MCU implementation:
+ // https://github.com/ANYCUBIC-3D/K3-klipper-mcu/blob/main/src/sensor_cs1237.c
+-// Adapted to Kalico's load_cell_probe interface.
++// Adapted to Kalico and the mainline trigger_analog interface.
+ 
+ #include <stdint.h>
+ #include "autoconf.h" // CONFIG_MACH_AVR
+@@ -19,7 +19,7 @@
+ #include "command.h" // DECL_COMMAND
+ #include "sched.h" // sched_add_timer
+ #include "sensor_bulk.h" // sensor_bulk_report
+-#include "load_cell_probe.h" // load_cell_probe_report_sample
++#include "trigger_analog.h" // trigger_analog_update
+ #if CONFIG_MACH_GD32F303_Q2
+ #include "generic/armcm_boot.h" // armcm_enable_irq
+ #include "stm32/internal.h" // GPIO and STM32 register definitions
+@@ -38,7 +38,7 @@ struct cs1237_adc {
+     struct gpio_out dout_out;
+     struct gpio_out sclk;
+     struct sensor_bulk sb;
+-    struct load_cell_probe *lce;
++    struct trigger_analog *ta;
+ #if CONFIG_MACH_GD32F303_Q2
+     uint8_t use_drdy_irq;
+ #endif
+@@ -55,6 +55,25 @@ enum {
+ #define SAMPLE_ERROR_READ_TOO_LONG (1L << 30)
+ #define SAMPLE_ERROR_CONFIG (1L << 29)
+ 
++// Sensor specific errors reported to trigger_analog while homing
++enum {
++    CSE_TIMEOUT = 1, CSE_READ_TOO_LONG, CSE_CONFIG
++};
++DECL_ENUMERATION("cs1237_error:", "SAMPLE_TIMEOUT", CSE_TIMEOUT);
++DECL_ENUMERATION("cs1237_error:", "READ_TOOK_TOO_LONG", CSE_READ_TOO_LONG);
++DECL_ENUMERATION("cs1237_error:", "CONFIG_NOT_ACCEPTED", CSE_CONFIG);
++
++// Map a bulk stream error sentinel to a trigger_analog sensor error code
++static uint8_t
++cs1237_error_code(uint32_t last_error)
++{
++    if (last_error == SAMPLE_ERROR_READ_TOO_LONG)
++        return CSE_READ_TOO_LONG;
++    if (last_error == SAMPLE_ERROR_CONFIG)
++        return CSE_CONFIG;
++    return CSE_TIMEOUT;
++}
++
+ // CS1237 command words (7-bit)
+ #define CMD_WRITE_CONFIG 0x65
+ #define CMD_READ_CONFIG 0x56
+@@ -443,11 +462,12 @@ cs1237_read_adc(struct cs1237_adc *cs1237, uint8_t oid)
+         // Report the error sentinel through the bulk stream and stop polling.
+         // The host detects the sentinel and restarts capture to recover.
+         sched_del_timer(&cs1237->timer);
++        trigger_analog_note_error(cs1237->ta,
++                                  cs1237_error_code(cs1237->last_error));
+         add_sample(cs1237, oid, counts, 1);
+     } else {
+         // probe is optional, report if enabled
+-        if (cs1237->lce)
+-            load_cell_probe_report_sample(cs1237->lce, counts);
++        trigger_analog_update(cs1237->ta, counts);
+         add_sample(cs1237, oid, counts, 0);
+     }
+ }
+@@ -464,7 +484,7 @@ command_config_cs1237(uint32_t *args)
+     cs1237->dout_in = gpio_in_setup(args[2], 1);
+     cs1237->sclk = gpio_out_setup(args[3], 1); // high -> power down
+     cs1237->last_sample = 0;
+-    cs1237->lce = NULL;
++    cs1237->ta = NULL;
+ #if CONFIG_MACH_GD32F303_Q2
+     cs1237_drdy_irq_setup(cs1237, args[2]);
+ #endif
+@@ -473,13 +493,15 @@ DECL_COMMAND(command_config_cs1237, "config_cs1237 oid=%c config=%c"
+              " dout_pin=%u sclk_pin=%u");
+ 
+ void
+-cs1237_attach_load_cell_probe(uint32_t *args)
++cs1237_attach_trigger_analog(uint32_t *args)
+ {
+     struct cs1237_adc *cs1237 = oid_lookup(args[0], command_config_cs1237);
+-    cs1237->lce = load_cell_probe_oid_lookup(args[1]);
++    cs1237->ta = trigger_analog_oid_lookup(args[1]);
+ }
+-DECL_COMMAND(cs1237_attach_load_cell_probe, "cs1237_attach_load_cell_probe"
+-             " oid=%c load_cell_probe_oid=%c");
++#if CONFIG_WANT_TRIGGER_ANALOG
++DECL_COMMAND(cs1237_attach_trigger_analog, "cs1237_attach_trigger_analog"
++             " oid=%c trigger_analog_oid=%c");
++#endif
+ 
+ // Start/stop capturing ADC data
+ void
+@@ -557,6 +579,7 @@ cs1237_capture_task(void)
+             if (ret) {
+                 cs1237->last_error = SAMPLE_ERROR_CONFIG;
+                 sched_del_timer(&cs1237->timer);
++                trigger_analog_note_error(cs1237->ta, CSE_CONFIG);
+                 add_sample(cs1237, oid, cs1237->last_error, 1);
+             }
+ #if CONFIG_MACH_GD32F303_Q2
+diff --git a/src/sensor_hx71x.c b/src/sensor_hx71x.c
+index 74575eec..62feee7f 100644
+--- a/src/sensor_hx71x.c
++++ b/src/sensor_hx71x.c
+@@ -12,7 +12,7 @@
+ #include "command.h" // DECL_COMMAND
+ #include "sched.h" // sched_add_timer
+ #include "sensor_bulk.h" // sensor_bulk_report
+-#include "load_cell_probe.h" // load_cell_probe_report_sample
++#include "trigger_analog.h" // trigger_analog_update
+ #include <stdbool.h>
+ #include <stdint.h>
+ 
+@@ -25,7 +25,7 @@ struct hx71x_adc {
+     struct gpio_in dout; // pin used to receive data from the hx71x
+     struct gpio_out sclk; // pin used to generate clock for the hx71x
+     struct sensor_bulk sb;
+-    struct load_cell_probe *lce;
++    struct trigger_analog *ta;
+ };
+ 
+ enum {
+@@ -178,8 +178,8 @@ hx71x_read_adc(struct hx71x_adc *hx71x, uint8_t oid)
+     }
+ 
+     // probe is optional, report if enabled
+-    if (hx71x->last_error == 0 && hx71x->lce) {
+-        load_cell_probe_report_sample(hx71x->lce, counts);
++    if (hx71x->last_error == 0) {
++        trigger_analog_update(hx71x->ta, counts);
+     }
+ 
+     // Add measurement to buffer
+@@ -206,13 +206,15 @@ DECL_COMMAND(command_config_hx71x, "config_hx71x oid=%c gain_channel=%c"
+              " dout_pin=%u sclk_pin=%u");
+ 
+ void
+-hx71x_attach_load_cell_probe(uint32_t *args) {
++hx71x_attach_trigger_analog(uint32_t *args) {
+     uint8_t oid = args[0];
+     struct hx71x_adc *hx71x = oid_lookup(oid, command_config_hx71x);
+-    hx71x->lce = load_cell_probe_oid_lookup(args[1]);
++    hx71x->ta = trigger_analog_oid_lookup(args[1]);
+ }
+-DECL_COMMAND(hx71x_attach_load_cell_probe, "hx71x_attach_load_cell_probe oid=%c"
+-    " load_cell_probe_oid=%c");
++#if CONFIG_WANT_TRIGGER_ANALOG
++DECL_COMMAND(hx71x_attach_trigger_analog, "hx71x_attach_trigger_analog oid=%c"
++    " trigger_analog_oid=%c");
++#endif
+ 
+ // start/stop capturing ADC data
+ void
+diff --git a/src/sos_filter.c b/src/sos_filter.c
+index 3ec5d617..6dbb896b 100644
+--- a/src/sos_filter.c
++++ b/src/sos_filter.c
+@@ -9,78 +9,93 @@
+ #include "sched.h" // shutdown
+ #include "sos_filter.h" // sos_filter
+ 
+-typedef int32_t fixedQ_coeff_t;
+-typedef int32_t fixedQ_value_t;
+-
+ // filter strucutre sizes
+ #define SECTION_WIDTH 5
+ #define STATE_WIDTH 2
+ 
+ struct sos_filter_section {
+     // filter composed of second order sections
+-    fixedQ_coeff_t coeff[SECTION_WIDTH]; // aka sos
+-    fixedQ_value_t state[STATE_WIDTH];   // aka zi
++    int32_t coeff[SECTION_WIDTH]; // aka sos
++    int32_t state[STATE_WIDTH];   // aka zi
+ };
+ 
+ struct sos_filter {
+-    uint8_t max_sections, n_sections, coeff_frac_bits, is_active;
+-    uint32_t coeff_rounding;
++    uint8_t max_sections, n_sections, coeff_frac_bits, scale_frac_bits;
++    uint8_t auto_offset;
++    int32_t offset, scale;
+     // filter composed of second order sections
+     struct sos_filter_section filter[0];
+ };
+ 
+-inline uint8_t
+-overflows_int32(int64_t value) {
++static inline int
++overflows_int32(int64_t value)
++{
+     return value > (int64_t)INT32_MAX || value < (int64_t)INT32_MIN;
+ }
+ 
+-// Multiply a coefficient in fixedQ_coeff_t by a value fixedQ_value_t
+-static inline fixedQ_value_t
+-fixed_mul(struct sos_filter *sf, const fixedQ_coeff_t coeff
+-        , const fixedQ_value_t value) {
++// Multiply a coeff*value and shift result by coeff_frac_bits
++static int
++fixed_mul(int32_t coeff, int32_t value, uint_fast8_t frac_bits, int32_t *res)
++{
+     // This optimizes to single cycle SMULL on Arm Coretex M0+
+-    int64_t product = (int64_t)coeff * (int64_t)value;
+-    // round up at the last bit to be shifted away
+-    product += sf->coeff_rounding;
+-    // shift the decimal right to discard the coefficient fractional bits
+-    int64_t result = product >> sf->coeff_frac_bits;
+-    // check for overflow of int32_t
+-    if (overflows_int32(result)) {
+-        shutdown("fixed_mul: overflow");
++    int64_t result = (int64_t)coeff * (int64_t)value;
++    if (frac_bits) {
++        // round up at the last bit to be shifted away
++        result += 1LL << (frac_bits - 1);
++        // shift the decimal right to discard the coefficient fractional bits
++        result >>= frac_bits;
+     }
+     // truncate significant 32 bits
+-    return (fixedQ_value_t)result;
++    *res = (int32_t)result;
++    // check for overflow of int32_t
++    if (overflows_int32(result))
++        return -1;
++    return 0;
+ }
+ 
+ // Apply the sosfilt algorithm to a new datapoint
+-// returns the fixedQ_value_t filtered value
+-int32_t
+-sosfilt(struct sos_filter *sf, const int32_t unfiltered_value) {
+-    if (!sf->is_active) {
+-        shutdown("sos_filter not property initialized");
+-    }
++int
++sos_filter_apply(struct sos_filter *sf, int32_t *pvalue)
++{
++    int32_t raw_val = *pvalue;
+ 
+-    // an empty filter performs no filtering
+-    if (sf->n_sections == 0) {
+-        return unfiltered_value;
++    // Automatically apply offset (if requested)
++    if (sf->auto_offset) {
++        sf->offset = -raw_val;
++        sf->auto_offset = 0;
+     }
+ 
+-    fixedQ_value_t cur_val = unfiltered_value;
++    // Apply offset and scale
++    int32_t offset = sf->offset, offset_val = raw_val + offset, cur_val;
++    if ((offset >= 0) != (offset_val >= raw_val))
++        // Overflow
++        return -1;
++    int ret = fixed_mul(sf->scale, offset_val, sf->scale_frac_bits, &cur_val);
++    if (ret)
++        return -1;
++
+     // foreach section
++    uint_fast8_t cfb = sf->coeff_frac_bits;
+     for (int section_idx = 0; section_idx < sf->n_sections; section_idx++) {
+         struct sos_filter_section *section = &(sf->filter[section_idx]);
+         // apply the section's filter coefficients to input
+-        fixedQ_value_t next_val = fixed_mul(sf, section->coeff[0], cur_val);
++        int32_t next_val, c1_cur, c2_cur, c3_next, c4_next;
++        int ret = fixed_mul(section->coeff[0], cur_val, cfb, &next_val);
+         next_val += section->state[0];
+-        section->state[0] = fixed_mul(sf, section->coeff[1], cur_val)
+-                            - fixed_mul(sf, section->coeff[3], next_val)
+-                            + (section->state[1]);
+-        section->state[1] = fixed_mul(sf, section->coeff[2], cur_val)
+-                            - fixed_mul(sf, section->coeff[4], next_val);
++        ret |= fixed_mul(section->coeff[1], cur_val, cfb, &c1_cur);
++        ret |= fixed_mul(section->coeff[3], next_val, cfb, &c3_next);
++        ret |= fixed_mul(section->coeff[2], cur_val, cfb, &c2_cur);
++        ret |= fixed_mul(section->coeff[4], next_val, cfb, &c4_next);
++        if (ret)
++            // Overflow
++            return -1;
++        section->state[0] = c1_cur - c3_next + section->state[1];
++        section->state[1] = c2_cur - c4_next;
+         cur_val = next_val;
+     }
+ 
+-    return (int32_t)cur_val;
++    *pvalue = cur_val;
++    return 0;
+ }
+ 
+ // Create an sos_filter
+@@ -92,7 +107,6 @@ command_config_sos_filter(uint32_t *args)
+     struct sos_filter *sf = oid_alloc(args[0]
+                             , command_config_sos_filter, size);
+     sf->max_sections = max_sections;
+-    sf->is_active = 0;
+ }
+ DECL_COMMAND(command_config_sos_filter, "config_sos_filter oid=%c"
+     " max_sections=%c");
+@@ -108,7 +122,7 @@ sos_filter_oid_lookup(uint8_t oid)
+ static void
+ validate_section_index(struct sos_filter *sf, uint8_t section_idx)
+ {
+-    if (section_idx > sf->max_sections)
++    if (section_idx >= sf->max_sections)
+         shutdown("Filter section index larger than max_sections");
+ }
+ 
+@@ -118,11 +132,11 @@ command_sos_filter_set_section(uint32_t *args)
+ {
+     struct sos_filter *sf = sos_filter_oid_lookup(args[0]);
+     // setting a section marks the filter as inactive
+-    sf->is_active = 0;
++    sf->n_sections = 0;
+     uint8_t section_idx = args[1];
+     validate_section_index(sf, section_idx);
+     // copy section data
+-    const uint8_t arg_base = 2;
++    uint8_t arg_base = 2;
+     for (uint8_t i = 0; i < SECTION_WIDTH; i++) {
+         sf->filter[section_idx].coeff[i] = args[i + arg_base];
+     }
+@@ -137,30 +151,41 @@ command_sos_filter_set_state(uint32_t *args)
+ {
+     struct sos_filter *sf = sos_filter_oid_lookup(args[0]);
+     // setting a section's state marks the filter as inactive
+-    sf->is_active = 0;
++    sf->n_sections = 0;
+     // copy state data
+     uint8_t section_idx = args[1];
+     validate_section_index(sf, section_idx);
+-    const uint8_t arg_base = 2;
++    uint8_t arg_base = 2;
+     sf->filter[section_idx].state[0] = args[0 + arg_base];
+     sf->filter[section_idx].state[1] = args[1 + arg_base];
+ }
+ DECL_COMMAND(command_sos_filter_set_state
+     , "sos_filter_set_state oid=%c section_idx=%c state0=%i state1=%i");
+ 
++// Set incoming sample offset/scaling
++void
++command_trigger_analog_set_offset_scale(uint32_t *args)
++{
++    struct sos_filter *sf = sos_filter_oid_lookup(args[0]);
++    sf->offset = args[1];
++    sf->scale = args[2];
++    sf->scale_frac_bits = args[3] & 0x3f;
++    sf->auto_offset = args[4];
++}
++DECL_COMMAND(command_trigger_analog_set_offset_scale,
++    "sos_filter_set_offset_scale oid=%c offset=%i scale=%i scale_frac_bits=%c"
++    " auto_offset=%c");
++
+ // Set one section of the filter
+ void
+ command_sos_filter_activate(uint32_t *args)
+ {
+     struct sos_filter *sf = sos_filter_oid_lookup(args[0]);
+     uint8_t n_sections = args[1];
+-    validate_section_index(sf, n_sections);
++    if (n_sections > sf->max_sections)
++        shutdown("Filter section index larger than max_sections");
+     sf->n_sections = n_sections;
+-    const uint8_t coeff_int_bits = args[2];
+-    sf->coeff_frac_bits = (31 - coeff_int_bits);
+-    sf->coeff_rounding  = (1 << (sf->coeff_frac_bits - 1));
+-    // mark filter as ready to use
+-    sf->is_active = 1;
++    sf->coeff_frac_bits = args[2] & 0x3f;
+ }
+ DECL_COMMAND(command_sos_filter_activate
+-    , "sos_filter_set_active oid=%c n_sections=%c coeff_int_bits=%c");
++    , "sos_filter_set_active oid=%c n_sections=%c coeff_frac_bits=%c");
+diff --git a/src/sos_filter.h b/src/sos_filter.h
+index 6c215dda..b697a268 100644
+--- a/src/sos_filter.h
++++ b/src/sos_filter.h
+@@ -4,9 +4,7 @@
+ #include <stdint.h>
+ 
+ struct sos_filter;
+-
+-int32_t sosfilt(struct sos_filter *sf
+-                        , const int32_t unfiltered_value);
++int sos_filter_apply(struct sos_filter *sf, int32_t *pvalue);
+ struct sos_filter *sos_filter_oid_lookup(uint8_t oid);
+ 
+ #endif // sos_filter.h
+diff --git a/src/trigger_analog.c b/src/trigger_analog.c
+new file mode 100644
+index 00000000..a2588905
+--- /dev/null
++++ b/src/trigger_analog.c
+@@ -0,0 +1,254 @@
++// Support homing/probing "trigger" notification from analog sensors
++//
++// Copyright (C) 2025  Gareth Farrington <gareth@waves.ky>
++// Copyright (C) 2024-2026  Kevin O'Connor <kevin@koconnor.net>
++//
++// This file may be distributed under the terms of the GNU GPLv3 license.
++
++#include "basecmd.h" // oid_alloc
++#include "board/io.h" // writeb
++#include "board/misc.h" // timer_read_time
++#include "command.h" // DECL_COMMAND
++#include "sched.h" // shutdown
++#include "sos_filter.h" // sos_filter_apply
++#include "trigger_analog.h" // trigger_analog_update
++#include "trsync.h" // trsync_do_trigger
++
++// Main trigger_analog storage
++struct trigger_analog {
++    // Raw value range check
++    int32_t raw_min, raw_max;
++    // Filtering
++    struct sos_filter *sf;
++    // Trigger value checking
++    int32_t trigger_value, trigger_peak;
++    uint8_t trigger_type;
++    // Trsync triggering
++    uint8_t flags, trigger_reason, error_reason;
++    struct trsync *ts;
++    uint32_t homing_clock;
++    // Sensor activity monitoring
++    uint8_t monitor_max, monitor_count;
++    struct timer time;
++    uint32_t monitor_ticks;
++};
++
++// Homing flags
++enum {
++    TA_AWAIT_HOMING = 1<<1, TA_CAN_TRIGGER = 1<<2
++};
++
++// Trigger types
++enum {
++    TT_ABS_GE, TT_GT, TT_DIFF_PEAK_GT
++};
++DECL_ENUMERATION("trigger_analog_type", "abs_ge", TT_ABS_GE);
++DECL_ENUMERATION("trigger_analog_type", "gt", TT_GT);
++DECL_ENUMERATION("trigger_analog_type", "diff_peak_gt", TT_DIFF_PEAK_GT);
++
++// Sample errors sent via trsync error code
++enum {
++    TE_RAW_RANGE, TE_OVERFLOW, TE_MONITOR, TE_SENSOR_SPECIFIC
++};
++DECL_ENUMERATION("trigger_analog_error:", "RAW_RANGE", TE_RAW_RANGE);
++DECL_ENUMERATION("trigger_analog_error:", "OVERFLOW", TE_OVERFLOW);
++DECL_ENUMERATION("trigger_analog_error:", "MONITOR", TE_MONITOR);
++DECL_ENUMERATION("trigger_analog_error:", "SENSOR_SPECIFIC"
++                 , TE_SENSOR_SPECIFIC);
++
++// Timer callback that monitors for sensor timeouts
++static uint_fast8_t
++monitor_event(struct timer *t)
++{
++    struct trigger_analog *ta = container_of(t, struct trigger_analog, time);
++
++    if (!(ta->flags & TA_CAN_TRIGGER))
++        return SF_DONE;
++
++    if (ta->monitor_count > ta->monitor_max) {
++        trsync_do_trigger(ta->ts, ta->error_reason + TE_MONITOR);
++        return SF_DONE;
++    }
++
++    // A sample was recently delivered, continue monitoring
++    ta->monitor_count++;
++    ta->time.waketime += ta->monitor_ticks;
++    return SF_RESCHEDULE;
++}
++
++// Note recent activity
++static void
++monitor_note_activity(struct trigger_analog *ta)
++{
++    writeb(&ta->monitor_count, 0);
++}
++
++// Check if a value should signal a "trigger" event
++static int
++check_trigger(struct trigger_analog *ta, uint32_t time, int32_t value)
++{
++    switch (ta->trigger_type) {
++    case TT_ABS_GE: ;
++        uint32_t abs_value = value < 0 ? -value : value;
++        return abs_value >= ta->trigger_value;
++    case TT_GT:
++        return value > ta->trigger_value;
++    case TT_DIFF_PEAK_GT:
++        if (value > ta->trigger_peak) {
++            ta->trigger_peak = value;
++            return 0;
++        }
++        uint32_t delta = ta->trigger_peak - value;
++        return delta > ta->trigger_value;
++    }
++    return 0;
++}
++
++// Reset fields associated with trigger checking
++static void
++trigger_reset(struct trigger_analog *ta)
++{
++    ta->trigger_peak = INT32_MIN;
++}
++
++// Stop homing due to an error
++static void
++cancel_homing(struct trigger_analog *ta, uint8_t error_code)
++{
++    if (!(ta->flags & TA_CAN_TRIGGER))
++        return;
++    ta->flags = 0;
++    trsync_do_trigger(ta->ts, ta->error_reason + error_code);
++}
++
++// Handle an error reported by the sensor
++void
++trigger_analog_note_error(struct trigger_analog *ta, uint8_t sensor_code)
++{
++    if (!ta)
++        return;
++    cancel_homing(ta, sensor_code + TE_SENSOR_SPECIFIC);
++}
++
++// Used by Sensors to report new raw ADC sample
++void
++trigger_analog_update(struct trigger_analog *ta, int32_t sample)
++{
++    // Check homing is active
++    if (!ta)
++        return;
++    uint8_t flags = ta->flags;
++    if (!(flags & TA_CAN_TRIGGER))
++        return;
++
++    // Check if homing has started
++    uint32_t time = timer_read_time();
++    if ((flags & TA_AWAIT_HOMING) && timer_is_before(time, ta->homing_clock))
++        return;
++    flags &= ~TA_AWAIT_HOMING;
++
++    // Reset the sensor timeout checking
++    monitor_note_activity(ta);
++
++    // Check that raw value is in range
++    if (sample < ta->raw_min || sample > ta->raw_max) {
++        cancel_homing(ta, TE_RAW_RANGE);
++        return;
++    }
++
++    // Perform filtering
++    int32_t filtered_value = sample;
++    int ret = sos_filter_apply(ta->sf, &filtered_value);
++    if (ret) {
++        cancel_homing(ta, TE_OVERFLOW);
++        return;
++    }
++
++    // Check if this is a "trigger"
++    ret = check_trigger(ta, time, filtered_value);
++    if (ret) {
++        trsync_do_trigger(ta->ts, ta->trigger_reason);
++        flags = 0;
++        ta->homing_clock = time;
++    }
++
++    ta->flags = flags;
++}
++
++// Create a trigger_analog
++void
++command_config_trigger_analog(uint32_t *args)
++{
++    struct trigger_analog *ta = oid_alloc(
++        args[0], command_config_trigger_analog, sizeof(*ta));
++    ta->sf = sos_filter_oid_lookup(args[1]);
++}
++DECL_COMMAND(command_config_trigger_analog
++             , "config_trigger_analog oid=%c sos_filter_oid=%c");
++
++// Lookup a trigger_analog
++struct trigger_analog *
++trigger_analog_oid_lookup(uint8_t oid)
++{
++    return oid_lookup(oid, command_config_trigger_analog);
++}
++
++// Set valid raw range
++void
++command_trigger_analog_set_raw_range(uint32_t *args)
++{
++    struct trigger_analog *ta = trigger_analog_oid_lookup(args[0]);
++    ta->raw_min = args[1];
++    ta->raw_max = args[2];
++}
++DECL_COMMAND(command_trigger_analog_set_raw_range,
++    "trigger_analog_set_raw_range oid=%c raw_min=%i raw_max=%i");
++
++// Set the triggering type and value
++void
++command_trigger_analog_set_trigger(uint32_t *args)
++{
++    struct trigger_analog *ta = trigger_analog_oid_lookup(args[0]);
++    ta->trigger_type = args[1];
++    ta->trigger_value = args[2];
++}
++DECL_COMMAND(command_trigger_analog_set_trigger, "trigger_analog_set_trigger"
++    " oid=%c trigger_analog_type=%c trigger_value=%i");
++
++// Home an axis
++void
++command_trigger_analog_home(uint32_t *args)
++{
++    struct trigger_analog *ta = trigger_analog_oid_lookup(args[0]);
++    sched_del_timer(&ta->time);
++    ta->monitor_ticks = args[5];
++    if (!ta->monitor_ticks) {
++        ta->flags = 0;
++        ta->ts = NULL;
++        return;
++    }
++    ta->ts = trsync_oid_lookup(args[1]);
++    ta->trigger_reason = args[2];
++    ta->error_reason = args[3];
++    ta->time.waketime = ta->homing_clock = args[4];
++    ta->monitor_max = args[6];
++    ta->monitor_count = 0;
++    ta->time.func = monitor_event;
++    ta->flags = TA_AWAIT_HOMING | TA_CAN_TRIGGER;
++    trigger_reset(ta);
++    sched_add_timer(&ta->time);
++}
++DECL_COMMAND(command_trigger_analog_home,
++             "trigger_analog_home oid=%c trsync_oid=%c trigger_reason=%c"
++             " error_reason=%c clock=%u monitor_ticks=%u monitor_max=%u");
++
++void
++command_trigger_analog_query_state(uint32_t *args)
++{
++    uint8_t oid = args[0];
++    struct trigger_analog *ta = trigger_analog_oid_lookup(args[0]);
++    sendf("trigger_analog_state oid=%c homing=%c homing_clock=%u"
++          , oid, !!(ta->flags & TA_CAN_TRIGGER), ta->homing_clock);
++}
++DECL_COMMAND(command_trigger_analog_query_state
++             , "trigger_analog_query_state oid=%c");
+diff --git a/src/trigger_analog.h b/src/trigger_analog.h
+new file mode 100644
+index 00000000..0dab2fbe
+--- /dev/null
++++ b/src/trigger_analog.h
+@@ -0,0 +1,26 @@
++#ifndef __TRIGGER_ANALOG_H
++#define __TRIGGER_ANALOG_H
++
++#include <stdint.h> // uint8_t
++#include "autoconf.h" // CONFIG_WANT_TRIGGER_ANALOG
++
++#if CONFIG_WANT_TRIGGER_ANALOG
++
++struct trigger_analog *trigger_analog_oid_lookup(uint8_t oid);
++void trigger_analog_note_error(struct trigger_analog *ta, uint8_t sensor_code);
++void trigger_analog_update(struct trigger_analog *ta, int32_t sample);
++
++#else
++// Dummy versions of code to avoid compile errors when not using trigger_analog
++
++static inline struct trigger_analog *trigger_analog_oid_lookup(uint8_t oid) {
++    return NULL;
++}
++static inline void
++trigger_analog_note_error(struct trigger_analog *ta, uint8_t sensor_code) { }
++static inline void
++trigger_analog_update(struct trigger_analog *ta, int32_t sample) { }
++
++#endif
++
++#endif // trigger_analog.h
