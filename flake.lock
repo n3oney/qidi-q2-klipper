@@ -37,11 +37,11 @@
     "katapult": {
       "flake": false,
       "locked": {
-        "lastModified": 1774007749,
-        "narHash": "sha256-iQ/z1qWWopb6wG1lHLL/nxrSCBmcdW20k66rpAYpN6Y=",
+        "lastModified": 1790878664,
+        "narHash": "sha256-iC3ypiuSzZ0Yy/RoWHOWCp/7vUL38FmLDTbdSClxynA=",
         "owner": "Arksine",
         "repo": "Katapult",
-        "rev": "ec59b9bb9ad6c2ec8d4dc6831fbc77f0b308e29e",
+        "rev": "3b973a485388b4ef0f9efef46f78152e302aea8e",
         "type": "github"
       },
       "original": {
