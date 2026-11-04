@@ -154,11 +154,9 @@ class CS1237(LoadCellSensor):
         logging.info("CS1237 finished '%s' measurements", self.name)
 
     def _process_batch(self, eventtime) -> BulkAdcData:
-        prev_overflows = self.ffreader.get_last_overflows()
         prev_error_count = self.last_error_count
-        samples = self.ffreader.pull_samples()
+        samples, overflows = self.ffreader.pull_samples()
         self._convert_samples(samples)
-        overflows = self.ffreader.get_last_overflows() - prev_overflows
         errors = self.last_error_count - prev_error_count
         if errors > 0:
             logging.error("%s: Forced sensor restart due to error", self.name)
@@ -176,8 +174,8 @@ class CS1237(LoadCellSensor):
             self.consecutive_fails = 0
         return {
             "data": samples,
-            "errors": self.last_error_count,
-            "overflows": self.ffreader.get_last_overflows(),
+            "errors": errors,
+            "overflows": overflows,
         }
 
 
