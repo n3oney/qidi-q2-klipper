@@ -91,12 +91,6 @@
     ./patches/0011-webhooks-msgspec-json.patch
     ./patches/0013-compat-ignore-namespace-packages.patch
     ./patches/0014-manual-home-probe-position.patch
-    # https://github.com/KalicoCrew/kalico/pull/932
-    ./patches/0012-motion-queuing-steppersync.patch
-    (fetchpatch2 {
-      url = "https://github.com/Klipper3d/klipper/commit/c49dbb5a879df16ebf3014ef0901eb9dd61e6225.patch";
-      hash = "sha256-xodhwjuTUHh7KNghpLwnxi4ff7M4Ms49W1OG2pIRbjg=";
-    })
     ./patches/0015-motion-queuing-disconnect-cleanup.patch
     ./patches/0016-toolhead-check-pause-yield.patch
     ./patches/0017-motion-queuing-drip-headroom.patch

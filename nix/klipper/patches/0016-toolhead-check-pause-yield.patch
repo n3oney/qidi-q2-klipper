@@ -1,7 +1,8 @@
 diff --git a/klippy/toolhead.py b/klippy/toolhead.py
+index 4b26e5414e..77d0edd69b 100644
 --- a/klippy/toolhead.py
 +++ b/klippy/toolhead.py
-@@ -457,6 +457,7 @@
+@@ -446,6 +446,7 @@ def _check_pause(self):
              wtime = eventtime + max(0.100, buffer_time - BUFFER_TIME_HIGH)
              self.reactor.update_timer(self.priming_timer, wtime)
          # Check if there are lots of queued moves and pause if so
@@ -9,19 +10,14 @@ diff --git a/klippy/toolhead.py b/klippy/toolhead.py
          while True:
              pause_time = buffer_time - BUFFER_TIME_HIGH
              if pause_time <= 0.0:
-@@ -464,12 +465,17 @@
-             if not self.can_pause:
-                 self.need_check_pause = self.reactor.NEVER
-                 return
--            eventtime = self.reactor.pause(eventtime + min(1.0, pause_time))
-+            pause_time = max(0.005, min(1.0, pause_time))
-+            eventtime = self.reactor.pause(eventtime + pause_time)
+@@ -458,9 +459,13 @@ def _check_pause(self):
+             )
              est_print_time = self.mcu.estimated_print_time(eventtime)
              buffer_time = self.print_time - est_print_time
 +            did_pause = True
          if not self.special_queuing_state:
 -            # In main state - defer pause checking until needed
--            self.need_check_pause = est_print_time + BUFFER_TIME_HIGH + 0.100
+-            self.need_check_pause = est_print_time + BUFFER_TIME_HIGH
 +            # In main state - defer pause checking
 +            self.need_check_pause = self.print_time
 +            if not did_pause:

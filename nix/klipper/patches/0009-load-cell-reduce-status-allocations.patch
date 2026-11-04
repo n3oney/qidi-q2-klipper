@@ -1,17 +1,18 @@
 diff --git a/klippy/extras/load_cell/load_cell.py b/klippy/extras/load_cell/load_cell.py
-index cdadf94a60..e85da614d8 100644
+index a253214d5f..9d5f8f7df2 100644
 --- a/klippy/extras/load_cell/load_cell.py
 +++ b/klippy/extras/load_cell/load_cell.py
-@@ -479,43 +479,52 @@
+@@ -654,7 +654,6 @@ def __init__(self, config: ConfigWrapper, sensor: BulkAdcSensor):
  
-     def _handle_ready(self):
+     def _handle_do_ready(self, eventtime):
          self.sensor.add_client(self._sensor_data_event)
 -        self.add_client(self._track_force)
          # announce calibration status on ready
          if self.is_calibrated():
              self.printer.send_event("load_cell:calibrate", self)
-         if self.is_tared():
-             self.printer.send_event("load_cell:tare", self)
+@@ -664,13 +663,19 @@ def _handle_ready(self):
+     def _handle_ready(self):
+         self.printer.get_reactor().register_callback(self._handle_do_ready)
  
 -    # convert raw counts to grams and broadcast to clients
 +    # Convert raw counts to grams and broadcast to active clients. Force
@@ -25,45 +26,46 @@ index cdadf94a60..e85da614d8 100644
              return None
 +        has_clients = bool(self.clients.client_cbs)
 +        track_force = self.is_calibrated() and self.is_tared()
++        if not (has_clients or track_force):
++            return True
          samples = []
          for row in data:
--            channel_counts = row[1:][::2]
--            if len(channel_counts) != self.channel_count:
--                logging.info(
--                    f"Missing Sensor Channels! Expected: "
--                    f"{self.channel_count}, found "
--                    f"{len(channel_counts)}"
--                )
--            sum_counts = sum(channel_counts)
+             channel_counts = row[1:][::2]
+@@ -681,22 +686,33 @@ def _sensor_data_event(self, msg):
+                     f"{len(channel_counts)}"
+                 )
+             sum_counts = sum(channel_counts)
 -            sample = [
 -                row[0],
 -                self.counts_to_grams(sum_counts),
 -                sum_counts,
 -                self.tare_counts,
 -            ]
--            if self.channel_count > 1:
-+            if self.channel_count == 1:
-+                channel_counts = None
-+                sum_counts = row[1]
-+            else:
-+                channel_counts = row[1:][::2]
-+                if len(channel_counts) != self.channel_count:
-+                    logging.info(
-+                        f"Missing Sensor Channels! Expected: "
-+                        f"{self.channel_count}, found "
-+                        f"{len(channel_counts)}"
-+                    )
-+                sum_counts = sum(channel_counts)
+-            for idx, counts in enumerate(channel_counts):
+-                sample.append(
 +            force = self.counts_to_grams(sum_counts)
++            if len(channel_counts) == 1:
++                channel_forces = [force]
++            else:
++                channel_forces = [
+                     self.counts_to_grams(
+                         counts, ZeroReference.TARE, channel=idx
+                     )
+-                )
++                    for idx, counts in enumerate(channel_counts)
++                ]
 +            if track_force:
 +                self._force_buffer.append(force)
++                for buf, channel_force in zip(
++                    self._channel_force_buffers, channel_forces
++                ):
++                    buf.append(channel_force)
 +            if not has_clients:
 +                continue
 +            sample = [row[0], force, sum_counts, self.tare_counts]
-+            if channel_counts is not None:
-                 for counts in channel_counts:
-                     sample.append(self.counts_to_grams(counts))
-                     sample.append(counts)
++            for channel_force, counts in zip(channel_forces, channel_counts):
++                sample.append(channel_force)
+                 sample.append(counts)
              samples.append(sample)
 -        msg = {"data": samples, "errors": errors, "overflows": overflows}
 -        self.clients.send(msg)
@@ -74,18 +76,20 @@ index cdadf94a60..e85da614d8 100644
          return True
  
      # get internal events of force data
-@@ -599,16 +608,6 @@
+@@ -825,18 +841,6 @@ def validate_samples(self, samples, errors):
+                         "Some samples are saturated (+/-100%)"
                      )
-         return avg(select_column(samples, 2))
  
 -    # Provide ongoing force tracking/averaging for status updates
 -    def _track_force(self, msg):
 -        if not (self.is_calibrated() and self.is_tared()):
 -            return True
 -        samples = msg["data"]
--        # selectColumn unusable here because Python 2 lacks deque.extend
 -        for sample in samples:
--            self._force_buffer.append(sample[1])
+-            self._force_buffer.append(sample[SampleStructure.FORCE_G.value])
+-            for idx in range(self.channel_count):
+-                col = SampleStructure.channel_force_col(idx)
+-                self._channel_force_buffers[idx].append(sample[col])
 -        return True
 -
      def _force_g(self):

@@ -1,5 +1,5 @@
 diff --git a/src/generic/usb_cdc_ep.h b/src/generic/usb_cdc_ep.h
-index 3b0e6be..3de6da2 100644
+index 3b0e6beb12..3de6da2ca7 100644
 --- a/src/generic/usb_cdc_ep.h
 +++ b/src/generic/usb_cdc_ep.h
 @@ -1,16 +1,28 @@
@@ -33,10 +33,10 @@ index 3b0e6be..3de6da2 100644
      USB_CDC_EP_BULK_OUT_SIZE = 64,
      USB_CDC_EP_BULK_IN_SIZE = 64,
 diff --git a/src/stm32/Kconfig b/src/stm32/Kconfig
-index 13acdcd..a0d2b41 100644
+index 4301d3c243..19b2fbcd32 100644
 --- a/src/stm32/Kconfig
 +++ b/src/stm32/Kconfig
-@@ -398,6 +398,15 @@ config STM32F0_TRIM
+@@ -402,6 +402,15 @@
          Default is 16 (use factory default). Each increment increases
          the clock rate by ~240KHz.
  
@@ -53,7 +53,7 @@ index 13acdcd..a0d2b41 100644
  ######################################################################
  # Communication inteface
 diff --git a/src/stm32/usbotg.c b/src/stm32/usbotg.c
-index b2d5245..98c1571 100644
+index 6e30836960..6df6cda1ce 100644
 --- a/src/stm32/usbotg.c
 +++ b/src/stm32/usbotg.c
 @@ -11,6 +11,7 @@
@@ -130,7 +130,7 @@ index b2d5245..98c1571 100644
  // Setup the USB fifos
  static void
  fifo_configure(void)
-@@ -151,11 +211,59 @@ enable_rx_endpoint(uint32_t ep)
+@@ -169,11 +229,59 @@ enable_rx_endpoint(uint32_t ep)
      USB_OTG_OUTEndpointTypeDef *epo = EPOUT(ep);
      uint32_t ctl = epo->DOEPCTL;
      if (!(ctl & USB_OTG_DOEPCTL_EPENA) || ctl & USB_OTG_DOEPCTL_NAKSTS) {
@@ -190,7 +190,7 @@ index b2d5245..98c1571 100644
  // Inspect the next packet on the rx queue
  static uint32_t
  peek_rx_queue(uint32_t ep)
-@@ -195,6 +303,19 @@ int_fast8_t
+@@ -213,6 +321,19 @@ usb_read_bulk_out(void *data, uint_fast8_t max_len)
  usb_read_bulk_out(void *data, uint_fast8_t max_len)
  {
      usb_irq_disable();
@@ -210,7 +210,7 @@ index b2d5245..98c1571 100644
      uint32_t grx = peek_rx_queue(USB_CDC_EP_BULK_OUT);
      if (!grx) {
          // Wait for packet
-@@ -204,6 +325,10 @@ usb_read_bulk_out(void *data, uint_fast8_t max_len)
+@@ -222,6 +343,10 @@ usb_read_bulk_out(void *data, uint_fast8_t max_len)
      }
      int_fast8_t ret = fifo_read_packet(data, max_len);
      enable_rx_endpoint(USB_CDC_EP_BULK_OUT);
@@ -221,7 +221,7 @@ index b2d5245..98c1571 100644
      usb_irq_enable();
      return ret;
  }
-@@ -249,6 +374,9 @@ usb_read_ep0(void *data, uint_fast8_t max_len)
+@@ -285,6 +410,9 @@ usb_read_ep0(void *data, uint_fast8_t max_len)
      }
      int_fast8_t ret = fifo_read_packet(data, max_len);
      enable_rx_endpoint(0);
@@ -231,7 +231,7 @@ index b2d5245..98c1571 100644
      usb_irq_enable();
      return ret;
  }
-@@ -290,6 +418,9 @@ usb_read_ep0_setup(void *data, uint_fast8_t max_len)
+@@ -326,6 +454,9 @@ usb_read_ep0_setup(void *data, uint_fast8_t max_len)
      }
      enable_rx_endpoint(0);
      EPOUT(0)->DOEPINT = USB_OTG_DOEPINT_STUP;
@@ -241,7 +241,7 @@ index b2d5245..98c1571 100644
      usb_irq_enable();
      // Return previously read setup packet
      memcpy(data, setup_buf, max_len);
-@@ -340,6 +471,10 @@ void
+@@ -376,6 +507,10 @@ usb_set_configure(void)
  usb_set_configure(void)
  {
      usb_irq_disable();
@@ -252,7 +252,7 @@ index b2d5245..98c1571 100644
      // Configure and enable USB_CDC_EP_ACM
      USB_OTG_INEndpointTypeDef *epi = EPIN(USB_CDC_EP_ACM);
      epi->DIEPTSIZ = (USB_CDC_EP_ACM_SIZE
-@@ -387,6 +522,9 @@ OTG_FS_IRQHandler(void)
+@@ -425,6 +560,9 @@ OTG_FS_IRQHandler(void)
  {
      uint32_t sts = OTG->GINTSTS;
      if (sts & USB_OTG_GINTSTS_RXFLVL) {
@@ -262,7 +262,7 @@ index b2d5245..98c1571 100644
          // Received data - disable irq and notify endpoint
          OTG->GINTMSK &= ~USB_OTG_GINTMSK_RXFLVLM;
          uint32_t grx = OTG->GRXSTSR, ep = grx & USB_OTG_GRXSTSP_EPNUM_Msk;
-@@ -394,16 +532,54 @@ OTG_FS_IRQHandler(void)
+@@ -432,11 +570,15 @@ OTG_FS_IRQHandler(void)
              usb_notify_ep0();
          else
              usb_notify_bulk_out();
@@ -279,8 +279,10 @@ index b2d5245..98c1571 100644
 +        OTGD->DAINTMSK = (msk & ~pend);
          if (pend & (1 << 0))
              usb_notify_ep0();
-         if (pend & (1 << USB_CDC_EP_BULK_IN))
-             usb_notify_bulk_in();
+         if (pend & (1 << USB_CDC_EP_BULK_IN)) {
+@@ -449,6 +591,40 @@ OTG_FS_IRQHandler(void)
+             }
+         }
      }
 +#if CONFIG_STM32F4_GD32_USB_INIT_WORKAROUND
 +    if (sts & USB_OTG_GINTSTS_OEPINT) {
@@ -319,7 +321,7 @@ index b2d5245..98c1571 100644
  }
  
  // Initialize the usb controller
-@@ -419,15 +595,40 @@ usb_init(void)
+@@ -464,15 +640,40 @@ usb_init(void)
  #else
      RCC->AHB2ENR |= RCC_AHB2ENR_OTGFSEN;
  #endif
@@ -360,7 +362,7 @@ index b2d5245..98c1571 100644
  #else
      OTG->GCCFG |= USB_OTG_GCCFG_NOVBUSSENS;
  #endif
-@@ -438,24 +639,49 @@ usb_init(void)
+@@ -483,24 +684,49 @@ usb_init(void)
  
      // Setup USB packet memory
      fifo_configure();

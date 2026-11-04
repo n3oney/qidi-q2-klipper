@@ -20,11 +20,11 @@
     "kalico-bleeding-edge": {
       "flake": false,
       "locked": {
-        "lastModified": 1781881508,
-        "narHash": "sha256-l0p/IjzcPTtLH0IJI0fepYO5l34g1D2NVcF+E3T1nLY=",
+        "lastModified": 1793644049,
+        "narHash": "sha256-vOOgPhxlryxJOy8uON6rwfXFjAcu8KhPVK2T83QTpNM=",
         "owner": "KalicoCrew",
         "repo": "kalico",
-        "rev": "e0a57a0b55c65d8b9112c812a01bd32f88476618",
+        "rev": "1ee39ff2c4d15d7c24ab5ddc3b4eae529e6cf6d6",
         "type": "github"
       },
       "original": {
