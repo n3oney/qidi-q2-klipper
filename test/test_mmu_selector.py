@@ -28,6 +28,7 @@ import logging
 import unittest
 
 from test.hh import session
+from test.hh.root import install
 from test.hh.profiles import PROFILES, Profile, clone_across_units
 
 logging.getLogger().setLevel(logging.CRITICAL)
@@ -37,6 +38,7 @@ FILAMENT_POS_LOADED = 10
 FILAMENT_POS_UNKNOWN = -1
 GATE_UNKNOWN = -1
 TOOL_GATE_UNKNOWN = -1
+GATE_AVAILABLE = 1
 TIP_AT_GATE = -40.0             # past the entry switch: where a user's push leaves it
 
 # mmu_constants.py:209-211, mirrored here for the same reason FILAMENT_POS_* is
@@ -62,6 +64,26 @@ LINEAR_MULTI_GEAR = Profile(
     },
     description='custom four-gate LinearMultiGearSelector with a separate selector driver')
 
+# Type-C with an independent exit sensor after every gear: the shape that can crossload by
+# driving another gate's own gear while the selector stays aligned with the loaded gate.
+LINEAR_MULTI_GEAR_EXIT = LINEAR_MULTI_GEAR.derive(
+    'linear_multi_gear_exit',
+    syms={
+        'MMU_HAS_SENSOR_EXIT': True,
+        'CHOICE_GATE_PRELOAD_ENDSTOP_EXIT': True,
+        'PARAM_GATE_PRELOAD_PARKING_DISTANCE': -10,
+    },
+    description='custom four-gate LinearMultiGearSelector with per-gate exit sensors')
+
+LINEAR_MULTI_GEAR_EXIT_NFC = LINEAR_MULTI_GEAR_EXIT.derive(
+    'linear_multi_gear_exit_nfc',
+    syms={
+        'CHOICE_GATE_HOMING_ENDSTOP_EXIT': True,
+        'MMU_HAS_NFC_READER': True,
+        'MMU_HAS_PER_GATE_NFC_READERS': True,
+    },
+    description='custom four-gate LinearMultiGearSelector with per-gate exit sensors and NFC readers')
+
 MACRO_SELECTOR = Profile(
     'macro_selector',
     syms={
@@ -85,9 +107,10 @@ class SelectorTestCase(unittest.TestCase):
 
     PROFILE = None
     HOME_UNITS = (0,)
+    SESSION_KWARGS = {}
 
     def setUp(self):
-        self.hh = session(self.PROFILE)
+        self.hh = session(self.PROFILE, **self.SESSION_KWARGS)
         self.hh.boot()
         self.assertEqual(self.hh.errors, [], 'bootup was not clean')
         self.seeded = self.hh.calibrate()
@@ -179,6 +202,25 @@ class TestLinearSelector(SelectorTestCase):
                                        places=3)
                 self.assertEqual(self.hh.errors, [])
 
+    def test_touch_blockage_recovery_pushes_filament_forward(self):
+        """A touch move blocked by unseen filament pushes it forward past the park retraction."""
+        from unittest import mock
+        from extras.mmu.mmu_utils import MmuError
+        selector, mmu = self.selector('unit0'), self.hh.mmu
+        moves = []
+        def move_filament(msg, dist, *args, **kwargs):
+            moves.append(dist)
+            raise MmuError('stop')
+        with mock.patch.object(selector, 'use_touch_move', return_value=True), \
+             mock.patch.object(selector, 'homing_move', side_effect=lambda *a, **k: (selector.selector_stepper.commanded_pos, True)), \
+             mock.patch.object(mmu, 'check_filament_in_gate', return_value=False), \
+             mock.patch.object(mmu, 'move_filament', side_effect=move_filament):
+            with self.assertRaises(MmuError):
+                selector._select_position(selector.selector_offsets[4])
+        unit = mmu.mmu_unit()
+        self.assertLess(unit.p.gate_parking_distance, 0)
+        self.assertEqual(moves, [-unit.p.gate_parking_distance + 10.])
+
     def test_full_load_and_unload(self):
         """The milestone: filament movement on a physical selector."""
         loaded, unloaded = self.load_and_unload(3)
@@ -196,6 +238,87 @@ class TestLinearSelector(SelectorTestCase):
         before = axis.carriage
         self.load_and_unload(5)
         self.assertAlmostEqual(axis.carriage, before, places=3)
+
+    def test_sync_gear_motor_is_not_sticky_when_the_selector_is_not_homed(self):
+        self.hh.run_gcode('MMU_SELECT GATE=0')
+        self.hh.run_gcode('MMU_MOTORS_OFF')
+        self.assertFalse(self.selector('unit0').is_homed)
+
+        self.hh.run_gcode('MMU_SYNC_GEAR_MOTOR SYNC=1')
+        self.assertFalse(self.hh.mmu.drive().is_synced_to_extruder())
+        self.assertFalse(self.hh.mmu._standalone_sync)
+
+
+class TestTestMoveGrip(SelectorTestCase):
+    """
+    MMU_TEST_MOVE GRIP=1 leaves a type-A (servo) unit gripped, e.g. ready for
+    MMU_CALIBRATE_GEAR; without GRIP the move ends released as before.
+    """
+
+    PROFILE = 'tradrack'
+
+    def setUp(self):
+        super().setUp()
+        self.hh.place_filament(0, position=TIP_AT_GATE)
+        self.hh.run_gcode('MMU_PRELOAD GATE=0')
+        self.hh.run_gcode('MMU_SELECT GATE=0')
+        self.assertEqual(self.hh.errors, [])
+
+    def grip_state(self):
+        return self.selector('unit0').get_filament_grip_state()
+
+    def test_grip_is_retained_after_the_move(self):
+        self.hh.run_gcode('MMU_TEST_MOVE MOVE=100 GRIP=1')
+        self.assertEqual(self.hh.errors, [])
+        self.assertEqual(self.grip_state(), FILAMENT_DRIVE_STATE)
+
+    def test_grip_is_restored_before_sync_after_an_extruder_only_move(self):
+        self.hh.run_gcode('MMU_LOAD')
+        self.hh.run_gcode('MMU_SYNC_GEAR_MOTOR SYNC=1')
+        self.hh.run_gcode('MMU_TEST_MOVE MOVE=5 MOTOR=extruder GRIP=1')
+        self.assertEqual(self.hh.errors, [])
+        self.assertTrue(self.hh.mmu.drive().is_synced_to_extruder())
+        self.assertEqual(self.grip_state(), FILAMENT_DRIVE_STATE)
+
+    def test_without_grip_the_filament_is_released(self):
+        self.hh.run_gcode('MMU_TEST_MOVE MOVE=100 GRIP=1')
+        self.hh.run_gcode('MMU_TEST_MOVE MOVE=-100')
+        self.assertEqual(self.hh.errors, [])
+        self.assertEqual(self.grip_state(), FILAMENT_RELEASE_STATE)
+
+
+class TestTestMoveGripAlwaysGripped(TestTestMoveGrip):
+    """mmx: a type-B ServoSelector, which stays gripped whatever GRIP says."""
+
+    PROFILE = 'mmx'
+
+    def test_without_grip_the_filament_is_released(self):
+        self.assertTrue(self.hh.mmu.mmu_unit().filament_always_gripped)
+        self.hh.run_gcode('MMU_TEST_MOVE MOVE=100')
+        self.assertEqual(self.hh.errors, [])
+        self.assertEqual(self.grip_state(), FILAMENT_DRIVE_STATE)
+
+
+class TestLinearServoSelectorSync(SelectorTestCase):
+    """tradrack with sync_to_extruder: the servo must be down before the gear syncs."""
+
+    PROFILE = PROFILES['tradrack'].derive(
+        'tradrack_sync_to_extruder', syms={'PARAM_SYNC_TO_EXTRUDER': True})
+
+    def test_print_start_grips_before_syncing(self):
+        selector = self.selector('unit0')
+        self.hh.place_filament(0, position=TIP_AT_GATE)
+        self.hh.run_gcode('MMU_PRELOAD GATE=0')
+        self.hh.run_gcode('MMU_SELECT GATE=0')
+        self.hh.run_gcode('MMU_LOAD')
+        self.assertEqual(selector.get_filament_grip_state(), FILAMENT_RELEASE_STATE)
+
+        self.hh.printer.lookup_object('print_stats').set_state('printing')
+        self.hh.run_gcode('MMU_PRINT_START')
+        self.hh.settle(1.0)
+        self.assertTrue(self.hh.mmu.drive().is_synced_to_extruder())
+        self.assertEqual(selector.get_filament_grip_state(), FILAMENT_DRIVE_STATE)
+        self.assertEqual(self.hh.errors, [])
 
 
 class TestLinearMultiGearSelector(SelectorTestCase):
@@ -233,6 +356,289 @@ class TestLinearMultiGearSelector(SelectorTestCase):
         self.assertEqual(self.hh.errors, [])
 
 
+class LinearMultiGearCrossloadCase(SelectorTestCase):
+    """
+    Type-C crossload: with gate 0 loaded through the selector, operations on another gate must
+    use that gate's own gear and leave the selector exactly where it is. The carriage ending
+    where it started is not enough - selecting the gate and restoring would also do that - so
+    every selector move is recorded.
+    """
+
+    LOADED_GATE = 0
+    OTHER_GATE = 2
+
+    def setUp(self):
+        super().setUp()
+        self.loaded_gate_0()
+        self.fil = self.hh.filament()
+        self.moves = []
+        selector = self.selector('unit0')
+        real_move = selector.move
+
+        def recording_move(trace_str, new_pos, *args, **kwargs):
+            self.moves.append(new_pos)
+            return real_move(trace_str, new_pos, *args, **kwargs)
+        selector.move = recording_move
+
+    def loaded_gate_0(self):
+        self.hh.place_filament(self.LOADED_GATE, position=TIP_AT_GATE)
+        self.hh.run_gcode('MMU_PRELOAD GATE=%d' % self.LOADED_GATE)
+        self.hh.run_gcode('MMU_SELECT GATE=%d' % self.LOADED_GATE)
+        self.hh.run_gcode('MMU_LOAD')
+        self.assertEqual(self.hh.mmu.filament_pos, FILAMENT_POS_LOADED)
+        self.assertEqual(self.hh.errors, [])
+
+    def assert_loaded_state_preserved(self, loaded_tip):
+        mmu = self.hh.mmu
+        self.assertEqual(self.moves, [], 'selector moved while filament was loaded through it')
+        self.assertEqual(mmu.gate_selected, self.LOADED_GATE)
+        self.assertEqual(mmu.filament_pos, FILAMENT_POS_LOADED)
+        self.assertEqual(self.fil.tip[self.LOADED_GATE], loaded_tip)
+
+
+
+class TestLinearMultiGearCrossload(LinearMultiGearCrossloadCase):
+
+    PROFILE = LINEAR_MULTI_GEAR_EXIT
+
+    def test_type_c_is_crossload_capable(self):
+        self.assertTrue(self.hh.mmu.mmu_unit(0).can_crossload)
+
+    def test_can_crossload_follows_live_config(self):
+        unit = self.hh.mmu.mmu_unit(0)
+        for param, unsafe, safe in (
+                ('gate_preload_parking_distance', '5', '-10'),
+                ('gate_preload_endstop', 'none', 'mmu_exit')):
+            with self.subTest(param=param):
+                self.hh.run_gcode('MMU_TEST_CONFIG UNIT=0 %s=%s' % (param, unsafe))
+                self.assertFalse(unit.can_crossload)
+                self.assertFalse(unit.get_status(0)['can_crossload'])
+                self.hh.run_gcode('MMU_TEST_CONFIG UNIT=0 %s=%s' % (param, safe))
+                self.assertTrue(unit.can_crossload)
+                self.assertEqual(self.hh.errors, [])
+
+    def test_preload_other_gate_holds_selector(self):
+        loaded_tip = self.fil.tip[self.LOADED_GATE]
+        self.hh.place_filament(self.OTHER_GATE, position=TIP_AT_GATE)
+
+        self.hh.run_gcode('MMU_PRELOAD GATE=%d' % self.OTHER_GATE)
+
+        self.assertEqual(self.hh.errors, [])
+        self.assert_loaded_state_preserved(loaded_tip)
+        self.assertEqual(self.hh.mmu.gate_status[self.OTHER_GATE], GATE_AVAILABLE)
+        # Homed to its own exit sensor (0.0) and retracted behind it
+        self.assertAlmostEqual(self.fil.tip[self.OTHER_GATE], -10.0, places=1)
+
+    def test_eject_other_gate_holds_selector(self):
+        loaded_tip = self.fil.tip[self.LOADED_GATE]
+        self.hh.place_filament(self.OTHER_GATE, position=TIP_AT_GATE)
+        self.hh.run_gcode('MMU_PRELOAD GATE=%d' % self.OTHER_GATE)
+        parked = self.fil.tip[self.OTHER_GATE]
+
+        self.hh.run_gcode('MMU_EJECT GATE=%d' % self.OTHER_GATE)
+
+        self.assertEqual(self.hh.errors, [])
+        self.assert_loaded_state_preserved(loaded_tip)
+        self.assertLess(self.fil.tip[self.OTHER_GATE], parked)
+
+    def test_selector_tracks_true_position_after_crossload(self):
+        """After unloading, selecting the crossloaded gate is a real move from the loaded gate."""
+        self.hh.place_filament(self.OTHER_GATE, position=TIP_AT_GATE)
+        self.hh.run_gcode('MMU_PRELOAD GATE=%d' % self.OTHER_GATE)
+        self.hh.run_gcode('MMU_UNLOAD')
+        self.hh.run_gcode('MMU_SELECT GATE=%d' % self.OTHER_GATE)
+
+        selector, axis = self.selector('unit0'), self.axis('unit0')
+        self.assertEqual(self.hh.errors, [])
+        self.assertAlmostEqual(axis.carriage, selector.selector_offsets[self.OTHER_GATE], places=3)
+
+    def assert_preload_refused(self, message='Filament is loaded'):
+        loaded_tip = self.fil.tip[self.LOADED_GATE]
+        self.hh.place_filament(self.OTHER_GATE, position=TIP_AT_GATE)
+        self.fil.history.clear()
+
+        self.hh.run_gcode('MMU_PRELOAD GATE=%d' % self.OTHER_GATE)
+
+        self.assertEqual(self.fil.history, [], 'a refused crossload must not move filament')
+        self.assert_loaded_state_preserved(loaded_tip)
+        self.assertTrue(any(message in e for e in self.hh.errors), self.hh.errors)
+
+    def test_preload_refused_when_parking_past_exit_sensor(self):
+        self.hh.run_gcode('MMU_TEST_CONFIG UNIT=0 gate_preload_parking_distance=5')
+        self.assert_preload_refused()
+
+    def test_preload_refused_for_sensorless_fixed_move(self):
+        self.hh.run_gcode('MMU_TEST_CONFIG UNIT=0 gate_preload_endstop=none')
+        self.assert_preload_refused()
+
+    def test_preload_refused_when_target_exit_sensor_is_disabled(self):
+        """Fitting is checked by can_crossload; a disabled sensor by MMU_PRELOAD's can_preload."""
+        self.hh.run_gcode('MMU_SENSORS ENABLE=0 SENSOR=mmu_exit_%d' % self.OTHER_GATE)
+        self.assertTrue(self.hh.mmu.mmu_unit(0).can_crossload)
+        self.assert_preload_refused('Perhaps no exit sensors')
+
+    def test_eject_refused_when_crossload_not_possible(self):
+        loaded_tip = self.fil.tip[self.LOADED_GATE]
+        self.hh.place_filament(self.OTHER_GATE, position=TIP_AT_GATE)
+        self.hh.run_gcode('MMU_PRELOAD GATE=%d' % self.OTHER_GATE)
+        self.hh.run_gcode('MMU_TEST_CONFIG UNIT=0 gate_preload_endstop=none')
+        self.fil.history.clear()
+
+        self.hh.run_gcode('MMU_EJECT GATE=%d' % self.OTHER_GATE)
+
+        self.assertEqual(self.fil.history, [])
+        self.assert_loaded_state_preserved(loaded_tip)
+        self.assertTrue(any('Filament is loaded' in e for e in self.hh.errors), self.hh.errors)
+
+    def test_plain_select_while_unloaded_still_moves_selector(self):
+        self.hh.run_gcode('MMU_UNLOAD')
+        self.hh.run_gcode('MMU_SELECT GATE=%d' % self.OTHER_GATE)
+        self.assertEqual(self.moves[-1:], [self.selector('unit0').selector_offsets[self.OTHER_GATE]])
+
+
+class TestLinearMultiGearCrossloadNfc(LinearMultiGearCrossloadCase):
+    """Per-gate homing to mmu_exit, so only the in-place checks stand between NFC and the selector."""
+
+    PROFILE = LINEAR_MULTI_GEAR_EXIT_NFC
+    SESSION_KWARGS = {'virtual_nfc': True}
+
+    def test_nfc_scan_of_other_gate_is_refused(self):
+        self.assertEqual(self.hh.mmu.mmu_unit(0).p.gate_homing_endstop, 'mmu_exit')
+        loaded_tip = self.fil.tip[self.LOADED_GATE]
+        self.hh.place_filament(self.OTHER_GATE)
+        self.hh.mmu.gate_maps.set_gate_status(self.OTHER_GATE, GATE_AVAILABLE)
+        self.fil.history.clear()
+
+        self.hh.run_gcode('MMU_NFC_SCAN GATE=%d' % self.OTHER_GATE)
+
+        self.assertEqual(self.fil.history, [], 'a refused scan must not move filament')
+        self.assert_loaded_state_preserved(loaded_tip)
+        self.assertTrue(any("Can't NFC scan another gate" in e for e in self.hh.errors), self.hh.errors)
+
+    def test_preload_with_reader_skips_nfc(self):
+        loaded_tip = self.fil.tip[self.LOADED_GATE]
+        self.fil.attach_tag(self.OTHER_GATE, '04A1B2C3')
+        self.hh.place_filament(self.OTHER_GATE, position=TIP_AT_GATE)
+        nfc = self.hh.mmu.mmu_unit(0).nfc_manager
+        self.assertTrue(nfc.has_gate_nfc_reader(self.OTHER_GATE))
+
+        self.hh.run_gcode('MMU_PRELOAD GATE=%d' % self.OTHER_GATE)
+
+        self.assertEqual(self.hh.errors, [])
+        self.assert_loaded_state_preserved(loaded_tip)
+        self.assertEqual(self.hh.mmu.gate_status[self.OTHER_GATE], GATE_AVAILABLE)
+        console = ' '.join(self.hh.console)
+        self.assertIn('Preloading gate %d...' % self.OTHER_GATE, console)
+        self.assertNotIn('Preloading gate %d with NFC scan' % self.OTHER_GATE, console)
+
+    def test_preload_with_reader_uses_nfc_when_unloaded(self):
+        """Control for the test above: the same preload does scan once nothing is loaded."""
+        self.hh.run_gcode('MMU_UNLOAD')
+        self.fil.attach_tag(self.OTHER_GATE, '04A1B2C3')
+        self.hh.place_filament(self.OTHER_GATE, position=TIP_AT_GATE)
+
+        self.hh.run_gcode('MMU_PRELOAD GATE=%d' % self.OTHER_GATE)
+
+        self.assertIn('Preloading gate %d with NFC scan' % self.OTHER_GATE, ' '.join(self.hh.console))
+
+
+class TestLinearMultiGearCrossloadMultiUnit(SelectorTestCase):
+    """
+    Two type-C units with gate 0 (unit0) loaded. Only the loaded unit's selector is held: a
+    preload on unit1 is not a crossload, so unit1's selector still moves to the target gate.
+    """
+
+    PROFILE = clone_across_units(
+        'two_linear_multi_gear', LINEAR_MULTI_GEAR_EXIT, ('unit0', 'unit1'),
+        description='two type-C units with per-gate exit sensors')
+    HOME_UNITS = (0, 1)
+    UNIT1_GATE = 6
+
+    def setUp(self):
+        super().setUp()
+        self.fil = self.hh.filament()
+        self.hh.place_filament(0, position=TIP_AT_GATE)
+        self.hh.run_gcode('MMU_PRELOAD GATE=0')
+        self.hh.run_gcode('MMU_SELECT GATE=0')
+        self.hh.run_gcode('MMU_LOAD')
+        self.assertEqual(self.hh.mmu.filament_pos, FILAMENT_POS_LOADED)
+        self.moves = {}
+        for name in ('unit0', 'unit1'):
+            selector = self.selector(name)
+            self.moves[name] = []
+            selector.move = self._recorder(selector.move, self.moves[name])
+
+    @staticmethod
+    def _recorder(real_move, log):
+        def recording_move(trace_str, new_pos, *args, **kwargs):
+            log.append(new_pos)
+            return real_move(trace_str, new_pos, *args, **kwargs)
+        return recording_move
+
+    def assert_unit0_untouched(self, loaded_tip):
+        # Restoring gate 0 after working on unit1 re-selects it: a zero-length move is fine
+        home = self.selector('unit0').selector_offsets[0]
+        self.assertEqual(set(self.moves['unit0']) - {home}, set(), 'loaded unit selector moved')
+        self.assertAlmostEqual(self.axis('unit0').carriage, home, places=3)
+        self.assertEqual(self.hh.mmu.gate_selected, 0)
+        self.assertEqual(self.hh.mmu.filament_pos, FILAMENT_POS_LOADED)
+        self.assertEqual(self.fil.tip[0], loaded_tip)
+        self.assertFalse(any(self.hh.mmu.mmu_machine.get_mmu_unit_by_index(i).selector_held for i in (0, 1)))
+
+    def test_preload_on_other_unit_moves_only_that_selector(self):
+        loaded_tip = self.fil.tip[0]
+        self.hh.place_filament(self.UNIT1_GATE, position=TIP_AT_GATE)
+
+        self.hh.run_gcode('MMU_PRELOAD GATE=%d' % self.UNIT1_GATE)
+
+        self.assertEqual(self.hh.errors, [])
+        self.assert_unit0_untouched(loaded_tip)
+        unit1 = self.hh.mmu.mmu_unit(self.UNIT1_GATE)
+        self.assertIn(self.selector('unit1').selector_offsets[unit1.local_gate(self.UNIT1_GATE)],
+                      self.moves['unit1'])
+        self.assertEqual(self.hh.mmu.gate_status[self.UNIT1_GATE], GATE_AVAILABLE)
+
+    def test_crossload_on_loaded_unit_holds_only_that_selector(self):
+        loaded_tip = self.fil.tip[0]
+        self.hh.place_filament(2, position=TIP_AT_GATE)
+
+        self.hh.run_gcode('MMU_PRELOAD GATE=2')
+
+        self.assertEqual(self.hh.errors, [])
+        self.assert_unit0_untouched(loaded_tip)
+        self.assertEqual(self.moves['unit1'], [])
+        self.assertEqual(self.hh.mmu.gate_status[2], GATE_AVAILABLE)
+
+
+class TestCrossloadCapability(unittest.TestCase):
+    """can_crossload for every selector type: unchanged for existing ones, sensor-dependent for type-C."""
+
+    EXPECTED = (
+        ('boxturtle_test', 'VirtualSelector', True),
+        ('tradrack', 'LinearServoSelector', False),
+        ('mmx', 'ServoSelector', True),
+        ('chameleon', 'RotarySelector', True),
+        ('ercf_vvd', 'IndexedSelector', True),
+        (MACRO_SELECTOR, 'MacroSelector', True),
+        (LINEAR_MULTI_GEAR, 'LinearMultiGearSelector', False),      # no per-gate exit sensors
+        (LINEAR_MULTI_GEAR_EXIT, 'LinearMultiGearSelector', True),
+    )
+
+    def test_can_crossload_by_selector_type(self):
+        for profile, selector_type, expected in self.EXPECTED:
+            with self.subTest(profile=getattr(profile, 'name', profile)):
+                hh = session(profile)
+                try:
+                    hh.boot()
+                    units = [u for u in hh.mmu.mmu_machine.units if u.selector_type == selector_type]
+                    self.assertTrue(units, 'profile has no %s unit' % selector_type)
+                    for unit in units:
+                        self.assertEqual(unit.can_crossload, expected, unit.name)
+                        self.assertEqual(unit.get_status(0)['can_crossload'], expected, unit.name)
+                finally:
+                    hh.close()
+
+
 class TestServoSelector(SelectorTestCase):
     """MMX provides valid vendor angles and exercises the otherwise-unused ServoSelector."""
 
@@ -247,6 +653,148 @@ class TestServoSelector(SelectorTestCase):
         self.assertEqual(loaded, FILAMENT_POS_LOADED)
         self.assertEqual(unloaded, FILAMENT_POS_UNLOADED)
         self.assertEqual(self.hh.errors, [])
+
+
+class TestServoSelectorSeededCalibration(SelectorTestCase):
+    """pico_mmu ships no gate angles, so the harness seeds them as a user's calibration would."""
+
+    PROFILE = 'pico_mmu'
+    HOME_UNITS = ()
+
+    def test_seeded_angles_are_evenly_spaced_within_the_servo_range(self):
+        selector = self.selector('unit0')
+        angles = selector.servo_gate_angles
+        self.assertEqual(self.seeded['unit0']['selector_angles'], angles)
+        self.assertEqual(angles[0], selector.p.servo_min_angle)
+        self.assertEqual(angles[-1], selector.p.servo_max_angle)
+        steps = [b - a for a, b in zip(angles, angles[1:])]
+        self.assertLessEqual(max(steps) - min(steps), 1)     # whole degrees, so rounding
+
+    def test_full_load_and_unload(self):
+        loaded, unloaded = self.load_and_unload(2)
+        self.assertEqual(loaded, FILAMENT_POS_LOADED)
+        self.assertEqual(unloaded, FILAMENT_POS_UNLOADED)
+        self.assertEqual(self.hh.errors, [])
+
+    def test_seeding_before_bootup_leaves_it_calibrated(self):
+        hh = session('pico_mmu')
+        self.addCleanup(hh.close)
+        hh.boot(calibrate=True)
+        self.assertEqual(hh.errors, [])
+        self.assertNotIn(-1, hh.mmu.mmu_unit(0).selector.servo_gate_angles)
+
+
+class TestServoSelectorCalibrationSummary(SelectorTestCase):
+    """MMU_CALIBRATE_SERVO_SELECTOR with no args reports a fixed release and bypass angle."""
+
+    PROFILE = PROFILES['pico_mmu'].derive(
+        'pico_mmu_fixed_release',
+        syms={'PARAM_SERVO_RELEASE_ANGLE': 0, 'PARAM_SERVO_BYPASS_ANGLE': 130})
+    HOME_UNITS = ()
+
+    def test_summary_shows_fixed_release_and_bypass_angles(self):
+        self.hh.run_gcode('MMU_CALIBRATE_SERVO_SELECTOR')
+        self.assertEqual(self.hh.errors, [])
+        console = '\n'.join(self.hh.console)
+        self.assertIn('Release angle is fixed at: 0', console)
+        self.assertIn('Bypass angle: 130', console)
+
+
+class TestServoSelectorReleaseGates(SelectorTestCase):
+    """With no fixed release angle, releasing moves the servo to the release gate's angle."""
+
+    PROFILE = PROFILES['mmx'].derive(
+        'mmx_release_gates',
+        syms={'PARAM_FILAMENT_ALWAYS_GRIPPED': False, 'PARAM_SYNC_TO_EXTRUDER': True})
+    HOME_UNITS = ()
+
+    def load_gate_0(self):
+        self.hh.place_filament(0, position=TIP_AT_GATE)
+        self.hh.run_gcode('MMU_PRELOAD GATE=0')
+        self.hh.run_gcode('MMU_SELECT GATE=0')
+        self.hh.run_gcode('MMU_LOAD')
+
+    def test_release_moves_to_the_release_gates_angle(self):
+        selector = self.selector('unit0')
+        self.assertEqual(selector.servo_release_angle, -1)
+        self.assertEqual(list(selector.p.selector_release_gates), [1, 2, 3, 0])
+        for gate, release_gate in enumerate(selector.p.selector_release_gates):
+            with self.subTest(gate=gate):
+                self.hh.run_gcode('MMU_SELECT GATE=%d' % gate)
+                self.hh.run_gcode('MMU_RELEASE')
+                self.assertEqual(selector.grip_state, FILAMENT_RELEASE_STATE)
+                self.assertEqual(selector.servo_angle, selector.servo_gate_angles[release_gate])
+                self.assertEqual(self.hh.errors, [])
+
+    def test_release_unsyncs_the_gear_before_gripping_the_release_gate(self):
+        self.load_gate_0()
+        self.hh.run_gcode('MMU_SYNC_GEAR_MOTOR SYNC=1')
+        self.assertTrue(self.hh.mmu.drive().is_synced_to_extruder())
+
+        self.hh.run_gcode('MMU_RELEASE')
+        self.assertEqual(self.selector('unit0').grip_state, FILAMENT_RELEASE_STATE)
+        self.assertFalse(self.hh.mmu.drive().is_synced_to_extruder())
+        self.assertFalse(self.hh.mmu._standalone_sync)
+        self.assertEqual(self.hh.errors, [])
+
+    def test_print_start_grips_the_gate_before_syncing(self):
+        selector = self.selector('unit0')
+        self.load_gate_0()
+        self.assertEqual(selector.grip_state, FILAMENT_RELEASE_STATE)
+
+        self.hh.printer.lookup_object('print_stats').set_state('printing')
+        self.hh.run_gcode('MMU_PRINT_START')
+        self.hh.settle(1.0)
+        self.assertTrue(self.hh.mmu.drive().is_synced_to_extruder())
+        self.assertEqual(selector.grip_state, FILAMENT_DRIVE_STATE)
+        self.assertEqual(selector.servo_angle, selector.servo_gate_angles[0])
+        self.assertEqual(self.hh.errors, [])
+
+
+class TestServoSelectorReset(SelectorTestCase):
+    """RESET=1 with no configured gate angles leaves a usable, uncalibrated selector."""
+
+    PROFILE = PROFILES['pico_mmu'].derive(
+        'pico_mmu_release_reset',
+        syms={'PARAM_FILAMENT_ALWAYS_GRIPPED': False, 'PARAM_SYNC_TO_EXTRUDER': True})
+    HOME_UNITS = ()
+
+    def test_release_after_reset_does_not_crash(self):
+        selector = self.selector('unit0')
+        self.hh.run_gcode('MMU_CALIBRATE_SERVO_SELECTOR ANGLE=10')
+        self.hh.run_gcode('MMU_CALIBRATE_SERVO_SELECTOR LGATE=0 SPACING=25')
+        self.hh.run_gcode('MMU_SELECT GATE=0')
+        self.hh.run_gcode('MMU_CALIBRATE_SERVO_SELECTOR RESET=1')
+
+        self.hh.run_gcode('MMU_RELEASE')
+        self.assertEqual(selector.servo_gate_angles, [-1, -1, -1, -1])
+
+    def test_sync_gear_motor_does_not_claim_sync_when_the_grip_fails(self):
+        self.hh.run_gcode('MMU_CALIBRATE_SERVO_SELECTOR ANGLE=10')
+        self.hh.run_gcode('MMU_CALIBRATE_SERVO_SELECTOR LGATE=0 SPACING=25')
+        self.hh.run_gcode('MMU_SELECT GATE=0')
+        self.hh.run_gcode('MMU_CALIBRATE_SERVO_SELECTOR RESET=1')
+
+        self.hh.run_gcode('MMU_SYNC_GEAR_MOTOR SYNC=1')
+        self.assertFalse(self.hh.mmu.drive().is_synced_to_extruder())
+        self.assertFalse(self.hh.mmu._standalone_sync)
+
+    def test_print_start_does_not_sync_when_the_grip_fails(self):
+        selector = self.selector('unit0')
+        self.hh.run_gcode('MMU_CALIBRATE_SERVO_SELECTOR ANGLE=10')
+        self.hh.run_gcode('MMU_CALIBRATE_SERVO_SELECTOR LGATE=0 SPACING=25')
+        self.hh.place_filament(0, position=TIP_AT_GATE)
+        self.hh.run_gcode('MMU_PRELOAD GATE=0')
+        self.hh.run_gcode('MMU_SELECT GATE=0')
+        self.hh.run_gcode('MMU_LOAD')
+        self.assertEqual(selector.grip_state, FILAMENT_RELEASE_STATE)
+        self.hh.run_gcode('MMU_CALIBRATE_SERVO_SELECTOR RESET=1')
+
+        self.hh.printer.lookup_object('print_stats').set_state('printing')
+        self.hh.run_gcode('MMU_PRINT_START')
+        self.hh.settle(1.0)
+        self.assertEqual(selector.grip_state, FILAMENT_RELEASE_STATE)
+        self.assertFalse(self.hh.mmu.drive().is_synced_to_extruder())
 
 
 class TestMacroSelector(SelectorTestCase):
@@ -296,7 +844,7 @@ class TestRotarySelector(SelectorTestCase):
 
     def test_the_machine_still_has_the_geometry_these_tests_assume(self):
         """
-        A guard, not a behaviour test. Everything below is only interesting because release
+        A guard, not a behavior test. Everything below is only interesting because release
         goes to a DIFFERENT gate and because the machine is allowed to release at all - if a
         vendor default ever changes, this fails first and says so, rather than the assertions
         quietly becoming tautologies.
@@ -315,7 +863,7 @@ class TestRotarySelector(SelectorTestCase):
         """
         THE regression test for this class. mmu_rotary_selector.py:229 read
         `self.selector_release_gates`, but that name is a ParamSpec and so lives on `self.p`
-        (the same line's neighbour at :257 gets it right) - so every release raised
+        (the same line's neighbor at :257 gets it right) - so every release raised
         AttributeError: 'RotarySelector' object has no attribute 'selector_release_gates'.
 
         Reached from MMU_RELEASE, and on this machine from plain MMU_SELECT as well:
@@ -382,8 +930,8 @@ class TestRotarySelector(SelectorTestCase):
             with self.subTest(gate=gate):
                 self.hh.run_gcode('MMU_SELECT GATE=%d' % gate)
                 stepper = self.hh.mmu.drive(gate).mmu_gear_stepper.stepper
-                inverted, _original = stepper.get_dir_inverted()
-                self.assertEqual(bool(inverted), bool(direction),
+                inverted, original = stepper.get_dir_inverted()
+                self.assertEqual(bool(inverted), bool(original) ^ bool(direction),
                                  'gate %d should drive the gear %s'
                                  % (gate, 'reversed' if direction else 'forwards'))
 
@@ -396,6 +944,19 @@ class TestRotarySelector(SelectorTestCase):
         loaded, unloaded = self.load_and_unload(1)
         self.assertEqual(loaded, FILAMENT_POS_LOADED)
         self.assertEqual(unloaded, FILAMENT_POS_UNLOADED)
+        self.assertEqual(self.hh.errors, [])
+
+    def test_release_unsyncs_the_gear_before_gripping_the_release_gate(self):
+        self.hh.place_filament(0, position=TIP_AT_GATE)
+        self.hh.run_gcode('MMU_PRELOAD GATE=0')
+        self.hh.run_gcode('MMU_SELECT GATE=0')
+        self.hh.run_gcode('MMU_LOAD')
+        self.hh.run_gcode('MMU_SYNC_GEAR_MOTOR SYNC=1')
+        self.assertTrue(self.hh.mmu.drive().is_synced_to_extruder())
+
+        self.hh.run_gcode('MMU_RELEASE')
+        self.assertEqual(self.selector('unit0').grip_state, FILAMENT_RELEASE_STATE)
+        self.assertFalse(self.hh.mmu.drive().is_synced_to_extruder())
         self.assertEqual(self.hh.errors, [])
 
 
@@ -462,8 +1023,8 @@ class TestRotarySelectorOnALaterUnit(SelectorTestCase):
             with self.subTest(gate=gate):
                 self.hh.run_gcode('MMU_SELECT GATE=%d' % gate)
                 stepper = self.hh.mmu.drive(gate).mmu_gear_stepper.stepper
-                inverted, _original = stepper.get_dir_inverted()
-                self.assertEqual(bool(inverted), bool(direction))
+                inverted, original = stepper.get_dir_inverted()
+                self.assertEqual(bool(inverted), bool(original) ^ bool(direction))
                 self.assertEqual(self.hh.errors, [])
 
     def test_calibration_takes_a_machine_gate_not_a_local_one(self):
@@ -498,6 +1059,150 @@ class TestRotarySelectorOnALaterUnit(SelectorTestCase):
 
         self.assertEqual(self.selector('unit1').selector_offsets, before)
         self.assertTrue(any('Filament may be loaded' in error for error in self.hh.errors))
+
+
+class TestRotarySelectorInvertedGearPin(SelectorTestCase):
+    """
+    selector_gate_directions is RELATIVE to the gear dir_pin, not a replacement for it.
+
+    It used to be handed straight to set_dir_inverted(), which overwrote the '!' Klipper read
+    from the pin - so inverting the pin did nothing once a gate had been gripped, and the gear
+    ran one way before the first grip and the other way after it. A Chameleon with an inverted
+    gear pin must now reverse exactly the gates its table does not.
+    """
+
+    PROFILE = PROFILES['chameleon'].derive(
+        'chameleon_inverted_gear', syms={'PIN_GEAR_DIR': '!unit0:PD3'},
+        description='3D Chameleon with the gear dir_pin inverted')
+
+    def test_other_rotary_machines_keep_the_stepper_retract_default(self):
+        homing = self.selector('unit0').selector_stepper.rail.get_homing_info()
+        self.assertEqual(homing.retract_dist, 5.)
+
+    def test_the_gear_pin_really_is_inverted(self):
+        """A guard: without the '!' this class is TestRotarySelector over again."""
+        stepper = self.hh.mmu.drive(0).mmu_gear_stepper.stepper
+        _inverted, original = stepper.get_dir_inverted()
+        self.assertTrue(original, 'PIN_GEAR_DIR no longer renders inverted')
+
+    def test_the_gate_direction_flips_the_pin_rather_than_replacing_it(self):
+        expected = (False, False, True, True)   # (1, 1, 0, 0) applied on top of '!'
+        for gate, want in enumerate(expected):
+            with self.subTest(gate=gate):
+                self.hh.run_gcode('MMU_SELECT GATE=%d' % gate)
+                self.hh.run_gcode('MMU_GRIP')
+                stepper = self.hh.mmu.drive(gate).mmu_gear_stepper.stepper
+                inverted, _original = stepper.get_dir_inverted()
+                self.assertEqual(bool(inverted), want)
+                self.assertEqual(self.hh.errors, [])
+
+
+def htlf_cam_offsets(cam_angle, num_gates=4):
+    """Gate positions."""
+    return [float(215 - i * cam_angle) for i in range(num_gates)]
+
+
+class TestHtlfSelector(SelectorTestCase):
+    """
+    htlf: a RotarySelector whose gate 0 is the cam lobe FARTHEST from home, on an ERB v2 whose
+    gear dir_pin ships inverted. Both were broken for real users: the LEDs (in gate order) were
+    right but the cams were selected in reverse, and inverting the gear pin did nothing.
+    """
+
+    PROFILE = 'htlf'
+
+    def test_the_machine_still_has_the_shape_these_tests_assume(self):
+        selector = self.selector('unit0')
+        self.assertEqual(type(selector).__name__, 'RotarySelector')
+        self.assertEqual(tuple(selector.p.selector_gate_directions), (0, 0, 0, 0))
+        stepper = self.hh.mmu.drive(0).mmu_gear_stepper.stepper
+        _inverted, original = stepper.get_dir_inverted()
+        self.assertTrue(original, 'ERB v2 no longer defaults the gear dir_pin to inverted')
+
+    def test_the_inverted_gear_pin_survives_gate_selection(self):
+        """
+        THE direction regression. With directions 0,0,0,0 every grip used to set the gear to
+        NOT inverted, silently discarding the board's '!'.
+        """
+        for gate in range(self.hh.mmu.num_gates):
+            with self.subTest(gate=gate):
+                self.hh.run_gcode('MMU_SELECT GATE=%d' % gate)
+                stepper = self.hh.mmu.drive(gate).mmu_gear_stepper.stepper
+                inverted, _original = stepper.get_dir_inverted()
+                self.assertTrue(inverted, 'gate %d lost the dir_pin inversion' % gate)
+                self.assertEqual(self.hh.errors, [])
+
+    def test_homing_backs_off_far_enough_to_clear_the_switch(self):
+        """
+        The stepper's default 5 was ~56 degrees of cam at the old rotation_distance of 32 but is
+        only 5 degrees at 360, which may not clear the switch ("Endstop still triggered after
+        retract"). HTLF keeps the back-off it was homing with.
+        """
+        homing = self.selector('unit0').selector_stepper.rail.get_homing_info()
+        self.assertEqual(homing.retract_dist, 55.)
+        self.assertEqual(homing.speed, 350.)
+
+    def test_gate_zero_is_the_cam_farthest_from_home(self):
+        selector = self.selector('unit0')
+        self.assertLess(selector.p.cad_gate_width, 0)
+        self.assertEqual(selector._cad_gate_offsets(), htlf_cam_offsets(60))
+
+    def test_selecting_a_gate_drives_to_its_own_cam(self):
+        """filament_always_gripped: selecting IS gripping, so the carriage sits on the gate's lobe."""
+        axis = self.axis('unit0')
+        expected = htlf_cam_offsets(60)
+        for gate in range(self.hh.mmu.num_gates):
+            with self.subTest(gate=gate):
+                self.hh.run_gcode('MMU_SELECT GATE=%d' % gate)
+                self.assertAlmostEqual(axis.carriage, expected[gate], places=1)
+                self.assertEqual(self.hh.errors, [])
+
+
+class TestHtlfCalibration(unittest.TestCase):
+    """
+    MMU_CALIBRATE_ROTARY_SELECTOR on an UNSEEDED HTLF. Every limit in the rotary selector used
+    to assume the last gate was the far one, so measuring gate 0 on its own - the natural thing
+    to do in LED order - exceeded gate 0's "maximum" and the save was refused.
+    """
+
+    STEP = 360. / (200 * 16)    # A measured offset is only as fine as one microstep
+
+    def boot(self, cam_angle=None):
+        profile = PROFILES['htlf']
+        if cam_angle is not None:
+            profile = profile.derive('htlf_cam_%d' % cam_angle,
+                                     syms={'CHOICE_HTLF_CAM_ANGLE_%d' % cam_angle: True})
+        self.hh = session(profile)
+        self.hh.boot()
+        self.addCleanup(self.hh.close)
+        self.axis = self.hh.printer.harness_selectors[0]
+        self.selector = self.axis.selector
+
+    def test_gate_zero_can_be_calibrated_on_its_own(self):
+        self.boot()
+        expected = htlf_cam_offsets(60)
+        self.axis.place(expected[0])
+        self.hh.run_gcode('MMU_CALIBRATE_ROTARY_SELECTOR UNIT=0 GATE=0 SINGLE=1')
+        self.assertAlmostEqual(self.selector.selector_offsets[0], expected[0], delta=self.STEP)
+        self.assertEqual(self.hh.errors, [])
+
+    def test_first_and_last_gate_extrapolate_a_descending_layout(self):
+        self.boot()
+        expected = htlf_cam_offsets(60)
+        for gate in (0, 3):
+            self.axis.place(expected[gate])
+            self.hh.run_gcode('MMU_CALIBRATE_ROTARY_SELECTOR UNIT=0 GATE=%d' % gate)
+        for gate, offset in enumerate(self.selector.selector_offsets):
+            self.assertAlmostEqual(offset, expected[gate], delta=self.STEP)
+        self.assertEqual(self.hh.errors, [])
+
+    def test_quick_calibration_follows_the_cam_angle(self):
+        for cam_angle in (30, 45, 60):
+            with self.subTest(cam_angle=cam_angle):
+                self.boot(cam_angle)
+                self.hh.run_gcode('MMU_CALIBRATE_ROTARY_SELECTOR UNIT=0 QUICK=1')
+                self.assertEqual(self.selector.selector_offsets, htlf_cam_offsets(cam_angle))
+                self.assertEqual(self.hh.errors, [])
 
 
 class TestSelectorCalibration(unittest.TestCase):
@@ -699,7 +1404,7 @@ class TestMultiUnitSelectors(SelectorTestCase):
     def test_unit0_loads_and_unloads(self):
         """
         Gate 2 is unit0: LinearServoSelector WITH an encoder, so this is the path that needs
-        tip forming to actually move the extruder.
+        the tip macro to actually move the extruder.
         """
         loaded, unloaded = self.load_and_unload(2)
         self.assertEqual(loaded, FILAMENT_POS_LOADED)
@@ -1308,3 +2013,26 @@ class TestTipFormingEffect(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestSelectorFinalMethods(unittest.TestCase):
+    """select_gate/restore_gate translate global to local gates; subclasses override the _ variants."""
+
+    @classmethod
+    def setUpClass(cls):
+        install() # The selector module imports klippy, so it needs the fake tree on sys.path
+
+    def test_overriding_final_methods_is_rejected(self):
+        from extras.mmu.unit.selectors.mmu_base_selectors import BaseSelector
+        for name in ('select_gate', 'restore_gate'):
+            with self.subTest(method=name):
+                with self.assertRaises(TypeError) as cm:
+                    type('BadSelector', (BaseSelector,), {name: lambda self, gate: None})
+                self.assertIn(name, str(cm.exception))
+
+    def test_overriding_local_variants_is_allowed(self):
+        from extras.mmu.unit.selectors.mmu_base_selectors import BaseSelector
+        type('GoodSelector', (BaseSelector,), {
+            '_select_gate': lambda self, lgate: None,
+            '_restore_gate': lambda self, lgate: None,
+        })

@@ -35,7 +35,7 @@
 import logging
 import unittest
 
-from test.hh import session
+from test.hh import cfg, profiles, session
 from test.hh.filament import TIP_PARKED, TIP_PRESENTED
 
 # Past the entry switch (-50): the only state a preload can realistically start from
@@ -57,9 +57,11 @@ GATE_AVAILABLE = 1
 class MotionTestCase(unittest.TestCase):
     # This suite exercises Box Turtle's real split exit/shared-exit geometry.
     PROFILE = 'boxturtle'
+    # Extra session() kwargs, e.g. the Kalico-generation emulation
+    SESSION_KWARGS = {}
 
     def setUp(self):
-        self.hh = session(self.PROFILE)
+        self.hh = session(self.PROFILE, **self.SESSION_KWARGS)
         self.hh.boot()
         self.assertEqual(self.hh.errors, [], 'bootup was not clean')
         self.fil = self.hh.filament()
@@ -78,6 +80,13 @@ class TestModelItself(MotionTestCase):
         self.hh.place_filament(0, position=entry + 1.0)
         self.assertTrue(self.fil.triggered('mmu_entry_0'))
         self.assertFalse(self.fil.triggered('mmu_exit_0'))
+
+    def test_stepper_rounds_negative_positions_to_nearest_step(self):
+        """As Klipper does - truncating toward zero miscounts a move that crosses it."""
+        stepper = self.hh.printer.lookup_object('toolhead').get_extruder().extruder_stepper.stepper
+        start = stepper.get_mcu_position()
+        stepper.harness_note_motion(-10.6 * stepper.get_step_dist())
+        self.assertEqual(stepper.get_mcu_position() - start, -11)
 
     def test_parked_state_is_coherent(self):
         """
@@ -310,6 +319,54 @@ class TestEveryDriveModeMovesFilament(MotionTestCase):
         self.assertAlmostEqual(self.fil.tip[0] - before, 0., places=3)
 
 
+class TestExtruderSyncAccel(MotionTestCase):
+    """
+    A gear-led synced move (gear+extruder) takes extruder_sync_accel, capped by extruder_accel.
+    It used to take max(gear_from_filament_buffer_accel, gear_load_accel), so on a unit with no
+    filament buffer the acceleration came from a parameter that was not even in its config.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.hh.place_filament(0, position=TIP_AT_GATE)
+        self.hh.run_gcode('MMU_PRELOAD GATE=0')
+        self.hh.heat_extruder(220)
+        self.hh.mmu.select_gate(0)
+        self.assertEqual(self.hh.errors, [])
+
+    def accel_of_gear_led_synced_move(self):
+        drive = self.hh.mmu.drive()
+        real = drive.move
+        accels = []
+
+        def spy(dist, speed, accel, *args, **kwargs):
+            accels.append(accel)
+            return real(dist, speed, accel, *args, **kwargs)
+
+        drive.move = spy
+        try:
+            self.hh.run_gcode('MMU_TEST_MOVE MOVE=20 MOTOR=gear+extruder')
+        finally:
+            del drive.move
+        self.assertEqual(self.hh.errors, [])
+        self.assertEqual(len(accels), 1)
+        return accels[0]
+
+    def test_the_default_is_rendered(self):
+        self.assertIn('extruder_sync_accel        : 400', cfg.render(profiles.get(self.PROFILE))['config/base/mmu.cfg'])
+        self.assertEqual(self.hh.mmu.p.extruder_sync_accel, 400.)
+
+    def test_gear_led_synced_move_uses_extruder_sync_accel(self):
+        self.hh.mmu.p.extruder_sync_accel = 250.
+        self.hh.mmu.mmu_unit().p.gear_from_filament_buffer_accel = 900.
+        self.assertEqual(self.accel_of_gear_led_synced_move(), 250.)
+
+    def test_extruder_accel_still_caps_it(self):
+        self.hh.mmu.p.extruder_sync_accel = 2000.
+        self.hh.mmu.p.extruder_accel = 300.
+        self.assertEqual(self.accel_of_gear_led_synced_move(), 300.)
+
+
 class TestQuietPlacement(MotionTestCase):
     """
     Placing filament is a real event, and the harness has to be explicit about it:
@@ -428,6 +485,73 @@ class TestLoadGate(MotionTestCase):
         with self.assertRaises(Exception):
             self.hh.mmu._load_gate()
         self.assertEqual(self.hh.mmu.gate_status[0], GATE_EMPTY)
+
+    def test_kalico_homing_drives_homing_move_directly(self):
+        """
+        Klipper versions whose manual_home predates the probe_pos argument (Kalico,
+        mainline v0.13.0-111) return no trigger position either: going through
+        manual_home, homing_move runs with probe_pos=False and reports the move
+        TARGET as the position - a bowden calibration on Kalico measured the
+        2000mm homing max instead of the ~1200mm tube length. do_homing_move
+        therefore introspects manual_home's signature and, when probe_pos is
+        absent, drives HomingMove directly (the approach the verified v3 code
+        used on Kalico), passing probe_pos through, and never calls manual_home.
+        Klipper versions with the probe_pos parameter keep using manual_home.
+
+        Simulate the old generation by swapping the fake PrinterHoming's
+        manual_home for a probe_pos-less version that returns the move target,
+        as the old implementations did. The signature IS the branch condition,
+        so no fork marker object is involved; record any manual_home call
+        (there must be none) and assert the move goes through
+        HomingMove.homing_move with probe_pos.
+        """
+        # Local import: the fake klippy tree (and hence `extras`) only exists on
+        # sys.path once the session in setUp has installed the overlay.
+        from extras.homing import HomingMove
+        printer = self.hh.printer
+        homing = printer.lookup_object('homing')
+        manual_home_calls = []
+        original_manual_home = homing.manual_home
+
+        def legacy_manual_home(toolhead, endstops, movepos, speed,
+                               triggered, check_triggered):
+            # Old-generation signature: no probe_pos, and the move target is
+            # what the caller ends up with.
+            manual_home_calls.append((movepos, speed))
+            hmove = HomingMove(printer, endstops, toolhead)
+            hmove.homing_move(movepos, speed, probe_pos=False,
+                              triggered=triggered, check_triggered=check_triggered)
+            return movepos
+        homing.manual_home = legacy_manual_home
+
+        moves = []
+        original_homing_move = HomingMove.homing_move
+
+        def recording_homing_move(self, movepos, speed, probe_pos=False,
+                                  triggered=True, check_triggered=True):
+            moves.append((probe_pos, triggered, check_triggered))
+            return original_homing_move(self, movepos, speed, probe_pos=probe_pos,
+                                        triggered=triggered,
+                                        check_triggered=check_triggered)
+
+        try:
+            HomingMove.homing_move = recording_homing_move
+            overshoot = self.hh.mmu._load_gate()
+        finally:
+            HomingMove.homing_move = original_homing_move
+            homing.manual_home = original_manual_home
+
+        self.assertEqual(manual_home_calls, [],
+                         'do_homing_move must not use a manual_home that lacks '
+                         'the probe_pos parameter')
+        self.assertEqual(len(moves), 1)
+        probe_pos, triggered, check_triggered = moves[0]
+        self.assertTrue(probe_pos,
+                        'old-generation homing must pass probe_pos through, or '
+                        'the move target is reported as the trigger position')
+        self.assertEqual(self.hh.mmu.filament_pos, FILAMENT_POS_HOMED_GATE)
+        self.assertEqual(overshoot, 0.0)
+        self.assertEqual(self.hh.errors, [])
 
 
 class TestCheckGate(MotionTestCase):
@@ -645,6 +769,44 @@ class TestPreload(MotionTestCase):
         banners = [l for l in self.hh.console[at:] if l.lower().startswith('ejecting')]
         self.assertEqual(banners, ['Ejecting gate 1...'])
         self.assertEqual(self.hh.mmu.gate_status[1], GATE_EMPTY)
+
+    def test_blind_eject_does_not_rewind_espooler(self):
+        """
+        #715: without an entry sensor the final eject is a blind move, and a rewinding
+        espooler keeps pulling after the gear lets go, dragging the tip off the spool.
+        The entry-sensor homing eject stops at the switch, so it keeps its rewind.
+        """
+        mmu = self.hh.mmu
+        ops = []
+        set_operation = mmu.espooler().set_operation
+        def spy(gate, value, operation):
+            ops.append((gate, operation))
+            return set_operation(gate, value, operation)
+        mmu.espooler().set_operation = spy
+
+        for gate in (1, 2):
+            self.hh.place_filament(gate, position=TIP_AT_GATE)
+            self.hh.run_gcode('MMU_PRELOAD GATE=%d' % gate)
+
+        del ops[:]
+        self.hh.run_gcode('MMU_EJECT GATE=2')
+        self.assertIn((2, 'rewind'), ops)
+
+        # Only the reverse homing off mmu_exit_1, still in the gear's grip, may rewind
+        self.hh.run_gcode('MMU_SENSORS SENSOR=mmu_entry_1 ENABLE=0')
+        del ops[:]
+        self.hh.run_gcode('MMU_EJECT GATE=1')
+        self.assertEqual(ops.count((1, 'rewind')), 1, ops)
+        self.assertEqual(mmu.gate_status[1], GATE_EMPTY)
+
+    def test_blind_eject_stops_a_running_espooler(self):
+        """Suppressing the rewind must still stop one already running, as the eject used to."""
+        self.hh.place_filament(1, position=TIP_AT_GATE)
+        self.hh.run_gcode('MMU_SENSORS SENSOR=mmu_entry_1 ENABLE=0')
+        self.hh.run_gcode('MMU_ESPOOLER GATE=1 OPERATION=rewind')
+        self.assertEqual(self.hh.mmu.espooler().get_operation(1)[0], 'rewind')
+        self.hh.run_gcode('MMU_EJECT GATE=1')
+        self.assertEqual(self.hh.mmu.espooler().get_operation(1)[0], 'off')
 
     def test_a_failed_preload_keeps_an_assigned_spool_id(self):
         """
@@ -874,6 +1036,209 @@ class TestNfcEndstopTrips(unittest.TestCase):
         self.assertIsNotNone(nfc)
         self.assertIsNotNone(switch)
         self.assertLess(nfc, switch[1])
+
+
+def _assert_all_mmu_steppers_on_the_emulator(testcase):
+    # Local import: the fake klippy tree (and hence `extras`) only exists on
+    # sys.path once the session in setUp has installed the overlay.
+    from extras.mmu_stepper import MotionQueuingEmulator
+    printer = testcase.hh.printer
+    testcase.assertIsNone(printer.lookup_object('motion_queuing', None),
+                          'this generation has no motion_queuing module')
+    unit = testcase.hh.mmu.mmu_unit(0)
+    steppers = [d.mmu_gear_stepper for d in unit.drives
+                if d.mmu_gear_stepper is not None]
+    steppers.append(unit.extruder_wrapper.homing_extruder_stepper)
+    for mstepper in steppers:
+        testcase.assertIsInstance(mstepper.motion_queuing, MotionQueuingEmulator,
+                                  'MmuStepper %s must run on the emulator' % mstepper.name)
+
+
+def _assert_step_generator_tracking(testcase):
+    # Old-generation toolheads step every registered generator ahead of the
+    # print time; a manual-mode stepper stepped that way runs its time
+    # cursor ahead of the manual trapq, and the next drip move dies in
+    # stepcompress ("Internal error in stepcompress" on a real Kalico).
+    # Manual-mode steppers must come off the toolhead's step generator list
+    # and return to it when they enter extruder mode.
+    toolhead = testcase.hh.printer.lookup_object('toolhead')
+    testcase.assertTrue(hasattr(toolhead, 'step_generators'),
+                        'this generation\'s toolhead must expose step generators')
+    unit = testcase.hh.mmu.mmu_unit(0)
+    gear = next(d.mmu_gear_stepper for d in unit.drives
+                if d.mmu_gear_stepper is not None)
+    handler = gear.stepper.generate_steps
+    testcase.assertNotIn(handler, toolhead.step_generators,
+                         'a manual-mode stepper must not be stepped by the toolhead')
+    home = unit.extruder_wrapper.homing_extruder_stepper
+    testcase.assertIn(home.stepper.generate_steps, toolhead.step_generators,
+                      'the homing extruder stepper stays with the toolhead')
+    gear.switch_to_extruder_mode()
+    testcase.assertIn(handler, toolhead.step_generators,
+                      'extruder mode follows the toolhead through step generation')
+    gear.switch_to_manual_mode()
+    testcase.assertNotIn(handler, toolhead.step_generators)
+    testcase.assertEqual(testcase.hh.errors, [])
+
+
+def _assert_gcode_axis_step_generator_tracking(testcase):
+    # A manual stepper assigned as a G-code axis must be stepped by the
+    # toolhead exactly like an extruder-mode one: the old-generation
+    # manual_stepper.command_with_gcode_axis registers the step generator
+    # when it assigns the axis and unregisters it when it removes the axis.
+    # Without that, a G1 move on the assigned axis queues movement and
+    # updates the software position without generating a single motor step.
+    toolhead = testcase.hh.printer.lookup_object('toolhead')
+    testcase.assertTrue(hasattr(toolhead, 'step_generators'),
+                        'this generation\'s toolhead must expose step generators')
+    unit = testcase.hh.mmu.mmu_unit(0)
+    gear = next(d.mmu_gear_stepper for d in unit.drives
+                if d.mmu_gear_stepper is not None)
+    handler = gear.stepper.generate_steps
+    stepper = gear.full_name.split()[-1]
+    testcase.assertNotIn(handler, toolhead.step_generators,
+                         'a standalone manual stepper must not be stepped by the toolhead')
+    testcase.hh.run_gcode('MMU_STEPPER STEPPER=%s GCODE_AXIS=A' % stepper)
+    testcase.assertEqual(toolhead.step_generators.count(handler), 1,
+                         'assigning the axis must register the step generator exactly once')
+    testcase.hh.run_gcode('MMU_STEPPER STEPPER=%s GCODE_AXIS=' % stepper)
+    testcase.assertNotIn(handler, toolhead.step_generators,
+                         'removing the axis must unregister the step generator')
+    testcase.hh.run_gcode('MMU_STEPPER STEPPER=%s GCODE_AXIS=A' % stepper)
+    testcase.assertEqual(toolhead.step_generators.count(handler), 1,
+                         'reassigning must register exactly once, not stack a second entry')
+    testcase.assertEqual(testcase.hh.errors, [])
+
+
+class TestKalico(MotionTestCase):
+    """
+    Kalico-generation session: is_kalico() is True from config load (the
+    'danger_options' marker object) and the motion_queuing module does not
+    exist, exactly as on real Kalico - so MmuStepper must take the
+    MotionQueuingEmulator path for its whole life: boot, homing and plain
+    moves.
+    """
+    SESSION_KWARGS = {'kalico': True}
+
+    def test_boot_without_motion_queuing(self):
+        """
+        The pre-fix crash: MmuStepper.__init__ did
+        printer.load_object(config, 'motion_queuing'), which on real Kalico
+        raises "Module 'motion_queuing' not found" and kills boot. The Kalico
+        generation must boot clean, with every MmuStepper on the emulator.
+        """
+        self._assert_all_mmu_steppers_on_the_emulator()
+        self.assertEqual(self.hh.errors, [])
+
+    def _assert_all_mmu_steppers_on_the_emulator(self):
+        _assert_all_mmu_steppers_on_the_emulator(self)
+
+    def test_load_and_park_on_kalico(self):
+        """
+        The load homes through HomingMove; the park is a PLAIN move - the one
+        that must reach the filament model through the emulator's trapq_append
+        (on real Kalico: the chelper trapq and stepcompress), so the tip must
+        end at the configured park exactly as on mainline Klipper.
+        """
+        self.hh.place_filament(0)
+        self.hh.mmu.select_gate(0)
+        self.hh.mmu._load_gate()
+        self.assertEqual(self.hh.mmu.filament_pos, FILAMENT_POS_HOMED_GATE)
+        mmu = self.hh.mmu
+        mmu._park_from_gate(mmu._gate_profile())
+        gate_park = (self.fil.layout['mmu_shared_exit']
+                     + mmu.mmu_unit(0).p.gate_parking_distance)
+        self.assertAlmostEqual(self.fil.tip[0], gate_park, places=2,
+                               msg='the park move never reached the model')
+        self.assertFalse(self.hh.sensor('unit0:mmu_shared_exit').present)
+        self.assertEqual(self.hh.errors, [])
+
+    def test_bootup_disables_idle_gear_steppers(self):
+        """
+        MMU_BOOTUP de-energizes the idle type-B gear steppers. On the
+        pre-set_motors_enable generation this must go through the per-stepper
+        path - on-printer it crashed with "'PrinterStepperEnable' object has
+        no attribute 'set_motors_enable'".
+        """
+        se = self.hh.printer.lookup_object('stepper_enable')
+        self.assertFalse(hasattr(se, 'set_motors_enable'),
+                         'this generation has no set_motors_enable')
+        unit = self.hh.mmu.mmu_unit(0)
+        gear_drives = [d for d in unit.drives if d.mmu_gear_stepper is not None]
+        self.assertTrue(gear_drives, 'boxturtle must be multigear')
+        for d in gear_drives:
+            d.mmu_gear_stepper.do_enable(True)
+        self.hh.mmu.disable_all_idle_gear_steppers()
+        for d in gear_drives:
+            el = se.lookup_enable(d.mmu_gear_stepper.stepper.get_name())
+            self.assertFalse(el.is_enabled,
+                             'gear stepper %s must be de-energized' % el.name)
+            self.assertEqual(el.transitions[-1][1], False)
+        self.assertEqual(self.hh.errors, [])
+
+    def test_manual_mode_steppers_off_toolhead_step_generators(self):
+        """
+        The on-printer "Internal error in stepcompress": the inherited
+        Kalico _handle_connect registered every MmuStepper as a toolhead
+        step generator, so toolhead step generation ran the stepper's time
+        cursor ahead of the manual trapq; the gate homing's drip move then
+        asked for steps at an earlier time and stepcompress blew up. Manual
+        mode must take the stepper off the toolhead's step generator list.
+        """
+        _assert_step_generator_tracking(self)
+
+    def test_gcode_axis_assignment_restores_step_generator(self):
+        """
+        The inverse of the stepcompress bug: a manual stepper assigned a
+        G-code axis (MMU_STEPPER ... GCODE_AXIS=A) is planned by the
+        toolhead, so on the pre-motion_queuing generation its step
+        generator must be registered again - exactly what Kalico's own
+        manual_stepper.command_with_gcode_axis does. Unregistered, a G1
+        move on axis A would queue and advance the software position
+        without any motor steps. The fake toolhead does not generate
+        physical steps, so only the registration list can catch this.
+        """
+        _assert_gcode_axis_step_generator_tracking(self)
+
+
+class TestOldKlipper(MotionTestCase):
+    """
+    Old mainline Klipper generation: no motion_queuing module, and no Kalico
+    marker. Old mainline is not officially supported - this is the bonus case
+    that selection on the module's ABSENCE (not on the fork) makes possible.
+    The emulator must be picked without is_kalico() ever being True, and the
+    homing then takes the HomingMove-direct branch of do_homing_move - old
+    mainline's manual_home also predates probe_pos, so the signature
+    introspection routes it there too - on top of the emulator.
+    """
+    SESSION_KWARGS = {'old_klipper': True}
+
+    def test_boot_on_the_emulator_without_the_kalico_marker(self):
+        printer = self.hh.printer
+        self.assertFalse(printer.lookup_object('danger_options', False),
+                         'this session must not look like Kalico')
+        _assert_all_mmu_steppers_on_the_emulator(self)
+        self.assertEqual(self.hh.errors, [])
+
+    def test_load_and_park_on_old_klipper(self):
+        self.hh.place_filament(0)
+        self.hh.mmu.select_gate(0)
+        self.hh.mmu._load_gate()
+        self.assertEqual(self.hh.mmu.filament_pos, FILAMENT_POS_HOMED_GATE)
+        mmu = self.hh.mmu
+        mmu._park_from_gate(mmu._gate_profile())
+        gate_park = (self.fil.layout['mmu_shared_exit']
+                     + mmu.mmu_unit(0).p.gate_parking_distance)
+        self.assertAlmostEqual(self.fil.tip[0], gate_park, places=2,
+                               msg='the park move never reached the model')
+        self.assertFalse(self.hh.sensor('unit0:mmu_shared_exit').present)
+        self.assertEqual(self.hh.errors, [])
+
+    def test_manual_mode_steppers_off_toolhead_step_generators(self):
+        _assert_step_generator_tracking(self)
+
+    def test_gcode_axis_assignment_restores_step_generator(self):
+        _assert_gcode_axis_step_generator_tracking(self)
 
 
 if __name__ == '__main__':

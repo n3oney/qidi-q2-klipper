@@ -10,12 +10,12 @@ config MMU_TYPE_VVD_1_0
   select MMU_HAS_NFC_READER
   select MMU_HAS_PER_GATE_NFC_READERS
   select UNSELECT_MMU_HAS_ESPOOLER        # Disable
+  select MMU_GEAR_ROTATES_SPOOL           # Gate gear motor turns the spool
   select UNSELECT_MMU_HAS_FILAMENT_BUFFER # Disable
 
   select UNSELECT_VARIABLE_BOWDEN_LENGTHS # Disable
-  select UNSELECT_FILAMENT_ALWAYS_GRIPPED # Disable
+  select PARAM_FILAMENT_ALWAYS_GRIPPED
 
-  select DISABLE_NUM_GATES_OPTION         # Disable
   imply OPTION_VVD_BUFFER                 # Suggest
 
 
@@ -29,9 +29,9 @@ if MMU_TYPE_VVD_1_0
     select MMU_HAS_BUFFER_MCU
     select MMU_HAS_SENSOR_EXIT
     select MMU_HAS_SYNC_FEEDBACK_BUFFER
-    select MMU_HAS_SENSOR_BUFFER_COMPRESSION
-    select MMU_HAS_SENSOR_BUFFER_TENSION
-    select UNSELECT_MMU_HAS_SENSOR_BUFFER_PROPORTIONAL
+    select MMU_HAS_SENSOR_BUFFER_COMPRESSION if !MMU_SHARED_SYNC_FEEDBACK_BUFFER
+    select MMU_HAS_SENSOR_BUFFER_TENSION if !MMU_SHARED_SYNC_FEEDBACK_BUFFER
+    select UNSELECT_MMU_HAS_SENSOR_BUFFER_PROPORTIONAL if !MMU_SHARED_SYNC_FEEDBACK_BUFFER
 
   if OPTION_VVD_BUFFER
     choice CHOICE_BUFFER_SPRING_STATE
@@ -47,24 +47,6 @@ endif
 
 if MMU_TYPE_VVD_1_0
 
-  # MISC_HARDWARE configures these
-  config CUSTOM_LED_SETUP
-    def_bool y
-  config CUSTOM_ENVIRONMENT_SENSOR_SETUP
-    def_bool y
-  config CUSTOM_HEATER_SETUP
-    def_bool y
-  config CUSTOM_FAN_SETUP
-    def_bool y
-  config CUSTOM_HEATER_FAN_SETUP
-    def_bool y
-  config CUSTOM_NFC_READER_SETUP
-    def_bool y
-
-  if SHOW_MMU_ADDITIONS_WITH_TYPE
-    source "Kconfig.mmu_additions"
-  endif
-
   source "Kconfig.capabilities"
 
   ####################
@@ -76,6 +58,8 @@ if MMU_TYPE_VVD_1_0
   config PARAM_VERSION
     default "1.0" 
   config PARAM_NUM_GATES
+    default 4
+  config PARAM_DESIGN_NUM_GATES
     default 4
   choice BOARD_TYPE
     default BOARD_TYPE_VVD_1_0
@@ -128,7 +112,7 @@ if MMU_TYPE_VVD_1_0
   config PARAM_FILAMENT_HEATER
     default "$(UNIT_NAME)_heater"
   config PARAM_HEATER_MAX_TEMP
-    default "75"
+    default 75
 
   config PARAM_NFC_READER_0
     default "$(UNIT_NAME)_nfc01"

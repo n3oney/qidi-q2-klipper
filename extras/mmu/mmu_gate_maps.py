@@ -41,7 +41,7 @@ class MmuGateMaps:
         self.endless_spool_enabled = self.p.endless_spool_enabled
         if len(self.p.default_endless_spool_groups) > 0:
             if len(self.p.default_endless_spool_groups) != self.num_gates:
-                raise self.config.error("endless_spool_groups has a different number of values than the number of gates")
+                raise self.config.error("default_endless_spool_groups has a different number of values than the number of gates")
         else:
             self.p.default_endless_spool_groups = list(range(self.num_gates))
         self.endless_spool_groups = list(self.p.default_endless_spool_groups)
@@ -52,11 +52,15 @@ class MmuGateMaps:
             (VARS_MMU_GATE_FILAMENT_NAME,  'gate_filament_name', ""),
             (VARS_MMU_GATE_MATERIAL,       'gate_material', ""),
             (VARS_MMU_GATE_VENDOR,         'gate_vendor', ""),
+            (VARS_MMU_GATE_TD,             'gate_td', None),
+            (VARS_MMU_GATE_TD1_COLOR,      'gate_td1_color', ""),
             (VARS_MMU_GATE_COLOR,          'gate_color', ""),
             (VARS_MMU_GATE_TEMPERATURE,    'gate_temperature', int(self.p.default_extruder_temp)),
             (VARS_MMU_GATE_SPOOL_ID,       'gate_spool_id', -1),
             (VARS_MMU_GATE_SPEED_OVERRIDE, 'gate_speed_override', 100),
             (VARS_MMU_GATE_SPOOL_RFID,     'gate_spool_rfid', ""),
+            (VARS_MMU_GATE_REMAINING_WEIGHT, 'gate_remaining_weight', -1),
+            (VARS_MMU_GATE_INITIAL_WEIGHT, 'gate_initial_weight', -1),
         ]
 
         for _, attr, default in self._gate_map_vars:
@@ -76,6 +80,8 @@ class MmuGateMaps:
         # attribution. gate_spool_rfid remains the single UID physically observed
         # at the gate; this cache contains every UID registered to its spool.
         self.gate_spool_rfid_aliases = [tuple() for _ in range(self.num_gates)]
+        self._migration_errors = []
+        self._migration_notes = []
         self.update_gate_color_rgb()
 
         # Helper RGB map used by slicer color projection / UI / LEDs
@@ -110,32 +116,22 @@ class MmuGateMaps:
         Returns:
             List[str]: any validation / length / sanity warnings encountered
         """
-        errors = []
+        errors, self._migration_errors = self._migration_errors, []
         var_manager = self.mmu.var_manager
-
-        # Load EndlessSpool config
         self.endless_spool_enabled = var_manager.get(VARS_MMU_ENABLE_ENDLESS_SPOOL, self.endless_spool_enabled)
-        endless_spool_groups = var_manager.get(VARS_MMU_ENDLESS_SPOOL_GROUPS, self.endless_spool_groups)
-        if len(endless_spool_groups) == self.num_gates:
-            self.endless_spool_groups = endless_spool_groups
-        else:
-            errors.append("Incorrect number of gates specified in %s" % VARS_MMU_ENDLESS_SPOOL_GROUPS)
-
-        # Load TTG map
-        tool_to_gate_map = var_manager.get(VARS_MMU_TOOL_TO_GATE_MAP, self.ttg_map)
-        if len(tool_to_gate_map) == self.num_gates:
-            self.ttg_map = tool_to_gate_map
-        else:
-            errors.append("Incorrect number of gates specified in %s" % VARS_MMU_TOOL_TO_GATE_MAP)
-
-        # Load gate map
-        for var, attr, _ in self._gate_map_vars:
+        lists = [(VARS_MMU_ENDLESS_SPOOL_GROUPS, 'endless_spool_groups'),
+                 (VARS_MMU_TOOL_TO_GATE_MAP, 'ttg_map')]
+        lists.extend((var, attr) for var, attr, _ in self._gate_map_vars)
+        for var, attr in lists:
             value = var_manager.get(var, getattr(self, attr))
-            if len(value) == self.num_gates:
-                setattr(self, attr, value)
+            if isinstance(value, list) and len(value) == self.num_gates:
+                setattr(self, attr, list(value))
             else:
-                errors.append("Incorrect number of gates specified with %s" % var)
+                errors.append("Invalid value or incorrect number of gates specified with %s" % var)
         self.update_gate_color_rgb()
+        if self._migration_notes:
+            self.mmu.log_warning("Warning: Persisted gate lists / unit state migrated:\n%s" % "\n".join(self._migration_notes))
+            self._migration_notes = []
 
         # Load selected gate and tool
         gate_selected = var_manager.get(VARS_MMU_GATE_SELECTED, self.mmu.gate_selected)
@@ -161,6 +157,10 @@ class MmuGateMaps:
         return errors
 
 
+    def current_layout(self):
+        return [[unit.name, unit.num_gates] for unit in self.mmu.mmu_machine.units]
+
+
     def persist_ttg_map(self):
         self.mmu.var_manager.set(VARS_MMU_TOOL_TO_GATE_MAP, self.ttg_map, write=True)
 
@@ -169,6 +169,52 @@ class MmuGateMaps:
         self.mmu.var_manager.set(VARS_MMU_ENABLE_ENDLESS_SPOOL, self.endless_spool_enabled)
         self.mmu.var_manager.set(VARS_MMU_ENDLESS_SPOOL_GROUPS, self.endless_spool_groups)
         self.mmu.var_manager.write()
+
+
+    def td1_rgba(self, gate):
+        """
+        The measured color, with an alpha channel derived from the measured TD.
+
+        TD is how far light gets into the filament, so alpha is its inverse: low TD is
+        opaque, TD1_CLEAR_TD and beyond is fully transparent. Returns "" with no measured
+        color, or plain RRGGBB with no TD to derive an alpha from.
+        """
+        color = self.gate_td1_color[gate]
+        if not color:
+            return ""
+        td = self.gate_td[gate]
+        if td is None:
+            return color
+        return "%s%02x" % (color, int(round(255 * max(0., 1. - td / TD1_CLEAR_TD))))
+
+
+    def clear_measurements(self, gate):
+        """
+        Drop the measured fields for 'gate' without claiming its filament changed.
+
+        For a hand-entered measurement, which supersedes the scanner's but leaves the
+        same filament in the gate. An adopted filament_color goes with it; a color
+        Spoolman or the user set does not - it is only ours while it still matches.
+        """
+        if self.gate_td1_color[gate] and self.gate_color[gate] == self.td1_rgba(gate):
+            self.gate_color[gate] = ""
+            self.update_gate_color_rgb()
+        self.gate_td[gate] = None
+        self.gate_td1_color[gate] = ""
+
+
+    def gate_filament_changed(self, gate):
+        """
+        The filament in 'gate' is no longer the filament it was.
+
+        Called for spool assignment/removal, RFID changes, gate reset and gates going
+        EMPTY. Measurements are fields of this map so they are dropped here;
+        'mmu:gate_filament_changed' lets subsystems drop what they derived from the old
+        identity. Handlers must not persist or mutate the map - the caller's own
+        gate-map write does that.
+        """
+        self.clear_measurements(gate)
+        self.printer.send_event("mmu:gate_filament_changed", gate)
 
 
     def persist_gate_status(self):
@@ -180,11 +226,16 @@ class MmuGateMaps:
         self.mmu.var_manager.set(VARS_MMU_GATE_FILAMENT_NAME, self.gate_filament_name)
         self.mmu.var_manager.set(VARS_MMU_GATE_MATERIAL, self.gate_material)
         self.mmu.var_manager.set(VARS_MMU_GATE_VENDOR, self.gate_vendor)
+        self.mmu.var_manager.set(VARS_MMU_GATE_TD, self.gate_td)
+        self.mmu.var_manager.set(VARS_MMU_GATE_TD1_COLOR, self.gate_td1_color)
         self.mmu.var_manager.set(VARS_MMU_GATE_COLOR, self.gate_color)
         self.mmu.var_manager.set(VARS_MMU_GATE_TEMPERATURE, self.gate_temperature)
         self.mmu.var_manager.set(VARS_MMU_GATE_SPOOL_ID, self.gate_spool_id)
         self.mmu.var_manager.set(VARS_MMU_GATE_SPEED_OVERRIDE, self.gate_speed_override)
         self.mmu.var_manager.set(VARS_MMU_GATE_SPOOL_RFID, self.gate_spool_rfid)
+        self.mmu.var_manager.set(VARS_MMU_GATE_REMAINING_WEIGHT, self.gate_remaining_weight)
+        self.mmu.var_manager.set(VARS_MMU_GATE_INITIAL_WEIGHT, self.gate_initial_weight)
+        self.mmu.var_manager.set(VARS_MMU_GATE_MAP_UNITS, self.current_layout())
         self.mmu.var_manager.write()
         self.update_t_macros()
 
@@ -209,7 +260,9 @@ class MmuGateMaps:
 # RUNOUT, ENDLESS SPOOL, TTG MAPPING and GATE HANDLING
 # -----------------------------------------------------------------------------------------------------------
 
-    def get_next_endless_spool_gate(self, tool, gate):
+    # exclude_gates lets a caller rule out gates it has already found wanting, whatever
+    # the map says about them.
+    def get_next_endless_spool_gate(self, tool, gate, exclude_gates=()):
         group = self.endless_spool_groups[gate]
         next_gate = -1
         checked_gates = []
@@ -217,7 +270,7 @@ class MmuGateMaps:
             check = (gate + i + 1) % self.num_gates
             if self.endless_spool_groups[check] == group:
                 checked_gates.append(check)
-                if self.gate_status[check] != GATE_EMPTY:
+                if check not in exclude_gates and self.gate_status[check] != GATE_EMPTY:
                     next_gate = check
                     break
         alt_gates = "(checked gates: %s)" % ",".join(map(str, checked_gates))
@@ -227,21 +280,28 @@ class MmuGateMaps:
 
     # Use mmu entry (and gear) sensors to "correct" gate status
     # Return updated gate_status adjusted by sensor readings
-    def validate_gate_status(self, gates=None):
+    #
+    # clear_attributes=False keeps the gate's material/color/temperature/spool_id when a
+    # sensor correction makes it EMPTY: an empty lane is not an ejected one, and a caller
+    # may be about to use those. reset_gate() is a real ejection and always clears.
+    def validate_gate_status(self, gates=None, clear_attributes=True):
         v_gate_status = list(self.gate_status) # Ensure that webhooks sees get_status() change
         gates = range(self.num_gates) if gates is None else gates
         for gate in gates:
             status = v_gate_status[gate]
             gear_detected = self.mmu.sensor_manager.check_gate_sensor(SENSOR_EXIT_PREFIX, gate)
             if gear_detected is True:
-                v_gate_status[gate] = GATE_AVAILABLE
+                # The sensor proves filament is present, not where it came from, so
+                # GATE_AVAILABLE_FROM_BUFFER must survive - it selects the buffer speed
+                # and accel for the load.
+                v_gate_status[gate] = max(status, GATE_AVAILABLE)
             else:
                 pre_detected = self.mmu.sensor_manager.check_gate_sensor(SENSOR_ENTRY_PREFIX, gate)
                 if pre_detected is True and status == GATE_EMPTY:
                     v_gate_status[gate] = GATE_UNKNOWN
                 elif pre_detected is False and status != GATE_EMPTY:
                     v_gate_status[gate] = GATE_EMPTY
-            if status != GATE_EMPTY and v_gate_status[gate] == GATE_EMPTY:
+            if clear_attributes and status != GATE_EMPTY and v_gate_status[gate] == GATE_EMPTY:
                 self.clear_gate_attributes(gate)
         self.gate_status = v_gate_status
 
@@ -300,18 +360,20 @@ class MmuGateMaps:
         self.persist_endless_spool()
 
 
-    def set_gate_status(self, gate, state):
+    # clear_attributes=False keeps spool identity when only a sensor reports the lane
+    # empty. The default clears, and unassigns the spool in Spoolman.
+    def set_gate_status(self, gate, state, clear_attributes=True):
         if 0 <= gate < self.num_gates:
             if state != self.gate_status[gate]:
                 self.gate_status = list(self.gate_status) # Ensure that webhooks sees get_status() change
-                if state == GATE_EMPTY:
+                if state == GATE_EMPTY and clear_attributes:
                     self.clear_gate_attributes(gate)
                 self.gate_status[gate] = state
                 if state == GATE_EMPTY:
                     self.update_gate_color_rgb()
                     self.persist_gate_map(
                         spoolman_sync=True,
-                        gate_ids=[(gate, -1)],
+                        gate_ids=[(gate, self.gate_spool_id[gate])],
                         changed_gate=gate
                     )
                     return
@@ -326,6 +388,7 @@ class MmuGateMaps:
         self.mmu.log_debug("Resetting gate map for gates: %s" % gates)
         self.renew_gate_map()
         for gate in gates:
+            self.gate_filament_changed(gate)
             self.gate_status[gate] = self.p.default_gate_status[gate]
         self.validate_gate_status(gates)
         # Applying defaults after status validation deliberately allows configured
@@ -347,6 +410,7 @@ class MmuGateMaps:
 
     def clear_gate_attributes(self, gate):
         """Clear filament metadata when a gate transitions to EMPTY."""
+        self.gate_filament_changed(gate)
         for _, attr, default in self._gate_map_vars:
             if attr != 'gate_status':
                 getattr(self, attr)[gate] = default
@@ -372,15 +436,37 @@ class MmuGateMaps:
     # Assign spool id to gate and clear from other gates returning list of changes
     def assign_spool_id(self, gate, spool_id):
         if self.gate_spool_id[gate] != spool_id:
+            self.gate_filament_changed(gate)
             self.gate_spool_rfid_aliases[gate] = tuple()
+            self.clear_spool_weight(gate)
         self.gate_spool_id[gate] = spool_id
         mod_gate_ids = [(gate, spool_id)]
         for i, sid in enumerate(self.gate_spool_id):
             if sid == spool_id and i != gate:
+                if sid > 0:
+                    self.gate_filament_changed(i)
+                    self.clear_spool_weight(i)
                 self.gate_spool_id[i] = -1
                 self.gate_spool_rfid_aliases[i] = tuple()
                 mod_gate_ids.append((i, -1))
         return mod_gate_ids
+
+
+    def clear_spool_weight(self, gate):
+        self.gate_remaining_weight[gate] = -1
+        self.gate_initial_weight[gate] = -1
+
+
+    def spool_fill_fraction(self, gate):
+        """
+        Fraction (0-1) of the spool's filament remaining, or None if the weights aren't known.
+        """
+        if not (0 <= gate < self.num_gates):
+            return None
+        remaining, initial = self.gate_remaining_weight[gate], self.gate_initial_weight[gate]
+        if remaining < 0 or initial <= 0:
+            return None
+        return min(remaining / float(initial), 1.)
 
 
     def set_gate_filament_from_tag(self, gate, name=None, material=None, vendor=None,
@@ -388,7 +474,7 @@ class MmuGateMaps:
         """
         Set per-gate filament attributes from a scanned NFC/RFID tag (local only;
         does NOT touch spool_id - a resolved Spoolman spool remains the source of
-        truth). Attributes passed as None are left unchanged. Validates/normalises
+        truth). Attributes passed as None are left unchanged. Validates/normalizes
         color, persists, and refreshes derived state (RGB/LEDs/t-macros).
         """
         if not (0 <= gate < self.num_gates):
@@ -409,6 +495,8 @@ class MmuGateMaps:
         if rfid is not None:
             rfid = self.normalize_gate_rfid(rfid)
             if rfid is not None:
+                if self.gate_spool_rfid[gate] != rfid:
+                    self.gate_filament_changed(gate)
                 self.gate_spool_rfid[gate] = rfid
         self.update_gate_color_rgb()
         self.persist_gate_map(spoolman_sync=False) # Local-only; nothing to push to Spoolman
@@ -432,6 +520,7 @@ class MmuGateMaps:
         if self.gate_spool_rfid[gate] == rfid:
             return
         self.renew_gate_map() # Ensure webhooks see get_status() change
+        self.gate_filament_changed(gate)
         self.gate_spool_rfid[gate] = rfid
         self.persist_gate_map(spoolman_sync=False) # Local-only; nothing to push to Spoolman
 
@@ -498,7 +587,9 @@ class MmuGateMaps:
 
     # Keep parallel RGB color map updated when color changes
     def update_gate_color_rgb(self):
-        # Recalculate RGB map for easy LED support
+        # Recalculate RGB map for easy LED support. A measured TD-1 color needs no
+        # cache of its own: it is adopted into gate_color when nothing else claims
+        # that field, so the LEDs see it through the ordinary 'filament_color' route
         self.gate_color_rgb = [MmuColorUtils.color_to_rgb_tuple(i) for i in self.gate_color]
 
 
@@ -633,7 +724,6 @@ class MmuGateMaps:
         """
         Format per-gate filament details into a readable summary.
         """
-        msg = "Gates / Filaments:" # String used to filter in KlipperScreen-HH
         available_status = {
             GATE_AVAILABLE_FROM_BUFFER: "Buffered",
             GATE_AVAILABLE: "On spool",
@@ -641,6 +731,7 @@ class MmuGateMaps:
             GATE_UNKNOWN: "Unknown"
         }
 
+        rows = []
         for g in range(self.num_gates):
             available = available_status[self.gate_status[g]]
             name = self.gate_filament_name[g] or "Unknown"
@@ -657,11 +748,10 @@ class MmuGateMaps:
             tools = ",".join("T{}".format(t) for t in range(self.num_gates) if self.ttg_map[t] == g)
             tools_fstr = (" [{}]".format(tools) if tools else "")
             gate_fstr = "{}".format(g).ljust(2, UI_SPACE)
-            gate_fstr = "{}({}){}:".format(gate_fstr, filament_char, tools_fstr).ljust(14 + len(filament_char), UI_SPACE)
+            gate_fstr = "{}({}){}:".format(gate_fstr, filament_char, tools_fstr)
 
             available_fstr = "{};".format(available).ljust(11, UI_SPACE)
-            material_fstr = material.ljust(5, UI_SPACE)
-            fil_fstr = "{} | {}{}C | {} | {}".format(material_fstr, temperature, UI_DEGREE, color, name)
+            temperature_fstr = "{}{}C".format(temperature, UI_DEGREE)
             rfid = (self.gate_spool_rfid[g] or "").upper()
             rfid_fstr = "({});".format(rfid).ljust(12, UI_SPACE) if rfid else ""
 
@@ -678,10 +768,39 @@ class MmuGateMaps:
             speed_fstr = " [Speed:{}%]".format(self.gate_speed_override[g]) if self.gate_speed_override[g] != 100 else ""
             extra_fstr = " [SELECTED]" if g == self.mmu.gate_selected else ""
             if details:
+                td = "{:.2f}".format(self.gate_td[g]) if self.gate_td[g] is not None else "none"
+                extra_fstr += " [TD: {} MEASURED COLOR: {}]".format(td, self.gate_td1_color[g] or "none")
                 rfids = ','.join(self.gate_spool_rfid_aliases[g]) or "none"
                 extra_fstr += " [RFIDS: {}]".format(rfids)
+                if self.gate_remaining_weight[g] >= 0:
+                    fraction = self.spool_fill_fraction(g)
+                    if fraction is not None:
+                        extra_fstr += " [WEIGHT: {}/{}g ({:.0f}%)]".format(self.gate_remaining_weight[g], self.gate_initial_weight[g], fraction * 100)
+                    else:
+                        extra_fstr += " [WEIGHT: {}g]".format(self.gate_remaining_weight[g])
 
-            msg += "\n{}{}{}{}{}{}".format(gate_fstr, available_fstr, spool_fstr, fil_fstr, speed_fstr, extra_fstr)
+            rows.append((gate_fstr, available_fstr, spool_fstr, material, temperature_fstr, color, name + speed_fstr + extra_fstr))
+
+        # Size columns from visible text: swatch color tokens occupy no console space.
+        def visible_length(value):
+            return len(re.sub(r"\{\{[^{}]*\}\}", "", value))
+
+        spool_header = "Spoolman" if self.p.spoolman_support != SPOOLMAN_OFF else ""
+        if any(self.gate_spool_rfid):
+            spool_header = "Spoolman / RFID" if spool_header else "RFID"
+        headers = ("Gate", "", spool_header, "Material", "", "Color", "Filament")
+        widths = [max([len(header)] + [visible_length(row[i]) for row in rows]) for i, header in enumerate(headers)]
+        widths[0] = max(widths[0] + 2, 17)
+        if spool_header:
+            widths[2] = max(widths[2], len(spool_header) + 2)
+
+        def format_row(row):
+            cells = [value + UI_SPACE * (widths[i] - visible_length(value)) for i, value in enumerate(row[:-1])]
+            return "{}{}{}{} | {} | {} | {}".format(*cells, row[-1])
+
+        msg = "Gates / Filaments:" # String used to filter in KlipperScreen-HH
+        msg += "\n" + format_row(headers)
+        msg += "".join("\n" + format_row(row) for row in rows)
         return msg
 
 
@@ -738,14 +857,18 @@ class MmuGateMaps:
                     if strategy == AUTOMAP_FILAMENT_NAME:
                         equal = self._compare_unicode(tool_to_remap[tool_field], gate_feature)
                     elif strategy == AUTOMAP_COLOR:
-                        equal = tool_to_remap[tool_field].upper().ljust(8,'F') == gate_feature.upper().ljust(8,'F')
+                        equal = (tool_to_remap[tool_field].upper().ljust(8,'F') == gate_feature.upper().ljust(8,'F')
+                                 and self._material_matches(tool_to_remap['material'], self.gate_material[gn]))
                     else:
                         equal = tool_to_remap[tool_field] == gate_feature
                     if equal:
                         remaps.append("T%s --> G%s (%s)" % (tool, gn, gate_feature))
                         self.mmu.wrap_gcode_command("MMU_TTG_MAP TOOL=%d GATE=%d QUIET=1" % (tool, gn))
                 if not remaps:
-                    errors.append("No gates found for tool %s with %s %s" % (tool, strategy_str, tool_to_remap[tool_field]))
+                    material_str = ""
+                    if strategy == AUTOMAP_COLOR and self._normalize_material(tool_to_remap['material']):
+                        material_str = " (material %s)" % tool_to_remap['material']
+                    errors.append("No gates found for tool %s with %s %s%s" % (tool, strategy_str, tool_to_remap[tool_field], material_str))
 
             # 'colors' search for closest
             elif strategy == AUTOMAP_CLOSEST_COLOR:
@@ -772,7 +895,7 @@ class MmuGateMaps:
                                 if distance > 0.5:
                                     warnings.append("Color matching is significantly different ! %s" % (UI_EMOTICONS[7] if t == 'emoticon' else ''))
                                 elif distance > 0.2:
-                                    warnings.append("Color matching might be noticebly different %s" % (UI_EMOTICONS[5] if t == 'emoticon' else ''))
+                                    warnings.append("Color matching might be noticeably different %s" % (UI_EMOTICONS[5] if t == 'emoticon' else ''))
                                 elif distance > 0.05:
                                     warnings.append("Color matching seems quite good %s" % (UI_EMOTICONS[3] if t == 'emoticon' else ''))
                                 elif distance > 0.02:
@@ -822,6 +945,25 @@ class MmuGateMaps:
         return a == b
 
 
+    # Unset material on either side ("" or slicer's "unknown") matches anything
+    def _normalize_material(self, material):
+        material = (material or "").strip().replace('#', '').lower()
+        return "" if material == "unknown" else material
+
+    def _material_matches(self, tool_material, gate_material):
+        tm = self._normalize_material(tool_material)
+        gm = self._normalize_material(gate_material)
+        return not tm or not gm or tm == gm
+
+    # Base material family is the leading name, e.g. "PLA Silk", "PLA-CF" and "PLA+" are all "pla"
+    def material_family(self, material):
+        return re.split(r"[\s\-+_/]", self._normalize_material(material), maxsplit=1)[0]
+
+    # Different families, or known to/from unknown, count as a change. Unknown to unknown doesn't
+    def is_material_change(self, from_material, to_material):
+        return self.material_family(from_material) != self.material_family(to_material)
+
+
     def restore_automap_option(self, skip=False):
         self.slicer_tool_map['skip_automap'] = skip
 
@@ -836,11 +978,15 @@ class MmuGateMaps:
         self.gate_filament_name = list(self.gate_filament_name)
         self.gate_material = list(self.gate_material)
         self.gate_vendor = list(self.gate_vendor)
+        self.gate_td = list(self.gate_td)
+        self.gate_td1_color = list(self.gate_td1_color)
         self.gate_color = list(self.gate_color)
         self.gate_temperature = list(self.gate_temperature)
         self.gate_spool_id = list(self.gate_spool_id)
         self.gate_speed_override = list(self.gate_speed_override)
         self.gate_spool_rfid = list(self.gate_spool_rfid)
+        self.gate_remaining_weight = list(self.gate_remaining_weight)
+        self.gate_initial_weight = list(self.gate_initial_weight)
 
 
     def get_status(self, eventtime):
@@ -855,11 +1001,15 @@ class MmuGateMaps:
             'gate_filament_name': self.gate_filament_name,
             'gate_material': self.gate_material,
             'gate_vendor': self.gate_vendor,
+            'gate_td': self.gate_td,
+            'gate_td1_color': self.gate_td1_color,
             'gate_color': self.gate_color,
             'gate_temperature': self.gate_temperature,
             'gate_spool_id': self.gate_spool_id,
             'gate_speed_override': self.gate_speed_override,
             'gate_spool_rfid': self.gate_spool_rfid,
+            'gate_remaining_weight': self.gate_remaining_weight,
+            'gate_initial_weight': self.gate_initial_weight,
             'gate_color_rgb': self.gate_color_rgb,
 
             'slicer_tool_map': self.slicer_tool_map,

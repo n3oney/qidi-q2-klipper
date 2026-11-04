@@ -1,5 +1,8 @@
 # Fake Klipper extras/respond.py - M118 / RESPOND. HH issues M118 as a console
 # fallback; recording is enough.
+#
+# RESPOND TYPE=command is sent as a raw '// ' line, as Klipper does, so output handlers (Happy Hare's
+# dialog, a web UI bridge) see host commands such as a UI's 'action:prompt_end'.
 
 
 class HostResponder:
@@ -18,6 +21,9 @@ class HostResponder:
     def cmd_RESPOND(self, gcmd):
         msg = gcmd.get('MSG', '')
         self.messages.append(msg)
+        if gcmd.get('TYPE', 'echo').lower() == 'command':
+            gcmd.respond_raw('// ' + msg)
+            return
         gcmd.respond_info(msg)
 
 

@@ -12,6 +12,7 @@
 # PARAM_ESPOOLER_MIN_STEPPER_SPEED
 # PARAM_ESPOOLER_SPEED_EXPONENT
 # PARAM_ESPOOLER_ASSIST_REDUCED_SPEED
+# PARAM_ESPOOLER_FULL_SPOOL_POWER
 # PARAM_ESPOOLER_PRINTING_POWER
 # PARAM_ESPOOLER_OPERATIONS
 # PARAM_ESPOOLER_ASSIST_EXTRUDER_MOVE_LENGTH
@@ -21,6 +22,12 @@
 # PARAM_ESPOOLER_ASSIST_BURST_TRIGGER_MAX
 # PARAM_ESPOOLER_REWIND_BURST_POWER
 # PARAM_ESPOOLER_REWIND_BURST_DURATION
+# PARAM_ESPOOLER_PWM
+# PARAM_ESPOOLER_HARDWARE_PWM
+# PARAM_ESPOOLER_CYCLE_TIME
+# PARAM_ESPOOLER_SCALE
+# PARAM_ESPOOLER_VALUE
+# PARAM_ESPOOLER_SHUTDOWN_VALUE
 #
 # Can be disabled and forced off with:
 #   select UNSELECT_MMU_HAS_ESPOOLER
@@ -92,12 +99,24 @@ if MMU_HAS_ESPOOLER
       help
         Control the % of the rewind speed that is applied to assisting load (want rewind to be faster)
 
+    config PARAM_ESPOOLER_FULL_SPOOL_POWER
+      int "Espooler full spool power        "
+      range 10 100
+      default 100
+      help
+        The % of normal rewind/assist power used on a full spool, rising
+        linearly to 100% as the spool empties (a full spool turns slower
+        for the same filament speed). 100 = disabled.
+        Needs the spool's remaining and full weight, from Spoolman or
+        'MMU_GATE_MAP GATE=.. WEIGHT=.. INITIAL_WEIGHT=..'
+
     config PARAM_ESPOOLER_PRINTING_POWER
       int "Espooler printing power          "
       range 0 100
       default 0
       help
-        If >0, fixes the % of PWM power while printing. 0=allows burst movement
+        0 enables in-print burst assist. If >0, in-print assist is off and this is only the
+        minimum % of PWM power used to assist a load
 
     config PARAM_ESPOOLER_OPERATIONS
       string "Espooler enabled operations      "
@@ -106,9 +125,8 @@ if MMU_HAS_ESPOOLER
       help
         Regardless of h/w you can enable/disable actions. E.g. remove 'print' to turn off operation while printing. Options:
           rewind - when filament is being unloaded under MMU control (aka respool)
-          assist - when filament is being loaded under MMU control (% of "rewind" speed but with minimum of "print" power)
-          print  - while printing. Generally set 'espooler_printing_power' to a low percentage just to
-                   allow motor to be turned freely or set to 0 to enable/allow "burst" assist movements
+          assist - when filament is being loaded under MMU control (% of "rewind" speed but with minimum of 'espooler_printing_power')
+          print  - in-print "burst" assist while filament is loaded. Requires 'espooler_printing_power: 0'
         If using a digitally controlled espooler motor (not PWM), then you should remove "print" and set
         'espooler_min_stepper_speed' to prevent "over movement"
 
@@ -122,7 +140,7 @@ if MMU_HAS_ESPOOLER
         This burst configuration is used to control the small rotation in the ASSIST direction
         optionally used when 'print' operation is enabled, 'espooler_printing_power: 0' and is
         triggered (tension switch or extruder movement). It can also be used to loosen filament with
-        'MMU_ESPOOLER COMMAND=assist BURST=1'.
+        'MMU_ESPOOLER OPERATION=assist BURST=1'.
 
         Distance (mm) extruder needs to move between each assist burst
 
@@ -152,6 +170,7 @@ if MMU_HAS_ESPOOLER
     config PARAM_ESPOOLER_ASSIST_BURST_TRIGGER_MAX
       prompt "Espooler assist burst trigger max"
       depends on PARAM_ESPOOLER_ASSIST_BURST_TRIGGER
+      keep_when_hidden
       help
         If trigger assist switch is fitted this limits the max number of back-to-back advances
 
@@ -166,7 +185,7 @@ if MMU_HAS_ESPOOLER
         This burst configuration is used to control the small rotation in the REWIND direction
         optionally used when running the filament drying cycle. The goal is to rotate the spool
         60-90 degrees. It can also be used to tighten the filament with
-        'MMU_ESPOOLER COMMAND=rewind BURST=1'.
+        'MMU_ESPOOLER OPERATION=rewind BURST=1'.
 
         The % power of the rewind burst move
 
@@ -176,6 +195,76 @@ if MMU_HAS_ESPOOLER
       help
         The duration of the rewind burst move in seconds
 
+    comment "_"
+    menu "Advanced"
+
+      config PARAM_ESPOOLER_PWM
+        boolint "PWM motor control?"
+        default 1
+        help
+          On (typical): the motor pins are PWM, so motor power follows gear
+          speed and the % power settings above.
+          Off: the pins are simply on (full power) or off. Then also remove
+          "print" from "Espooler enabled operations" and set "Espooler min
+          stepper speed" to avoid over-rotating the spool.
+
+      config PARAM_ESPOOLER_HARDWARE_PWM
+        boolint
+        prompt "Hardware PWM?" if PARAM_ESPOOLER_PWM
+        default 0
+        keep_when_hidden
+        help
+          Use the MCU's hardware PWM instead of software PWM. The motor pins
+          must support it, and the real cycle time may then differ from
+          "PWM cycle time". Software PWM (off) works on any pin.
+          See "hardware_pwm" in Klipper's [output_pin] documentation.
+
+      config PARAM_ESPOOLER_CYCLE_TIME
+        float
+        prompt "$(pad,29,PWM cycle time)" if PARAM_ESPOOLER_PWM
+        default 0.1
+        keep_when_hidden
+        help
+          The length of one PWM on/off cycle in seconds (0.1 = 10Hz).
+          Shorter gives smoother motor drive but more MCU load; with software
+          PWM Klipper recommends 0.01 or more.
+          See "cycle_time" in Klipper's [output_pin] documentation.
+
+      config PARAM_ESPOOLER_SCALE
+        float
+        prompt "$(pad,29,Scale)" if PARAM_ESPOOLER_PWM
+        default 1
+        keep_when_hidden
+        help
+          Motor power (0-100%) is divided by this to give the PWM duty.
+          1 = full range. 2 caps the motors at 50% duty, e.g. for a motor
+          rated below the supply voltage. Below 1 they reach full duty sooner.
+          "Value" and "Shutdown value" are given in the same units as Scale.
+
+      config PARAM_ESPOOLER_VALUE
+        float "$(pad,33,Value)"
+        default 0
+        help
+          The motor pin value Klipper sets at startup, before Happy Hare
+          drives the espooler (0 to "Scale"). 0 keeps the motors off, which
+          is almost always what you want.
+          Without PWM any value above 0 means on (full power).
+          See "value" in Klipper's [output_pin] documentation.
+
+      config PARAM_ESPOOLER_SHUTDOWN_VALUE
+        float "$(pad,33,Shutdown value)"
+        default 0
+        help
+          The motor pin value the MCU falls back to when Klipper shuts it
+          down, e.g. on an error or emergency stop. 0 stops the motors, which
+          is almost always what you want.
+          With software PWM it must be 0 or "Scale"; values in between need
+          hardware PWM (0 to "Scale").
+          Without PWM any value above 0 means on (full power).
+          See "shutdown_value" in Klipper's [output_pin] documentation.
+
+    endmenu
+
 # -------------------------------------
 # eSpooler pins
 # -------------------------------------
@@ -183,17 +272,29 @@ if MMU_HAS_ESPOOLER
     comment "_"
     comment "_eSpooler pins"
 
-    @repeat var=i min=0 max=11@
+    @repeat var=i min=0 max=$(max_gate)@
       if PARAM_NUM_GATES > $(i)
         comment "_" if $(i) > 0
         config PIN_ESPOOLER_EN_$(i)
           prompt "eSpooler enable $(i) pin " if HAS_ESPOOLER_ENABLE_PIN
+          validator "$(pin_validator)"
+          help
+            $(pin_help)
         config PIN_ESPOOLER_RWD_$(i)
           prompt "eSpooler rewind $(i) pin "
+          validator "$(pin_validator)"
+          help
+            $(pin_help)
         config PIN_ESPOOLER_FWD_$(i)
           prompt "eSpooler forward $(i) pin"
+          validator "$(pin_validator)"
+          help
+            $(pin_help)
         config PIN_ESPOOLER_TRIG_$(i)
           prompt "eSpooler trigger $(i) pin"
+          validator "$(pin_validator)"
+          help
+            $(pin_help)
       endif
     @endrepeat@
 

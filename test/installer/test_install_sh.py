@@ -1,11 +1,13 @@
 """Integration tests for install.sh recovery and v3 migration paths."""
 
 import os
+import re
 from pathlib import Path
 import shlex
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 
@@ -129,6 +131,28 @@ class TestInstallSh(unittest.TestCase):
         self.assertFalse((repo_dest / ".mmu_config.old").exists())
         self.assertEqual(list(config_home.glob("mmu.old-*")), [])
 
+    def test_recovery_discards_a_pending_unit_migration(self):
+        config_home = self.root / "printer_data" / "config"
+        current = config_home / "mmu"
+        repo_dest = self.root / "happy-hare"
+        self.make_mmu_config(current, ".mmu_config_unit0")
+        self.write(repo_dest / ".mmu_config.unit_migration", "{}\n")
+        self.write(repo_dest / ".mmu_config.MMU_UNITS.changes", "{}\n")
+
+        self.run_shell("""
+            SCRIPT_DIR={repo}
+            CONFIG_KLIPPER_CONFIG_HOME={config}
+            TESTDIR=
+            recover_last_config
+        """.format(
+            repo=shlex.quote(str(repo_dest)),
+            config=shlex.quote(str(config_home)),
+        ))
+
+        self.assertTrue((repo_dest / ".mmu_config_unit0").exists())
+        self.assertFalse((repo_dest / ".mmu_config.unit_migration").exists())
+        self.assertFalse((repo_dest / ".mmu_config.MMU_UNITS.changes").exists())
+
     def test_last_without_current_restores_newest_backup(self):
         config_home = self.root / "printer_data" / "config"
         older = config_home / "mmu.old-20260101-010203"
@@ -168,6 +192,8 @@ class TestInstallSh(unittest.TestCase):
             ".mmu_config.old",
             "newer-marker",
         )
+        # An old backup's config must still look older than the Kconfig files, so it's refreshed
+        os.utime(newer / ".mmu_config", (1000000000, 1000000000))
 
         result = self.run_shell("""
             SCRIPT_DIR={repo}
@@ -175,6 +201,7 @@ class TestInstallSh(unittest.TestCase):
             TESTDIR=
             recover_previous_config
             [ "$F_NO_MMU_BACKUP" = y ]
+            [ "$HH_RESTORED_FROM" = {config}/mmu.old-20260830-120000 ]
         """.format(
             repo=shlex.quote(str(repo_dest)),
             config=shlex.quote(str(config_home)),
@@ -194,6 +221,7 @@ class TestInstallSh(unittest.TestCase):
         self.assertFalse((current / "current-marker").exists())
         self.assertTrue((repo_dest / ".mmu_config_unit0").exists())
         self.assertFalse((repo_dest / ".mmu_config.old").exists())
+        self.assertEqual((repo_dest / ".mmu_config").stat().st_mtime, 1000000000)
 
         preserved = [
             path for path in config_home.glob("mmu.old-*")
@@ -295,6 +323,72 @@ class TestInstallSh(unittest.TestCase):
             "$(call backup,$(basename $@),$(F_NO_MMU_BACKUP))",
             MAKEFILE.read_text(encoding="utf-8"),
         )
+
+    def test_build_reads_the_baselines_of_a_custom_config_name(self):
+        base = self.root / "out" / "menuconfig_base"
+        for name in ("myprinter.cfg", "myprinter.cfg_unit0", "myprinter.cfg.pickle", ".mmu_config"):
+            self.write(base / name)
+        extra = self.write(self.root / "extra.mk", "print_baseline_pickles:\n\t@echo $(baseline_pickles)\n")
+        result = subprocess.run(
+            ["make", "--no-print-directory", "-s", "-f", "Makefile", "-f", str(extra), "print_baseline_pickles",
+             "KCONFIG_CONFIG={}".format(self.root / "myprinter.cfg"), "OUT={}".format(self.root / "out"),
+             "F_MENUCONFIG_BASELINE=y"],
+            cwd=REPO_ROOT, text=True, capture_output=True, check=True)
+        self.assertEqual(sorted(result.stdout.split()),
+                         [str(base / "myprinter.cfg.pickle"), str(base / "myprinter.cfg_unit0.pickle")])
+
+    def test_unit_config_is_stale_when_parent_config_is_newer(self):
+        # Future mtimes put both files after every Kconfig source, so only
+        # their order relative to each other decides.
+        now = time.time()
+        unit = self.write(self.root / ".mmu_config_unit0", "CONFIG_MULTI_UNIT=y\n")
+        parent = self.write(self.root / ".mmu_config", "CONFIG_MULTI_UNIT=y\n")
+
+        def needs_update(parent_mtime, *extra):
+            os.utime(unit, (now + 1000, now + 1000))
+            os.utime(parent, (parent_mtime, parent_mtime))
+            return subprocess.run(
+                # PY= as install.sh passes it; the recipe reads a python failure as "n"
+                ["make", "--no-print-directory", "-s", "kconfig_needs_update",
+                 "PY={}".format(sys.executable), "KCONFIG_CONFIG={}".format(unit), *extra],
+                cwd=REPO_ROOT, text=True, capture_output=True, check=True,
+            ).stdout.strip()
+
+        parent_arg = "KCONFIG_PARENT={}".format(parent)
+        self.assertEqual(needs_update(now + 2000, parent_arg), "y")
+        self.assertEqual(needs_update(now + 500, parent_arg), "n")
+        self.assertEqual(needs_update(now + 2000), "n")
+        self.assertIn('KCONFIG_PARENT="${KCONFIG_CONFIG}"',
+                      INSTALL_SH.read_text(encoding="utf-8"))
+
+    def test_sharing_unit_config_is_stale_when_its_owner_changed(self):
+        # The sharer is the newest file, so only the owner's values can make it stale
+        now = time.time()
+        parent = self.write(self.root / ".mmu_config",
+                            'CONFIG_MULTI_UNIT=y\nCONFIG_MMU_UNITS="unit0,unit1"\n')
+        self.write(self.root / ".mmu_config_unit0",
+                   "CONFIG_MMU_HAS_SYNC_FEEDBACK_BUFFER=y\n"
+                   "CONFIG_MMU_HAS_SENSOR_BUFFER_COMPRESSION=y\n")
+        sharer = self.root / ".mmu_config_unit1"
+
+        def needs_update(sharer_text):
+            self.write(sharer, "CONFIG_MMU_HAS_SYNC_FEEDBACK_BUFFER=y\n"
+                               "CONFIG_MMU_SHARED_SYNC_FEEDBACK_BUFFER=y\n"
+                               'CONFIG_PARAM_SYNC_FEEDBACK_BUFFER_NAME="unit0" #~DEFAULT~#\n'
+                               + sharer_text)
+            os.utime(parent, (now, now))
+            os.utime(sharer, (now + 1000, now + 1000))
+            return subprocess.run(
+                ["make", "--no-print-directory", "-s", "kconfig_needs_update",
+                 "PY={}".format(sys.executable),
+                 "KCONFIG_CONFIG={}".format(sharer), "KCONFIG_PARENT={}".format(parent)],
+                cwd=REPO_ROOT, text=True, capture_output=True, check=True,
+            ).stdout.strip()
+
+        self.assertEqual(needs_update(""), "y")
+        self.assertEqual(needs_update("CONFIG_MMU_HAS_SENSOR_BUFFER_COMPRESSION=y #~DEFAULT~#\n"), "n")
+        self.assertIn("# A unit sharing a component owned by a unit refreshed after it",
+                      INSTALL_SH.read_text(encoding="utf-8"))
 
     def test_git_is_isolated_from_developer_configuration(self):
         """Developer git configuration must not affect temporary repos."""
@@ -418,6 +512,16 @@ class TestInstallSh(unittest.TestCase):
         self.assertEqual((log_dir / "self-update").read_text().strip(), "v3")
         self.assertEqual((log_dir / "reexec").read_text().strip(), "v3:force:YES")
 
+    def test_v3_red_choice_drops_only_a_v3_branch(self):
+        for branch, expected in (("v3", ""), ("development", "development")):
+            with self.subTest(branch=branch):
+                result = self.run_shell("""
+                    export BRANCH={branch}
+                    offer_v3_v4_choice
+                    echo "BRANCH=${{BRANCH:-}}"
+                """.format(branch=branch), stdin="2\n")
+                self.assertIn("BRANCH=%s\n" % expected, result.stdout)
+
     def test_self_update_switches_before_checking_current_branch(self):
         remote = self.root / "remote.git"
         checkout = self.root / "checkout"
@@ -506,6 +610,291 @@ class TestInstallSh(unittest.TestCase):
         self.assertIn("[update_manager other]", moonraker)
         self.assertIn("[server]", moonraker)
         self.assertEqual(make_log.read_text().strip(), "F_NO_SERVICE=y fix_links")
+
+    # review_unit_changes() turns unit_migration check's exit status into go/no-go
+    def review_units(self, status, stdin="", **env):
+        result = self.run_shell("""
+            unit_migration() {{ return {status}; }}
+            if review_unit_changes; then echo RESULT=go; else echo RESULT=stop; fi
+            echo "RESTRUCTURED=${{F_UNITS_RESTRUCTURED:-}}"
+        """.format(status=status), stdin=stdin, env=env)
+        return result.stdout
+
+    # prepare_refresh() has every Kconfig file report (saving its baseline), shows the reports
+    # once and asks once, then on yes has every file apply; the build then uses the baselines
+    def prepare_refresh(self, show_status=10, stdin="", **env):
+        show = self.write(self.root / "fake-python", "#!/bin/sh\necho \"SHOW $*\"\nexit {}\n".format(show_status))
+        show.chmod(0o755)
+        result = self.run_shell("""
+            run_make() { echo "MAKE $*"; }
+            run_kconfig_top() { echo "TOP $1 apply=${HH_IMPORT_APPLY:-} home=${HH_CONFIG_HOME:-}"; }
+            run_kconfig_units() { echo "UNITS $1 apply=${HH_IMPORT_APPLY:-}"; }
+            CONFIG_KLIPPER_CONFIG_HOME=/printer/config
+            INSTALLER_PY=%s
+            status=0
+            ( prepare_refresh
+              echo "AFTER report=${HH_IMPORT_REPORT:-} home=${HH_CONFIG_HOME:-} baseline=${F_MENUCONFIG_BASELINE:-}" ) \
+                || status=$?
+            echo "STATUS=$status"
+        """ % shlex.quote(str(show)), stdin=stdin, env=env)
+        return result.stdout
+
+    def test_refresh_reports_shows_once_and_applies(self):
+        out = self.prepare_refresh(stdin="y\n", F_CFG_UPGRADE_MODE="refresh")
+        self.assertIn("MAKE kconfig_baseline_clean", out)
+        self.assertIn("TOP kconfig_import apply= home=/printer/config", out)
+        self.assertIn("UNITS kconfig_import apply=\n", out)
+        self.assertEqual(out.count("SHOW "), 1)
+        self.assertEqual(out.count("Import these .cfg values into menuconfig (y/n)?"), 1)
+        self.assertIn("TOP kconfig_import apply=y", out)
+        self.assertIn("UNITS kconfig_import apply=y", out)
+        self.assertIn("AFTER report= home= baseline=y\n", out)
+        self.assertIn("STATUS=0", out)
+
+    def test_refresh_says_what_it_is_doing_until_menuconfig_opens(self):
+        out = self.prepare_refresh(stdin="y\n", F_CFG_UPGRADE_MODE="refresh")
+        order = [out.index(text) for text in (
+            "Checking your .cfg files for values to import into menuconfig...\n",
+            "TOP kconfig_import apply= ",
+            "Importing them into menuconfig...\n",
+            "TOP kconfig_import apply=y ",
+            "UNITS kconfig_import apply=y",
+            "Opening menuconfig...\n")]
+        self.assertEqual(order, sorted(order))
+
+    def test_refresh_declined_continues_without_importing(self):
+        out = self.prepare_refresh(stdin="n\n", F_CFG_UPGRADE_MODE="refresh")
+        self.assertIn("Not imported", out)
+        self.assertNotIn("apply=y", out)
+        self.assertIn("baseline=y", out)
+        self.assertIn("STATUS=0", out)
+
+    def test_refresh_with_nothing_to_import_asks_nothing(self):
+        out = self.prepare_refresh(show_status=0, F_CFG_UPGRADE_MODE="refresh")
+        self.assertNotIn("Import these", out)
+        self.assertNotIn("apply=y", out)
+        self.assertIn("baseline=y", out)
+
+    def test_refresh_yes_flag_imports(self):
+        out = self.prepare_refresh(F_CFG_UPGRADE_MODE="refresh", F_YES="y")
+        self.assertIn("Import these .cfg values into menuconfig (y/n)? y", out)
+        self.assertIn("UNITS kconfig_import apply=y", out)
+
+    def test_merge_is_refresh(self):
+        self.assertIn("apply=y", self.prepare_refresh(stdin="y\n", F_CFG_UPGRADE_MODE="merge"))
+
+    def test_replace_skips_the_import_and_baselines(self):
+        out = self.prepare_refresh(F_CFG_UPGRADE_MODE="replace")
+        self.assertNotIn("kconfig_import", out)
+        self.assertNotIn("kconfig_baseline_clean", out)
+        self.assertIn("baseline=\n", out)
+
+    def test_unit_review_no_change_and_append_go_without_asking(self):
+        for status in (0, 10):
+            with self.subTest(status=status):
+                out = self.review_units(status)
+                self.assertIn("RESULT=go", out)
+                self.assertNotIn("(y/n)", out)
+
+    def test_unit_review_unrecorded_change_stops_without_losing_baseline(self):
+        result = self.run_shell("""
+            unit_migration() { return 12; }
+            F_UNITS_BASELINE=a,b
+            review_unit_changes && echo RESULT=go || echo RESULT=stop
+            echo "BASELINE=${F_UNITS_BASELINE}"
+        """)
+        self.assertIn("RESULT=stop", result.stdout)
+        self.assertIn("BASELINE=a,b", result.stdout)
+
+    def test_unit_review_errors_stop_without_losing_baseline(self):
+        for status in (3, 1, 127):
+            with self.subTest(status=status):
+                result = self.run_shell("""
+                    unit_migration() {{ return {status}; }}
+                    F_UNITS_BASELINE=a,b
+                    review_unit_changes && echo RESULT=go || echo RESULT=stop
+                    echo "BASELINE=${{F_UNITS_BASELINE}}"
+                """.format(status=status))
+                self.assertIn("RESULT=stop", result.stdout)
+                self.assertIn("BASELINE=a,b", result.stdout)
+
+    def test_failed_history_verification_stops_make_before_restart(self):
+        command = next(line for line in MAKEFILE.read_text().splitlines()
+                       if '-m installer.unit_migration apply ' in line)
+        fail = self.write(self.root / 'fail-python', '#!/bin/sh\nexit 3\n')
+        fail.chmod(0o755)
+        recipe = self.write(self.root / 'Makefile',
+                            'PY := %s\ninstall:\n%s\n\t@echo RESTART\n' % (fail, command))
+        # Override the outer test runner's command-line PY, inherited via MAKEFLAGS.
+        result = subprocess.run(['make', '-f', str(recipe), 'PY=' + str(fail), 'install'],
+                                text=True, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn('RESTART', result.stdout)
+
+    def test_baseline_is_captured_from_the_migration(self):
+        result = self.run_shell("""
+            unit_migration() { echo "a,b"; }
+            unset F_UNITS_RESTRUCTURE F_CFG_UPGRADE_MODE
+            capture_units_baseline
+            echo "BASELINE=[${F_UNITS_BASELINE}]"
+            echo "RESTRUCTURE=${F_UNITS_RESTRUCTURE:-n}"
+        """)
+        self.assertIn("BASELINE=[a,b]", result.stdout)
+        self.assertIn("RESTRUCTURE=n", result.stdout)
+
+    def test_a_failed_baseline_stops_before_menuconfig(self):
+        # An empty baseline would otherwise look like a first install
+        for mode in ("refresh", "replace"):
+            with self.subTest(mode=mode):
+                result = self.run_shell("""
+                    set -e
+                    unit_migration() {{ return 3; }}
+                    unset F_UNITS_RESTRUCTURE
+                    F_CFG_UPGRADE_MODE={mode}
+                    capture_units_baseline && echo RESULT=go || echo RESULT=stop
+                    echo "BASELINE=[${{F_UNITS_BASELINE}}]"
+                    echo "RESTRUCTURE=${{F_UNITS_RESTRUCTURE:-n}}"
+                """.format(mode=mode))
+                self.assertIn("RESULT=stop", result.stdout)
+                self.assertIn("RESTRUCTURE=n", result.stdout)
+
+    def test_unit_migration_step_failure_stops_before_install(self):
+        for step in ('kconfig', 'prepare'):
+            result = self.run_shell("""
+                unit_migration() {{ return 1; }}
+                unit_migration_step {step} && echo RESULT=go || echo RESULT=stop
+            """.format(step=step))
+            self.assertIn("RESULT=stop", result.stdout)
+            self.assertNotIn("continuing without it", result.stdout)
+
+    def test_units_can_be_restructured_in_replace_mode_or_before_anything_exists(self):
+        result = self.run_shell("""
+            check() {
+                unset F_UNITS_RESTRUCTURE
+                F_CFG_UPGRADE_MODE=$1 F_UNITS_BASELINE=$2
+                set_units_restructure
+                echo "$1/$2=${F_UNITS_RESTRUCTURE:-n}"
+            }
+            check refresh unit0
+            check replace unit0
+            check refresh ""
+            check "" ""
+        """)
+        self.assertIn("refresh/unit0=n", result.stdout)
+        self.assertIn("replace/unit0=y", result.stdout)
+        self.assertIn("refresh/=y", result.stdout)
+        self.assertIn("/=y", result.stdout.splitlines()[-1])
+
+    def test_max_gates_below_the_default_is_refused(self):
+        values = ("", "abc", "0", "1", "4", "11", "012", "-12", "12", "16", "24")
+        result = self.run_shell("\n".join(
+            'valid_max_gates {v} && echo "OK=[{l}]" || echo "NO=[{l}]"'.format(v=shlex.quote(v), l=v)
+            for v in values))
+        self.assertEqual([line for line in result.stdout.split() if line.startswith("OK=")],
+                         ["OK=[12]", "OK=[16]", "OK=[24]"])
+
+    def test_max_gates_is_read_back_and_compared(self):
+        saved = shlex.quote(str(self.write(self.root / ".mmu_config", "CONFIG_MAX_GATES=24\n")))
+        unsaved = shlex.quote(str(self.write(self.root / ".mmu_config_old", "CONFIG_SENTINEL=y\n")))
+        result = self.run_shell("\n".join((
+            "unset F_MAX_GATES",
+            'echo "SAVED=[$(saved_max_gates {s})] [$(saved_max_gates {u})]"',
+            "max_gates_changed {s} && echo unset-changed",
+            "F_MAX_GATES=24; max_gates_changed {s} || echo same",
+            "F_MAX_GATES=16; max_gates_changed {s} && echo lowered",
+            "max_gates_changed {u} && echo unsaved",
+        )).format(s=saved, u=unsaved))
+        self.assertIn("SAVED=[24] []", result.stdout)
+        self.assertNotIn("unset-changed", result.stdout)
+        for line in ("same", "lowered", "unsaved"):
+            self.assertIn(line, result.stdout.split())
+
+    def test_single_unit_name(self):
+        cases = {
+            "no config": (None, "unit0"),
+            "single": ('CONFIG_UNIT_NAME="box"\n', "box"),
+            "multi unit": ('CONFIG_MULTI_UNIT=y\nCONFIG_UNIT_NAME="box"\n', ""),
+        }
+        for label, (text, expected) in cases.items():
+            with self.subTest(label):
+                kconfig = self.root / ".mmu_config"
+                if text is None:
+                    kconfig.unlink(missing_ok=True)
+                else:
+                    self.write(kconfig, text)
+                result = self.run_shell("KCONFIG_CONFIG={k}; echo \"NAME=[$(single_unit_name)]\""
+                                        .format(k=shlex.quote(str(kconfig))))
+                self.assertIn("NAME=[%s]" % expected, result.stdout)
+
+    def test_single_unit_renamed(self):
+        cases = {
+            "single, renamed": ('CONFIG_UNIT_NAME="box"\nCONFIG_MCU_NAME="unit0"\n', "", "yes"),
+            "single, unchanged": ('CONFIG_UNIT_NAME="unit0"\nCONFIG_MCU_NAME="unit0"\n', "", "no"),
+            # menuconfig re-parsed after the rename, so MCU_NAME already follows it
+            "single, renamed and re-parsed": ('CONFIG_UNIT_NAME="box"\nCONFIG_MCU_NAME="box"\n', "unit0", "yes"),
+            "single, re-parsed but unchanged": ('CONFIG_UNIT_NAME="box"\nCONFIG_MCU_NAME="box"\n', "box", "no"),
+            "multi unit": ('CONFIG_MULTI_UNIT=y\nCONFIG_UNIT_NAME="box"\n', "unit0", "no"),
+        }
+        for label, (text, before, expected) in cases.items():
+            with self.subTest(label):
+                kconfig = self.write(self.root / ".mmu_config", text)
+                result = self.run_shell("""
+                    KCONFIG_CONFIG={k}
+                    F_UNIT_NAME_BEFORE={before}
+                    if single_unit_renamed; then echo RESULT=yes; else echo RESULT=no; fi
+                    echo "LEAK=${{CONFIG_UNIT_NAME:-}}"
+                """.format(k=shlex.quote(str(kconfig)), before=shlex.quote(before)))
+                self.assertIn("RESULT=" + expected, result.stdout)
+                self.assertIn("LEAK=\n", result.stdout)
+
+    def test_single_unit_name_steers_the_makefile(self):
+        cases = {
+            'CONFIG_UNIT_NAME="box"\n': "box",
+            'CONFIG_UNIT_NAME="unit0"\n': "unit0",
+            "": "unit0",
+            'CONFIG_MULTI_UNIT=y\nCONFIG_MMU_UNITS="a,b"\nCONFIG_UNIT_NAME="box"\n': "a b",
+        }
+        for text, expected in cases.items():
+            with self.subTest(text):
+                kconfig = self.write(self.root / ".mmu_config", text)
+                # As install.sh runs it: nothing else naming the unit (make test exports one)
+                env = {k: v for k, v in os.environ.items()
+                       if k not in ("UNIT_NAME", "MCU_NAME", "UNIT_INDEX", "KCONFIG_CONFIG")}
+                out = subprocess.run(
+                    ["make", "--no-print-directory", "-s", "variables",
+                     "KCONFIG_CONFIG={}".format(kconfig)],
+                    cwd=REPO_ROOT, env=env, text=True, capture_output=True).stdout
+                line = [l for l in out.splitlines() if "unit_names" in l][0]
+                self.assertEqual(re.sub(r"\x1b[^m]*m|\x1b\(B", "", line).split("=", 1)[1].strip(),
+                                 expected)
+
+    def test_unit_review_refused_change_stops(self):
+        self.assertIn("RESULT=stop", self.review_units(2))
+
+    def test_unit_review_structural_change_is_confirmed(self):
+        out = self.review_units(11, stdin="y\n")
+        self.assertIn("RESULT=go", out)
+        self.assertIn("RESTRUCTURED=y", out)
+        self.assertIn("RESTRUCTURED=\n", self.review_units(10))
+        self.assertIn("RESULT=stop", self.review_units(11, stdin="n\n"))
+
+    def test_unit_review_skipped_restarts_only_confirms_unit_changes(self):
+        out = self.review_units(11, stdin="y\n", F_NO_SERVICE="y")
+        self.assertNotIn("Is it stopped", out)
+        self.assertIn("Apply these unit changes", out)
+        self.assertIn("RESULT=go", out)
+        self.assertIn("RESULT=stop", self.review_units(11, stdin="n\n", F_NO_SERVICE="y"))
+
+    def test_unit_migration_runs_from_the_repo(self):
+        kconfig = self.write(self.root / ".mmu_config",
+                             'CONFIG_MULTI_UNIT=y\nCONFIG_MMU_UNITS="a,b"\n')
+        result = self.run_shell("""
+            SCRIPT_DIR={repo}
+            KCONFIG_CONFIG={kconfig}
+            unit_migration baseline
+        """.format(repo=shlex.quote(str(REPO_ROOT)), kconfig=shlex.quote(str(kconfig))),
+            env={"INSTALLER_PY": sys.executable})
+        self.assertEqual(result.stdout.strip(), "a,b")
 
 
 if __name__ == "__main__":

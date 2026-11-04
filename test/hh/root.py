@@ -26,13 +26,14 @@ FAKE_SRC    = os.path.join(HARNESS_DIR, 'klippy_root')
 REPO_ROOT   = os.path.dirname(os.path.dirname(HARNESS_DIR))
 
 # Must stay in lockstep with Makefile:114 `hh_klipper_extras_files`. Each pattern
-# is asserted non-empty so a repo reorganisation fails loudly here rather than
+# is asserted non-empty so a repo reorganization fails loudly here rather than
 # silently shipping a partial overlay.
 HH_GLOBS = (
     'extras/*.py',
     'extras/mmu/*.py',
     'extras/mmu/unit/*.py',
     'extras/mmu/unit/nfc/*.py',
+    'extras/mmu/unit/td1/*.py',
     'extras/mmu/unit/selectors/*.py',
     'extras/mmu/commands/*.py',
 )
@@ -84,8 +85,9 @@ def build_overlay():
     # matching sys.path entry, so without this file `extras.__path__` would become
     # [<tmp>/klippy/extras, <repo>/extras] and which copy wins would depend on
     # sys.path order. An __init__.py terminates the merge. HH's own subpackages
-    # (extras/mmu, extras/mmu/unit) stay namespace portions beneath it, which is
-    # exactly what they are on a real install too.
+    # (extras/mmu, extras/mmu/unit) ship their own __init__.py - regular packages
+    # here and on a real install alike (test_extras_subpackages_are_regular_packages
+    # in test_mmu_import.py).
     init = os.path.join(klippy, 'extras', '__init__.py')
     if not os.path.exists(init):
         with open(init, 'w') as f:

@@ -15,10 +15,19 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
+import collections
 import mcu as mcu_mod
+
+Coord = collections.namedtuple('Coord', ('x', 'y', 'z', 'e'))
 
 
 class DummyKinematics:
+    # No `limits` attribute by default, like a kinematics without box limits (delta),
+    # so nothing range-checks. set_limits() gives it cartesian-style limits, and the
+    # toolhead then rejects out-of-range moves the way cartesian._check_endstops does.
+    axes_min = Coord(0., 0., 0., 0.)
+    axes_max = Coord(200., 200., 200., 0.)
+
     def get_steppers(self):
         return []
 
@@ -28,9 +37,33 @@ class DummyKinematics:
     def check_move(self, move):
         pass
 
+    def set_limits(self, mins, maxs):
+        self.axes_min = Coord(*(list(mins) + [0.]))
+        self.axes_max = Coord(*(list(maxs) + [0.]))
+        self.limits = [(lo, hi) for lo, hi in zip(mins, maxs)]
+
+    def check_limits(self, oldpos, newpos):
+        for i in (0, 1, 2):
+            lo, hi = self.limits[i]
+            if newpos[i] != oldpos[i] and (newpos[i] < lo or newpos[i] > hi):
+                if lo > hi:
+                    return "Must home axis first: %.3f %.3f %.3f [%.3f]" % tuple(newpos[:4])
+                return "Move out of range: %.3f %.3f %.3f [%.3f]" % tuple(newpos[:4])
+        return None
+
     def get_status(self, eventtime):
-        return {'homed_axes': 'xyz', 'axis_minimum': (0., 0., 0., 0.),
-                'axis_maximum': (200., 200., 200., 0.)}
+        return {'homed_axes': 'xyz', 'axis_minimum': self.axes_min,
+                'axis_maximum': self.axes_max}
+
+
+def _register_step_generator(self, handler):
+    self.step_generators.append(handler)
+
+
+def _unregister_step_generator(self, handler):
+    # Mirrors the old toolhead (kalico/klippy/toolhead.py:817-819)
+    if handler in self.step_generators:
+        self.step_generators.remove(handler)
 
 
 class ToolHead:
@@ -45,7 +78,18 @@ class ToolHead:
         self.extra_axes = []
         self.extruder = None
         self.kin = DummyKinematics()
-        self.step_generators = []
+        # The pre-motion_queuing generation (real old Klipper / Kalico)
+        # exposes the step-generator list on the toolhead; newer generations
+        # have no such API at all. MmuStepper selects on exactly that
+        # capability, so the fake must mirror each generation.
+        if 'motion_queuing' in getattr(self.printer, 'harness_missing_modules', ()):
+            self.step_generators = []
+            # Per-instance so that the new-generation toolhead exposes none
+            # of this API at all, exactly like the real one.
+            self.register_step_generator = _register_step_generator.__get__(
+                self, ToolHead)
+            self.unregister_step_generator = _unregister_step_generator.__get__(
+                self, ToolHead)
         self.lookahead_callbacks = []
         # -- assertion surfaces -------------------------------------------
         self.moves = []             # [(newpos, speed)] every commanded move
@@ -56,6 +100,9 @@ class ToolHead:
         # (klippy/toolhead.py:292). `homing` in particular is looked up rather than
         # loaded by HH (extras/mmu_stepper.py:883), so it has to exist by now. The
         # ones the harness does not fake are loaded with a None default and skipped.
+        gcode = self.printer.lookup_object('gcode')
+        gcode.register_command('G4', self.cmd_G4)
+        gcode.register_command('M400', self.cmd_M400)
         for module_name in ('gcode_move', 'homing', 'idle_timeout', 'statistics',
                             'manual_probe', 'tuning_tower', 'garbage_collection'):
             self.printer.load_object(config, module_name, None)
@@ -79,9 +126,6 @@ class ToolHead:
         self.lookahead_callbacks.append(callback)
         callback(self._print_time())
 
-    def register_step_generator(self, handler):
-        self.step_generators.append(handler)
-
     def note_step_generation_scan_time(self, delay, old_delay=0.):
         pass
 
@@ -93,6 +137,10 @@ class ToolHead:
         self.commanded_pos = list(newpos)
 
     def move(self, newpos, speed):
+        if getattr(self.kin, 'limits', None) is not None:
+            err = self.kin.check_limits(self.commanded_pos, newpos)
+            if err:
+                raise self.printer.command_error(err)
         self.moves.append((list(newpos), speed))
         old_extruder_pos = self.commanded_pos[3]
         self.commanded_pos = list(newpos)
@@ -115,6 +163,14 @@ class ToolHead:
 
     def wait_moves(self):
         self.waits += 1
+
+    def cmd_G4(self, gcmd):
+        # Recorded, not waited: the virtual clock only moves when the harness advances it
+        delay = gcmd.get_float('P', 0., minval=0.) / 1000.
+        self.dwell(delay)
+
+    def cmd_M400(self, gcmd):
+        self.wait_moves()
 
     def drip_move(self, newpos, speed, drip_completion):
         self.move(newpos, speed)
@@ -164,6 +220,8 @@ class ToolHead:
             'minimum_cruise_ratio': 0.5,
             'square_corner_velocity': 5.,
             'homed_axes': 'xyz',
+            'axis_minimum': self.kin.axes_min,
+            'axis_maximum': self.kin.axes_max,
         }
 
     def stats(self, eventtime):

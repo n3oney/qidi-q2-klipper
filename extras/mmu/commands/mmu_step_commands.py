@@ -54,7 +54,7 @@ class MmuStepLoadGateCommand(BaseCommand):
             with mmu.wrap_sync_gear_to_extruder():
                 mmu._load_gate()
         except MmuError as ee:
-            mmu.handle_mmu_error("_MMU_STEP_LOAD_GATE: %s" % str(ee))
+            mmu.handle_mmu_error(ee.with_message("_MMU_STEP_LOAD_GATE: %s" % str(ee)))
 
 
 class MmuStepUnloadGateCommand(BaseCommand):
@@ -79,11 +79,12 @@ class MmuStepUnloadGateCommand(BaseCommand):
         mmu = self.mmu
 
         full = bool(gcmd.get_int('FULL', 0, minval=0, maxval=1))
+        homing_buffer, mmu.step_unload_homing_buffer = mmu.step_unload_homing_buffer, 0.
         try:
             with mmu.wrap_sync_gear_to_extruder():
-                mmu._unload_gate(extra_homing=None if full else 0.)
+                mmu._unload_gate(extra_homing=None if full else homing_buffer)
         except MmuError as ee:
-            mmu.handle_mmu_error("_MMU_STEP_UNLOAD_GATE: %s" % str(ee))
+            mmu.handle_mmu_error(ee.with_message("_MMU_STEP_UNLOAD_GATE: %s" % str(ee)))
 
 
 class MmuStepLoadBowdenCommand(BaseCommand):
@@ -114,7 +115,7 @@ class MmuStepLoadBowdenCommand(BaseCommand):
             with mmu.wrap_sync_gear_to_extruder():
                 mmu._load_bowden(length, start_pos=start_pos)
         except MmuError as ee:
-            mmu.handle_mmu_error("_MMU_STEP_LOAD_BOWDEN: %s" % str(ee))
+            mmu.handle_mmu_error(ee.with_message("_MMU_STEP_LOAD_BOWDEN: %s" % str(ee)))
 
 
 class MmuStepUnloadBowdenCommand(BaseCommand):
@@ -138,12 +139,13 @@ class MmuStepUnloadBowdenCommand(BaseCommand):
     def _run(self, gcmd):
         mmu = self.mmu
 
-        length = gcmd.get_float('LENGTH', mmu._get_bowden_length(mmu.gate_selected))
+        length = gcmd.get_float('LENGTH', None, minval=0.)
+        start_pos, mmu.step_unload_overshoot = mmu.step_unload_overshoot, 0.
         try:
             with mmu.wrap_sync_gear_to_extruder():
-                mmu._unload_bowden(length)
+                _, mmu.step_unload_homing_buffer = mmu._unload_bowden(length, start_pos=start_pos)
         except MmuError as ee:
-            mmu.handle_mmu_error("_MMU_STEP_UNLOAD_BOWDEN: %s" % str(ee))
+            mmu.handle_mmu_error(ee.with_message("_MMU_STEP_UNLOAD_BOWDEN: %s" % str(ee)))
 
 
 class MmuStepHomeExtruderCommand(BaseCommand):
@@ -169,7 +171,7 @@ class MmuStepHomeExtruderCommand(BaseCommand):
             with mmu.wrap_sync_gear_to_extruder():
                 mmu._home_to_extruder(mmu.mmu_unit().p.extruder_homing_max)
         except MmuError as ee:
-            mmu.handle_mmu_error("_MMU_STEP_HOME_EXTRUDER: %s" % str(ee))
+            mmu.handle_mmu_error(ee.with_message("_MMU_STEP_HOME_EXTRUDER: %s" % str(ee)))
 
 
 class MmuStepLoadToolheadCommand(BaseCommand):
@@ -198,7 +200,7 @@ class MmuStepLoadToolheadCommand(BaseCommand):
             with mmu.wrap_sync_gear_to_extruder():
                 mmu._load_extruder(extruder_only)
         except MmuError as ee:
-            mmu.handle_mmu_error("_MMU_STEP_LOAD_TOOLHEAD: %s" % str(ee))
+            mmu.handle_mmu_error(ee.with_message("_MMU_STEP_LOAD_TOOLHEAD: %s" % str(ee)))
 
 
 class MmuStepUnloadToolheadCommand(BaseCommand):
@@ -209,6 +211,7 @@ class MmuStepUnloadToolheadCommand(BaseCommand):
         f"{CMD}: {HELP_BRIEF}\n"
         + "EXTRUDER_ONLY   = [0|1] Extruder only unload (e.g. when in bypass)\n"
         + "PARK_POS        = mm    The starting position of the filament in extruder (after tip forming / retraction)\n"
+        + "CUT_FRAGMENT    = mm    Length cut off by tip cutting, used to detect a missed cut (default: current unload's)\n"
     )
     HELP_SUPPLEMENT = (
         "Examples:\n"
@@ -226,6 +229,7 @@ class MmuStepUnloadToolheadCommand(BaseCommand):
 
         extruder_only = bool(gcmd.get_int('EXTRUDER_ONLY', 0))
         park_pos = gcmd.get_float('PARK_POS', -mmu.drive().get_filament_position())
+        cut_fragment = gcmd.get_float('CUT_FRAGMENT', mmu.unload_cut_fragment, minval=0.)
         try:
             with mmu.wrap_sync_gear_to_extruder():
                 park_pos = min(
@@ -233,9 +237,9 @@ class MmuStepUnloadToolheadCommand(BaseCommand):
                     max(0, park_pos)
                 )
                 mmu.drive().set_filament_position(-park_pos)
-                mmu._unload_extruder(extruder_only=extruder_only)
+                _, mmu.step_unload_overshoot, _ = mmu._unload_extruder(extruder_only=extruder_only, cut_fragment=cut_fragment)
         except MmuError as ee:
-            mmu.handle_mmu_error("_MMU_STEP_UNLOAD_TOOLHEAD: %s" % str(ee))
+            mmu.handle_mmu_error(ee.with_message("_MMU_STEP_UNLOAD_TOOLHEAD: %s" % str(ee)))
 
 
 class MmuStepHomingMoveCommand(MoveMixin, BaseCommand):
@@ -268,7 +272,7 @@ class MmuStepHomingMoveCommand(MoveMixin, BaseCommand):
                     allow_bypass=allow_bypass
                 )
         except MmuError as ee:
-            mmu.handle_mmu_error("_MMU_STEP_HOMING_MOVE: %s" % str(ee))
+            mmu.handle_mmu_error(ee.with_message("_MMU_STEP_HOMING_MOVE: %s" % str(ee)))
 
 
 class MmuStepMoveCommand(MoveMixin, BaseCommand):
@@ -301,7 +305,7 @@ class MmuStepMoveCommand(MoveMixin, BaseCommand):
                     allow_bypass=allow_bypass
                 )
         except MmuError as ee:
-            mmu.handle_mmu_error("_MMU_STEP_MOVE: %s" % str(ee))
+            mmu.handle_mmu_error(ee.with_message("_MMU_STEP_MOVE: %s" % str(ee)))
 
 
 class MmuStepSetFilamentCommand(BaseCommand):

@@ -286,6 +286,12 @@ class TestLoadAndUnload(EncoderTestCase):
         self.assertGreater(self.encoder.get_distance(),
                            self.fil.layout['extruder_entry'] / 2)
 
+    def test_small_extrusion_moves_add_up_on_the_encoder(self):
+        self.hh.run_gcode('MMU_CHANGE_TOOL TOOL=0')
+        self.encoder.reset_counts()
+        self.hh.run_gcode('M83\n' + 'G1 E0.1 F300\n' * 100)
+        self.assertAlmostEqual(self.encoder.get_distance(), 10., delta=self.encoder.resolution)
+
     def test_the_gate_keeps_normal_buffered_availability_after_a_round_trip(self):
         self.hh.run_gcode('MMU_CHANGE_TOOL TOOL=0')
         self.hh.run_gcode('MMU_UNLOAD')
@@ -399,7 +405,7 @@ class TestClogDetectionLength(EncoderTestCase):
     def test_effective_length_ignores_the_calibration_in_static_mode(self):
         """
         Static mode never consults the calibrated length, so reporting one would describe
-        behaviour the machine is not going to exhibit.
+        behavior the machine is not going to exhibit.
         """
         self.hh.run_gcode('MMU_TEST_CONFIG flowguard_encoder_mode=1')
         self.calibrator.update_clog_detection_length(30.0, push=True)
@@ -577,6 +583,133 @@ class TestExtruderMonitorRebase(EncoderTestCase):
         monitor._last_pos = 999.
         monitor.remove_callback(callback)
         self.assertIsNone(monitor._last_pos)
+
+
+class TestCalibrateEncoderSpeed(EncoderTestCase):
+    """
+    MMU_CALIBRATE_ENCODER's default speed. It defaulted to gear_from_filament_buffer_speed, a
+    speed only meant for filament already pulled into a filament buffer - and on a unit with
+    no buffer that parameter is not even rendered, so calibration silently ran at a hidden
+    default the user could not see. Calibration must use the normal load speed.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.hh.calibrate()
+        self.unit = self.hh.mmu.mmu_unit(0)
+        self.preload(0)
+        self.hh.run_gcode('MMU_SELECT GATE=0')
+        # The command assumes filament already runs through the encoder (its docstring's "Start")
+        self.hh.place_filament(0, position=ENCODER_AT + 50.0)
+        self.assertEqual(self.hh.errors, [])
+
+    def calibration_moves(self, gcode):
+        moves = []
+        real = self.hh.mmu.move_filament
+
+        def spy(trace_str, dist, *args, **kwargs):
+            if trace_str is None:   # _calibrate_encoder's measured moves carry no trace string
+                moves.append((kwargs.get('speed'), kwargs.get('accel')))
+            return real(trace_str, dist, *args, **kwargs)
+
+        self.hh.mmu.move_filament = spy
+        try:
+            self.hh.run_gcode(gcode)
+        finally:
+            del self.hh.mmu.move_filament
+        return moves
+
+    def test_the_unit_has_no_filament_buffer(self):
+        """A guard: with a buffer, the two speeds would at least have a configured value."""
+        self.assertFalse(self.unit.has_filament_buffer())
+        self.assertNotEqual(self.unit.p.gear_load_speed, self.unit.p.gear_from_filament_buffer_speed)
+
+    def test_calibration_defaults_to_the_load_speed(self):
+        moves = self.calibration_moves('MMU_CALIBRATE_ENCODER LENGTH=100 REPEATS=1 SAVE=0')
+        self.assertEqual(self.hh.errors, [])
+        self.assertTrue(moves, 'no calibration moves were made')
+        for speed, accel in moves:
+            self.assertEqual(speed, self.unit.p.gear_load_speed)
+            self.assertEqual(accel, self.unit.p.gear_load_accel)
+
+    def test_explicit_speed_still_wins(self):
+        moves = self.calibration_moves('MMU_CALIBRATE_ENCODER LENGTH=100 REPEATS=1 SAVE=0 SPEED=42 ACCEL=77')
+        self.assertTrue(moves, 'no calibration moves were made')
+        self.assertEqual(set(moves), {(42., 77.)})
+
+
+
+class TestCalibrateGateSpeed(unittest.TestCase):
+    """
+    MMU_CALIBRATE_GATE's measured load move passed no speed, so on a unit with a filament
+    buffer and a gate already marked "from buffer" (every gate after a normal unload) it ran at
+    gear_from_filament_buffer_speed, while the matching unload ran at gear_unload_speed. The
+    rotation_distance it derives from those two moves needs them measured at the load speed.
+    """
+
+    GATE = 1
+    LENGTH = 200.
+
+    def setUp(self):
+        self.hh = session('ercf_vvd')
+        self.addCleanup(self.hh.close)
+        self.hh.boot()
+        self.hh.calibrate()
+        self.hh.run_gcode('MMU_HOME UNIT=0')
+        self.unit = self.hh.mmu.mmu_unit(self.GATE)
+        self.hh.place_filament(self.GATE, position=TIP_AT_GATE)
+        self.hh.run_gcode('MMU_PRELOAD GATE=%d' % self.GATE)
+        self.hh.mmu.gate_maps.set_gate_status(self.GATE, GATE_AVAILABLE_FROM_BUFFER)
+        self.assertEqual(self.hh.errors, [])
+
+    def measured_moves(self, gcode):
+        """(dist, speed, accel) for each gear move of exactly LENGTH, as the resolver chose them."""
+        moves = []
+        mmu = self.hh.mmu
+        real = mmu._resolve_filament_move_speed
+
+        def spy(dist, motor, homing_move, *args, **kwargs):
+            speed, accel = real(dist, motor, homing_move, *args, **kwargs)
+            if motor == 'gear' and not homing_move and abs(dist) == self.LENGTH:
+                moves.append((dist, speed, accel))
+            return speed, accel
+
+        mmu._resolve_filament_move_speed = spy
+        try:
+            self.hh.run_gcode(gcode)
+        finally:
+            del mmu._resolve_filament_move_speed
+        return moves
+
+    def test_the_unit_would_otherwise_pick_the_buffer_speed(self):
+        """A guard: without a buffer and a "from buffer" gate there is nothing to get wrong."""
+        self.assertTrue(self.unit.has_filament_buffer())
+        self.assertEqual(self.hh.mmu.gate_status[self.GATE], GATE_AVAILABLE_FROM_BUFFER)
+        self.assertNotEqual(self.unit.p.gear_load_speed, self.unit.p.gear_from_filament_buffer_speed)
+
+    def test_the_measured_load_runs_at_the_load_speed(self):
+        moves = self.measured_moves(
+            'MMU_CALIBRATE_GATE GATE=%d LENGTH=%d REPEATS=1 SAVE=0' % (self.GATE, self.LENGTH))
+        self.assertEqual(self.hh.errors, [])
+        loads = [(speed, accel) for dist, speed, accel in moves if dist > 0]
+        unloads = [(speed, accel) for dist, speed, accel in moves if dist < 0]
+        self.assertTrue(loads and unloads, 'calibration made no measured moves')
+        self.assertEqual(set(loads), {(self.unit.p.gear_load_speed, self.unit.p.gear_load_accel)})
+        self.assertEqual(set(unloads), {(self.unit.p.gear_unload_speed, self.unit.p.gear_unload_accel)})
+
+
+class TestNegativeGateEndstopToEncoder(unittest.TestCase):
+    """A negative gate_endstop_to_encoder means the encoder is before the gate endstop."""
+
+    def test_encoder_before_shared_exit_has_no_dead_space(self):
+        hh = session('quattrobox_v2')
+        hh.boot()
+        self.addCleanup(hh.close)
+        mmu = hh.mmu
+        hh.run_gcode('MMU_TEST_CONFIG gate_endstop_to_encoder=-10')
+        self.assertEqual(mmu.mmu_unit().p.gate_endstop_to_encoder, -10.0)
+        self.assertEqual(mmu.get_encoder_dead_space(), 0.0)
+        self.assertEqual(mmu.get_encoder_dead_space(park=-30.0), 20.0)
 
 
 if __name__ == '__main__':

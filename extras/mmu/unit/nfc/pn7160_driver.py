@@ -1,4 +1,9 @@
-# PN7160 reader driver for Happy Hare RFID Reader.
+# Happy Hare MMU Software
+# PN7160 reader driver
+#
+# Copyright (C) 2026  WoodWorker
+#
+# Goal: Drive a PN7160 over I2C behind the same reader-facing API as the PN532
 #
 # This is not the standalone [pn7160] Klipper plugin.  It adapts the PN7160
 # NCI controller flow to the small reader interface used by nfc_manager:
@@ -7,7 +12,16 @@
 # PN7160 uses the same reader-facing API as PN532 where possible.  The driver
 # owns NCI and raw tag commands; tag_handler owns retry windows, payload parsing,
 # Spoolman lookups, and Happy Hare side effects.
+#
+# (\_/)
+# ( *,*)
+# (")_(") Happy Hare Ready
+#
+# This file may be distributed under the terms of the GNU GPLv3 license.
+#
 
+from .i2c_transport import (NO_STATUS_WARNING, I2CStatusError, status_supported,
+                            transfer_checked)
 from .log import logger
 from .rx_gain import RX_GAIN_CODES
 
@@ -115,15 +129,19 @@ class PN7160NoTag(PN7160Error):
     pass
 
 
-class PN7160I2CStatusError(PN7160Error):
-    def __init__(self, status, response=None, label=None):
-        self.status = status
-        self.response = [] if response is None else response
-        self.label = label
-        label_text = "" if label is None else " label=%s" % (label,)
-        PN7160Error.__init__(
-            self, "I2C%s status=%s response=%s"
-            % (label_text, status, _hex(self.response)))
+class PN7160I2CStatusError(I2CStatusError, PN7160Error):
+    pass
+
+
+class PN7160PolledUnsupported(PN7160Error):
+    """Polled (no irq_pin) I/O refused: this firmware cannot report an I2C NACK."""
+    pass
+
+
+POLLED_UNSUPPORTED_MSG = (
+    "no irq_pin is wired and this Klipper/Kalico MCU firmware cannot report an I2C "
+    "NACK (no i2c_transfer command), so a polled read would risk an MCU shutdown. "
+    "Update to a Klipper with i2c_transfer, or on Kalico wire irq_pin")
 
 
 def _hex(data, sep=' '):
@@ -286,7 +304,7 @@ class PN7160Handler:
         bus.MCU_I2C.i2c_transfer() wrapper invoke_shutdown()s on a NACK too, which
         is why _i2c_transfer_safe calls the raw command and reads the status itself.
         """
-        return getattr(self.i2c, "i2c_transfer_cmd", None) is not None
+        return status_supported(self.i2c)
 
     def _debug(self, msg, *args):
         if self.debug >= 4:
@@ -356,46 +374,40 @@ class PN7160Handler:
         self.initialized = False
 
 
+    def _refuse_unreported_polling(self, label):
+        # Polled mode learns "nothing pending" from a NACK. Where the MCU cannot
+        # report one (old Klipper, Kalico) command_i2c_read/_write shut the MCU
+        # down instead, so refuse before any byte reaches the bus.
+        if self.no_irq_mode:
+            raise PN7160PolledUnsupported(
+                "I2C%s refused: %s"
+                % ("" if label is None else " " + label, POLLED_UNSUPPORTED_MSG))
+
+
     def _i2c_write_safe(self, data, label=None):
         if not self.i2c_status_supported:
+            self._refuse_unreported_polling(label)
             try:
                 self.i2c.i2c_write(data, retry=False)
             except TypeError:
                 self.i2c.i2c_write(data)
             return
-        params = self.i2c.i2c_transfer_cmd.send(
-            [self.i2c.oid, data, 0], retry=False)
-        status = params.get("i2c_bus_status", "SUCCESS")
-        response = list(bytearray(params.get("response", [])))
-        if status != "SUCCESS":
-            raise PN7160I2CStatusError(status, response, label=label)
+        transfer_checked(self.i2c, data, 0, label=label,
+                         error_cls=PN7160I2CStatusError)
 
 
     def _i2c_transfer_safe(self, write, read_len, label=None):
         if not self.i2c_status_supported:
             # No status to inspect on this firmware, so this branch can never raise
-            # PN7160I2CStatusError - which is exactly what i2c_status_supported
-            # gates on: nothing may read on spec here.
-            #
-            # And note what is deliberately NOT done: 'retry' is not a kwarg of
-            # bus.MCU_I2C.i2c_read() on released Klipper (<= v0.13.0), so this line
-            # raises TypeError there, wait_frame()'s bare except swallows it, and
-            # the reader reports not-alive without a single byte reaching the bus.
-            # Guarding the TypeError the way _i2c_write_safe above does would turn
-            # every polled read into a real read against firmware that SHUTS THE
-            # MCU DOWN on a NACK - and the PN7160 is not guaranteed to answer
-            # within no_irq_read_delay on a cold connect_nci. That trades a
-            # dead-reader message for a dead printer, so it stays as it is until
-            # polled mode itself is refused on such firmware.
+            # PN7160I2CStatusError; polled mode is refused. IRQ mode only reads once
+            # the NFCC has raised IRQ. 'retry' is not a kwarg of i2c_read() on
+            # Klipper <= v0.13.0, so there this raises TypeError and the reader
+            # reports not-alive; Kalico's i2c_read() accepts it.
+            self._refuse_unreported_polling(label)
             params = self.i2c.i2c_read(write, read_len, retry=False)
             return "SUCCESS", list(bytearray(params.get("response", [])))
-        params = self.i2c.i2c_transfer_cmd.send(
-            [self.i2c.oid, write, read_len], retry=False)
-        status = params.get("i2c_bus_status", "SUCCESS")
-        response = list(bytearray(params.get("response", [])))
-        if status != "SUCCESS":
-            raise PN7160I2CStatusError(status, response, label=label)
-        return status, response
+        return transfer_checked(self.i2c, write, read_len, label=label,
+                                error_cls=PN7160I2CStatusError)
 
 
     def write_frame(self, frame, label=None):
@@ -1422,9 +1434,17 @@ class PN7160Driver:
 
 
     def init(self):
+        self.startup_warnings = []
+        if self._handler.no_irq_mode and not self._handler.i2c_status_supported:
+            raise PN7160PolledUnsupported(
+                "[%s pn7160] %s" % (self._name, POLLED_UNSUPPORTED_MSG))
         # connect_nci raises once its retries are exhausted, so this only runs on success
         self._setup_for_read(full=True)
         self._alive = True
+        if not self._handler.i2c_status_supported:
+            # Only IRQ mode gets here
+            logger.warning("[%s pn7160] WARNING: %s", self._name, NO_STATUS_WARNING)
+            self.startup_warnings.append(NO_STATUS_WARNING)
         # Report WHY, not just whether. The two ways to lose the probe need completely
         # different responses from the user - "you turned it off with probe_polled" and
         # "your Klipper can't report an I2C NACK, so wire irq_pin or update"
@@ -1507,7 +1527,7 @@ class PN7160Driver:
     # nfc_gate_jog_scan_window at 100mm/s is 5 seconds of entirely normal silence, and
     # tearing down partway through costs probe_start()'s blocking NCI setup (a VEN
     # toggle plus full bring-up, ~124ms = 12mm of travel at that speed) with discovery
-    # DOWN for all of it. Worse, a restart storm destabilises the chip: repeated
+    # DOWN for all of it. Worse, a restart storm destabilizes the chip: repeated
     # hardware resets provoke I2C START_NACKs, whose recovery is slower again.
     #
     # Note this is NOT the same situation as pn532_driver's watchdog, which is correct
@@ -1581,7 +1601,7 @@ class PN7160Driver:
         except Exception as e:
             # warning, and ungated, unlike rc522's equivalent: this path also marks
             # the reader not-alive and forces a full re-init, so the user needs to
-            # see it. Do not "normalise" it down to a debug-gated info.
+            # see it. Do not "normalize" it down to a debug-gated info.
             logger.warning("[%s pn7160] probe_start failed: %s", self._name, e)
             self._probe_active = False
             self._alive = False

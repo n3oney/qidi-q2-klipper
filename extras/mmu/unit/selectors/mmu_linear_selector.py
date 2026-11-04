@@ -570,7 +570,7 @@ class LinearSelector(PhysicalSelector):
                             found = self.mmu.check_filament_in_gate()
                             if not found:
                                 # Push filament into view of the gate endstop
-                                _,_,measured,_ = self.mmu.move_filament("Locating filament", self.mmu_unit.p.gate_parking_distance + self.mmu_unit.p.gate_endstop_to_encoder + 10.)
+                                _,_,measured,_ = self.mmu.move_filament("Locating filament", -self.mmu_unit.p.gate_parking_distance + max(0., self.mmu_unit.p.gate_endstop_to_encoder) + 10.)
                                 if self.mmu_unit.has_encoder() and measured < self.mmu_unit.encoder.movement_min():
                                     raise MmuError("Unblocking selector failed because unable to move filament to clear")
 
@@ -829,6 +829,6 @@ class MmuCalibrateSelectorCommand(BaseCommand):
                     selector.disable_motors()
 
         except MmuError as ee:
-            mmu.handle_mmu_error(str(ee))
+            mmu.handle_mmu_error(ee)
         finally:
             mmu.calibrating = False

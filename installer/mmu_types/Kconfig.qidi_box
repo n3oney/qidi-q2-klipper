@@ -10,18 +10,49 @@ config MMU_TYPE_QIDI_BOX_1_0
   select MMU_HAS_SENSOR_SHARED_EXIT
   select MMU_HAS_SENSOR_EXTRUDER
   select MMU_HAS_SYNC_FEEDBACK_BUFFER
-  select MMU_HAS_SENSOR_BUFFER_TENSION
-  select UNSELECT_MMU_HAS_SENSOR_BUFFER_COMPRESSION
-  select UNSELECT_MMU_HAS_SENSOR_BUFFER_PROPORTIONAL
+  select MMU_HAS_SENSOR_BUFFER_TENSION if !MMU_SHARED_SYNC_FEEDBACK_BUFFER
+  select UNSELECT_MMU_HAS_SENSOR_BUFFER_COMPRESSION if !MMU_SHARED_SYNC_FEEDBACK_BUFFER
+  select UNSELECT_MMU_HAS_SENSOR_BUFFER_PROPORTIONAL if !MMU_SHARED_SYNC_FEEDBACK_BUFFER
   imply  MMU_HAS_ENVIRONMENT_SENSOR
   imply  MMU_HAS_HEATER
   select PARAM_FILAMENT_ALWAYS_GRIPPED
+  select MMU_GEAR_ROTATES_SPOOL           # Gate gear motor turns the spool
+  select MMU_HAS_NFC_READER
+  select MMU_HAS_PER_GATE_NFC_READERS
   select PARAM_SYNC_TO_EXTRUDER
   select PARAM_SYNC_FORM_TIP
   select PARAM_SYNC_PURGE
-  select DISABLE_NUM_GATES_OPTION
 
 if MMU_TYPE_QIDI_BOX_1_0
+
+  # The readers are declared by the board profile, one physical chip per pair
+  # of gates, so the per-gate list repeats each name twice.
+  config PARAM_NFC_READER_0
+    default "$(UNIT_NAME)_nfc01"
+  config PARAM_NFC_READER_1
+    default "$(UNIT_NAME)_nfc01"
+  config PARAM_NFC_READER_2
+    default "$(UNIT_NAME)_nfc23"
+  config PARAM_NFC_READER_3
+    default "$(UNIT_NAME)_nfc23"
+
+  # The tag sits on the spool, so the gear motor has to turn it past the
+  # antenna to find it; a full turn of a near-empty spool is about 480mm.
+  # Retracting is the safe direction here - the gate parks at the shared hub,
+  # so feeding forward would push filament into it.
+  config PARAM_NFC_GATE_JOG_SCAN_WINDOW
+    default "-480, 60"
+  config PARAM_NFC_PRELOAD_JOG_SCAN_WINDOW
+    default "-480, 60"
+  config PARAM_NFC_GATE_CLEAR_DISTANCE
+    default -70
+  config PARAM_NFC_PRELOAD_CLEAR_DISTANCE
+    default -70
+
+  # One physical reader serves two gates, so a neighbor's spool can sit in
+  # the same RF field and be attributed to the wrong gate.
+  config PARAM_NFC_NEIGHBOR_CHECK
+    default y
 
   # Motor current and driver mode are configured in hardware. Default to no
   # Klipper-managed TMC, while allowing modified units to select one normally.
@@ -39,9 +70,6 @@ if MMU_TYPE_QIDI_BOX_1_0
   # the gate's own path. A fixed move cannot do this: the parking retract is
   # not applied when the preload endstop is 'none'.
 
-  if SHOW_MMU_ADDITIONS_WITH_TYPE
-    source "Kconfig.mmu_additions"
-  endif
 
   source "Kconfig.capabilities"
 
@@ -55,6 +83,8 @@ if MMU_TYPE_QIDI_BOX_1_0
   config PARAM_VERSION
     default "1.0"
   config PARAM_NUM_GATES
+    default 4
+  config PARAM_DESIGN_NUM_GATES
     default 4
   choice BOARD_TYPE
     default BOARD_TYPE_QIDI_BOX_2_0
@@ -112,11 +142,14 @@ if MMU_TYPE_QIDI_BOX_1_0
     default 12
 
   # Dryer ----------------------------------
-  # The profile implies MMU_HAS_HEATER, so name the heater object the same way
-  # the other vendors with a dryer do (see Kconfig.vvd / Kconfig.kms). Without
-  # a name the dryer is enabled but bound to nothing and silently does nothing.
+  # The board's misc hardware defines this heater (see Kconfig.qidi_box under
+  # boards/custom)
   config PARAM_FILAMENT_HEATER
     default "$(UNIT_NAME)_heater"
+  # The heater is controlled through the environment sensor, so it must
+  # report as often as the AHT driver allows
+  config PARAM_ENVIRONMENT_SENSOR_REPORT_TIME
+    default 5 if !CHOICE_ENVIRONMENT_SENSOR_TYPE_BME280
 
   comment "_"
 

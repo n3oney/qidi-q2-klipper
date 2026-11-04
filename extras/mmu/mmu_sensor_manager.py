@@ -515,14 +515,22 @@ class MmuSensorManager:
         return None
 
 
-    def check_event_sensor(self, name, gate=None):
+    def check_event_sensor(self, name, gate=None, eventtime=None):
         """
         Return the current state of the exact sensor named by a queued event.
 
         Unlike check_sensor(), this resolves against the stable global registry rather
         than active_sensors_map. Event delivery may lag behind a gate or unit selection,
         so checking the active generic sensor can inspect a different physical switch.
+
+        With eventtime, a read sooner than sensor_min_debounce_delay after the event
+        first waits out the remainder so a bouncing switch has settled.
         """
+        delay = self.mmu.p.sensor_min_debounce_delay
+        if delay > 0 and eventtime is not None:
+            settled = eventtime + delay
+            if settled > self.mmu.reactor.monotonic():
+                self.mmu.reactor.pause(settled)
         mmu_unit = self.mmu.mmu_unit(gate) if gate is not None and gate >= 0 else None
         _qualified, sensor, _error = self.resolve_sensor(name, mmu_unit=mmu_unit)
         if sensor is not None and sensor.runout_helper.sensor_enabled:
@@ -617,8 +625,8 @@ class MmuSensorManager:
         """
         sensors = self.get_sensors_before(FILAMENT_POS_LOADED, self.mmu.gate_selected)
         if any(state is False for state in sensors.values()):
-            MmuError("Loaded check failed:\nFilament not detected by sensors: %s" %
-                     ', '.join([n for n, s in sensors.items() if s is False]))
+            raise MmuError("Loaded check failed:\nFilament not detected by sensors: %s" %
+                           ', '.join([n for n, s in sensors.items() if s is False]))
 
 
     def enable_runout(self, gate):

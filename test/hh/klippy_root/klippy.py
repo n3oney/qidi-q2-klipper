@@ -9,7 +9,7 @@
 #   arguments are shifted: config='mmu_nfc_reader', section=None, no default. Real
 #   Klipper then does None.split() -> AttributeError, crashing config load for
 #   anyone with an [mmu_nfc_reader NAME] section. A permissive fake would paper over
-#   a genuine crash-on-load bug, so we keep the exact behaviour.
+#   a genuine crash-on-load bug, so we keep the exact behavior.
 #
 #   Keeping the on-disk check is the second half: even with the arguments fixed the
 #   call returns None, because HH's reader lives at extras/mmu/unit/nfc/ and there is
@@ -92,6 +92,13 @@ class Printer:
             return self.objects[section]
         module_parts = section.split()
         module_name = module_parts[0]
+        # Pre-motion_queuing generation emulation: modules that do not exist
+        # in that generation fail to load exactly as on real old Klipper /
+        # Kalico.
+        if module_name in getattr(self, 'harness_missing_modules', ()):
+            if default is not configfile.sentinel:
+                return default
+            raise self.config_error("Unable to load module '%s'" % (section,))
         py_name = os.path.join(self._extras_dir, module_name + '.py')
         py_dirname = os.path.join(self._extras_dir, module_name, '__init__.py')
         if not os.path.exists(py_name) and not os.path.exists(py_dirname):

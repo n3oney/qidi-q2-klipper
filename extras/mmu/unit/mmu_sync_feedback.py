@@ -52,6 +52,8 @@ class MmuSyncFeedback:
         self.flowguard_active = False # FlowGuard armed in sync-feedback controller or just using encoder
         self.ctrl = None
         self.flow_rate = 100.         # Estimated % flowrate (calc only for proportional sensors)
+        self.rd_correction = 0.       # % deviation of tuned rd from the rd the gate started with
+        self._rd_start = None         # Calibrated rd the controller was last hard reset with
 
         # Coalescing state for deferred gear rd updates: keep only the latest
         # target with a single in-flight lookahead callback (all on reactor greenlet)
@@ -136,6 +138,12 @@ class MmuSyncFeedback:
             self.ctrl._current_log_file = self._telemetry_log_path()
             self.ctrl._init_log()
 
+        # Likewise rebase correction on the rd calibrated now (may have been autotune-saved last print)
+        if self.active and self.ctrl is not None:
+            self._rd_start = self.mmu_unit.calibrator.get_gear_rd()
+            rd_tuned = self.ctrl.autotune.get_tuned_rd()
+            self.rd_correction = round((rd_tuned - self._rd_start) / self._rd_start * 100., 2)
+
 
     def is_enabled(self):
         """
@@ -156,13 +164,21 @@ class MmuSyncFeedback:
             return "unavailable"
 
         if state is None:
-            sm = self.mmu.sensor_manager
-            if sm.has_sensor(SENSOR_PROPORTIONAL):
+            buffer = self.mmu_unit.buffer
+            sensor = buffer.proportional_sensor
+            if sensor is not None and sensor.runout_helper.sensor_enabled:
                 # Report the buffer's hysteresis state, independent of controller mode
                 # and whether either derived switch is enabled. Control keeps the raw value.
-                state = sm.get_sensor_obj(SENSOR_PROPORTIONAL).get_virtual_sensor_state()
+                state = sensor.get_virtual_sensor_state()
             else:
-                state = self._get_sensor_state()
+                # Status can be requested for an inactive unit; read its own buffer.
+                def switch_state(sensor):
+                    if sensor is not None and sensor.runout_helper.sensor_enabled:
+                        return bool(sensor.runout_helper.filament_present)
+                    return None
+                tension = switch_state(buffer.tension_sensor)
+                compression = switch_state(buffer.compression_sensor)
+                state = 0 if tension == compression else 1 if compression else -1 if tension else 0
         if (self.mmu.is_enabled and self.p.sync_feedback_enabled and self.active) or detail:
             return 'compressed' if state > 0 else 'tension' if state < 0 else 'neutral'
         elif self.mmu.is_enabled and self.p.sync_feedback_enabled:
@@ -181,12 +197,12 @@ class MmuSyncFeedback:
             self.ctrl.autotune.resume()
             msg = "FlowGuard monitoring activated and Autotune resumed"
 
-        # Enable encoder based Flowguard
-        if u.has_encoder() and not u.encoder.is_flowguard_enabled():
-            if not u.encoder.enable_flowguard(u):
-                return # Must in in off mode
-            self.flowguard_active = True
-            msg = msg or "FlowGuard monitoring with encoder activated"
+        # Enable encoder based Flowguard, taking over a shared encoder armed by another unit
+        if u.has_encoder() and (not u.encoder.is_flowguard_enabled() or u.encoder.active_mmu_unit is not u):
+            # Encoder monitoring may be off while buffer FlowGuard still activates.
+            if u.encoder.enable_flowguard(u):
+                self.flowguard_active = True
+                msg = msg or "FlowGuard monitoring with encoder activated"
 
         if msg:
             self.mmu.log_info(msg)
@@ -201,12 +217,15 @@ class MmuSyncFeedback:
             self.ctrl.autotune.pause()
             msg = "FlowGuard monitoring deactivated and Autotune paused"
 
-        # Enable encoder based "flowguard"
-        if u.has_encoder() and u.encoder.is_flowguard_enabled():
-            if not u.encoder.disable_flowguard():
-                return # Must in in off mode
-            self.flowguard_active = False
-            msg = msg or "FlowGuard monitoring with encoder deactivated"
+        # Disable encoder based Flowguard. Only the unit that armed the encoder may disarm it
+        if u.has_encoder():
+            if u.encoder.active_mmu_unit is not u:
+                self.flowguard_active = False
+            elif u.encoder.is_flowguard_enabled():
+                if not u.encoder.disable_flowguard():
+                    return # Must be in off mode
+                self.flowguard_active = False
+                msg = msg or "FlowGuard monitoring with encoder deactivated"
 
         if msg:
             self.mmu.log_info(msg)
@@ -319,11 +338,13 @@ class MmuSyncFeedback:
                 self._schedule_tangle_current(gate, restore_percent, False, msg)
 
 
-    def adjust_filament_tension(self, use_gear_motor=True, max_move=None):
+    def adjust_filament_tension(self, use_gear_motor=True, max_move=None, target=0.0):
         """
         Relax the filament tension, preferring proportional control if available else sync-feedback sensor switches.
         By default uses gear stepper to achieve the result but optionally can use just extruder stepper for
         extruder entry check using compression sensor 'max_move' is advisory maximum travel distance
+        'target' is the sync-feedback state to settle at, default 0.0 (neutral). A non-neutral target is
+        used to park the buffer at its spring rest position and requires a proportional sensor
         Returns distance of the correction move and whether operation was successful (or None if not performed)
         """
         if not self.mmu_unit.has_buffer(): return 0.0, None
@@ -332,7 +353,12 @@ class MmuSyncFeedback:
         max_move = max_move or self.mmu_unit.buffer.buffer_maxrange
 
         if has_proportional:
-            return self._adjust_filament_tension_proportional() # Doesn't yet support extruder stepper or max_move parameter
+            return self._adjust_filament_tension_proportional(target=target) # Doesn't yet support extruder stepper or max_move parameter
+
+        if target:
+            # Non-neutral targets are not implemented for switch sensors.
+            self.mmu.log_debug("Tension target %.2f ignored: only supported with a proportional sensor" % target)
+            return 0., None
 
         if has_tension or has_compression:
             return self._adjust_filament_tension_switch(use_gear_motor=use_gear_motor, max_move=max_move)
@@ -377,6 +403,7 @@ class MmuSyncFeedback:
             'sync_feedback_bias_raw': None,
             'sync_feedback_bias_modelled': None,
             'sync_feedback_flow_rate': None,
+            'sync_feedback_rd_correction': None,
             'flowguard': None,
             'tangle_prevention': None,
         }
@@ -396,6 +423,7 @@ class MmuSyncFeedback:
                 'sync_feedback_bias_raw': round(self._get_sync_bias_raw(), 2),
                 'sync_feedback_bias_modelled': round(self._get_sync_bias_modelled(), 2),
                 'sync_feedback_flow_rate': self.flow_rate,
+                'sync_feedback_rd_correction': self.rd_correction,
                 'flowguard': flowguard_status,
                 'tangle_prevention': {
                     'enabled': bool(self.p.tangle_prevention_enabled),
@@ -497,14 +525,13 @@ class MmuSyncFeedback:
 
         if not self.active: return
 
+        self.save_autotuned_rd()
+
         # Deactivate sync feedback
         self.active = False
 
         # Reset tangle prevention state and restore current if boosted
         self._reset_tangle_prevention(eventtime)
-
-        if self.new_autotuned_rd is not None:
-            self.mmu_unit.calibrator.note_rd_telemetry(self.mmu.gate_selected, self.new_autotuned_rd)
 
         # Restore default (last tuned) rotation distance in case it wasn't "autotune-saved" above.
         # This snaps rd outside the scheduler so invalidate its memory
@@ -515,6 +542,14 @@ class MmuSyncFeedback:
         self.mmu_unit.extruder_monitor().remove_callback(self._handle_extruder_movement)
 
 
+    def save_autotuned_rd(self):
+        if not (self.mmu.is_enabled and self.p.sync_feedback_enabled and self.active): return
+        if not self.mmu_unit.manages_gate(self.mmu.gate_selected): return
+        if self.new_autotuned_rd is not None:
+            self.mmu_unit.calibrator.note_rd_telemetry(self.mmu.gate_selected, self.new_autotuned_rd)
+            self.new_autotuned_rd = None
+
+
     def _handle_gate_selected(self, gate, prev_gate):
         """
         On gate swap the calibrator snaps the stepper to the new gate's calibrated rd
@@ -523,6 +558,8 @@ class MmuSyncFeedback:
         """
         if not self.mmu_unit.has_buffer(): return
         self._invalidate_rd_scheduler()
+        self.rd_correction = 0.
+        self._rd_start = None # Until the controller is reset for the new gate
 
         # Usually a no-op because the unsync ahead of the gate change already restored, but it
         # covers the paths where that handler bails early (feature toggled off mid-boost)
@@ -655,6 +692,7 @@ class MmuSyncFeedback:
                 sensor = sm.get_sensor_obj(sensor_key)
 
                 if sensor is not None and sensor.runout_helper.sensor_enabled:
+                    self.mmu.flowguard_trip_reason = f_reason
                     sensor.runout_helper.note_clog_tangle(f_trigger)
                 elif sensor is not None:
                     self.mmu.log_debug(
@@ -671,7 +709,8 @@ class MmuSyncFeedback:
         save = autotune.get('save', None)
         if rd is not None:
             msg = "MmuSyncFeedback: Autotune suggested new operational reference rd: %.4f\n%s" % (rd, note)
-            self.new_autotuned_rd = rd
+            if save:
+                self.new_autotuned_rd = rd # Only persist confident suggestions
             self.mmu.log_debug(msg)
 
         # Update gear stepper rd, subject to a fractional dead-band against the last
@@ -699,6 +738,9 @@ class MmuSyncFeedback:
             # if rd_current > rd_true then flowrate must be reduced
             self.flow_rate = round(min(1.0, (rd_tuned / rd_current)) * 100., 2)
 
+        if self._rd_start:
+            self.rd_correction = round((rd_tuned - self._rd_start) / self._rd_start * 100., 2)
+
         # Tangle prevention: boost gear current on high tension (spool resistance)
         self._check_tangle_prevention(eventtime)
 
@@ -719,6 +761,7 @@ class MmuSyncFeedback:
         self.estimated_state = starting_state
         if hard_reset:
             rd_start = self.mmu_unit.calibrator.get_gear_rd()
+            self._rd_start = rd_start
         else:
             rd_start = self.ctrl.autotune.get_rec_rd()
         # Fresh controller state: invalidate so a stale queued lookahead callback
@@ -742,6 +785,8 @@ class MmuSyncFeedback:
             sensor_type = self._get_sensor_type(),
             use_twolevel_for_type_p = self.p.sync_feedback_force_twolevel,
             rd_start = rd_start,
+            rd_twolevel_speed_multiplier = self.p.sync_feedback_speed_multiplier / 100.,
+            rd_twolevel_boost_multiplier = self.p.sync_feedback_boost_multiplier / 100.,
             flowguard_relief_mm = self.p.flowguard_max_relief,
         )
         # EKF "extreme" threshold tracks the analog sensor trigger point (type-P only)
@@ -758,6 +803,17 @@ class MmuSyncFeedback:
         """
         if not self.mmu_unit.has_buffer() or self.ctrl is None: return
         self.ctrl.cfg.flowguard_relief_mm = self.p.flowguard_max_relief
+
+
+    def apply_twolevel_tuning(self):
+        """
+        Push live twolevel speed/boost multipliers to a running controller so
+        MMU_TEST_CONFIG changes take effect immediately without a controller reset.
+        """
+        if not self.mmu_unit.has_buffer() or self.ctrl is None: return
+        self.ctrl.cfg.rd_twolevel_speed_multiplier = self.p.sync_feedback_speed_multiplier / 100.
+        self.ctrl.cfg.rd_twolevel_boost_multiplier = self.p.sync_feedback_boost_multiplier / 100.
+        self.ctrl.apply_twolevel_tuning()
 
 
     def apply_extrude_threshold(self):
@@ -920,9 +976,10 @@ class MmuSyncFeedback:
         return actual, fhomed
 
 
-    def _adjust_filament_tension_proportional(self):
+    def _adjust_filament_tension_proportional(self, target=0.0):
         """
         Helper to relax filament tension using the proportional sync-feedback buffer.
+        'target' is the sensor state to settle at, default 0.0 (neutral).
         Returns: actual distance moved (mm), success bool
         """
 
@@ -945,6 +1002,19 @@ class MmuSyncFeedback:
         if neutral_band < 0.05:
             neutral_band = 0.05
 
+        # Rail targets accept readings at or beyond the arrival threshold.
+        target = max(-1.0, min(1.0, float(target)))
+        at_rail = abs(target) >= 1.0 - neutral_band
+
+        def arrived(state):
+            if at_rail:
+                return state <= target + neutral_band if target < 0. else state >= target - neutral_band
+            return abs(state - target) <= neutral_band
+
+        arrival_word = "neutral" if not target else "on target"
+        if target:
+            self.mmu.log_debug("Proportional adjust: targeting %.2f rather than neutral" % target)
+
         # maxrange is full end-to-end sensor span; use half as the per-side budget from neutral to either end
         maxrange_span_mm = float(self.mmu_unit.buffer.buffer_maxrange)
         if maxrange_span_mm <= 0.0:
@@ -965,11 +1035,11 @@ class MmuSyncFeedback:
         # --- Initial proportional correction ---
         # Negative sensor state = tension -> feed filament. positive sensor state = compression -> retract filament
         prop_state = self._get_sensor_state() # [-1..+1], 0 ≈ neutral
-        if abs(prop_state) > neutral_band:
+        if not arrived(prop_state):
             # Initial move distance as a proportion to how off centre we are based on the sensor readings.
             # this will get the sensor close but likely will need a few fine adjustments (nudges) to get it
             # within the centre range depending on how large the bowden tube slack is.
-            initial_move_mm = -prop_state * per_side_budget_mm
+            initial_move_mm = -(prop_state - target) * per_side_budget_mm
             if abs(initial_move_mm) >= nudge_mm:
                 self.mmu.move_filament(
                     "Proportional initial adjust - extruder load",
@@ -985,11 +1055,11 @@ class MmuSyncFeedback:
 
         # --- Check proportional sensor state after initial move and return if within neutral deadband ---
         prop_state = self._get_sensor_state()
-        if abs(prop_state) <= neutral_band:
+        if arrived(prop_state):
             self.mmu.log_info(
-                "Proportional adjust: neutral after initial "
+                "Proportional adjust: %s after initial "
                 "(nudge=%.2fmm, initial=%.2fmm, nudges=%.2fmm, total=%.2fmm, steps=%d, final_state=%.3f, success=yes)" %
-                (nudge_mm, moved_initial_mm, moved_nudges_mm, moved_total_mm, steps, prop_state)
+                (arrival_word, nudge_mm, moved_initial_mm, moved_nudges_mm, moved_total_mm, steps, prop_state)
             )
             return moved_total_mm, True
 
@@ -1005,18 +1075,18 @@ class MmuSyncFeedback:
                 )
                 return moved_total_mm, False
 
-            if abs(prop_state) <= neutral_band:
+            if arrived(prop_state):
                 # confirm neutral after a short wait
                 try:
                     self.mmu.reactor.pause(settle_time)
                 except Exception:
                     time.sleep(settle_time)
                 prop_state = self._get_sensor_state()
-                if abs(prop_state) <= neutral_band:
+                if arrived(prop_state):
                     break
 
-            # Direction: tension -> feed forward; compression -> retract
-            nudge_move_mm = nudge_mm if prop_state < 0.0 else -nudge_mm
+            # Direction: below target -> feed forward; above target -> retract
+            nudge_move_mm = nudge_mm if prop_state < target else -nudge_mm
             # don't exceed the end to end sensor span (maxrange_span_mm). Serves as "ultimate" failsafe.
             if abs(moved_total_mm + nudge_move_mm) >= maxrange_span_mm:
                 self.mmu.log_info(
@@ -1040,7 +1110,7 @@ class MmuSyncFeedback:
 
         # Final check
         final_state = self._get_sensor_state()
-        success = abs(final_state) <= neutral_band
+        success = arrived(final_state)
         self.mmu.log_info(
             "Proportional adjust: complete "
             "(nudge=%.2fmm, initial=%.2fmm, nudges=%.2fmm, total=%.2fmm, steps=%d, final_state=%.3f, success=%s)" %

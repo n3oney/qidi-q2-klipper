@@ -26,7 +26,7 @@ import re
 import unittest
 from unittest.mock import patch
 
-from test.hh import session
+from test.hh import profiles, session
 from test.hh.bootstrap import PRINTER_STUB
 
 # HH logs a lot at INFO during construction; keep test output readable.
@@ -106,7 +106,8 @@ class TestConfigLoad(unittest.TestCase):
         status = self.hh.mmu.get_status(self.hh.reactor.monotonic())
         for key in ('encoder', 'sync_feedback_state', 'sync_feedback_enabled',
                     'sync_feedback_bias_raw', 'sync_feedback_bias_modelled',
-                    'sync_feedback_flow_rate', 'flowguard', 'tangle_prevention'):
+                    'sync_feedback_flow_rate', 'sync_feedback_rd_correction',
+                    'flowguard', 'tangle_prevention'):
             self.assertIn(key, status)
             self.assertIsNone(status[key])
 
@@ -179,6 +180,106 @@ class TestVersionMismatch(unittest.TestCase):
         self.assertIn('3.99.0', str(cm.exception))
 
 
+class TestUnitName(unittest.TestCase):
+    """
+    Unit names must satisfy the same rule menuconfig's MMU_UNITS validator applies
+    ([a-z][a-z0-9_-]*). In particular mmu_vars.cfg (save_variables) lowercases keys,
+    so a mixed case name would never round-trip its persisted state.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from test.hh import install
+        install()
+
+    def _build_unit(self, name):
+        import configparser
+        from configfile import ConfigWrapper
+        from extras.mmu.mmu_unit import MmuUnit
+
+        section = 'mmu_unit %s' % name
+        fileconfig = configparser.RawConfigParser()
+        fileconfig.add_section(section)
+        config = ConfigWrapper(None, fileconfig, {}, section)
+        return MmuUnit(config, None, 0, 0)
+
+    def test_invalid_unit_names_raise_config_error(self):
+        from configfile import error as ConfigError
+        for name in ('BoxTurtle', 'unit0A', '0unit', '_unit', 'unit.0', 'unit#1'):
+            with self.subTest(name=name):
+                with self.assertRaises(ConfigError) as cm:
+                    self._build_unit(name)
+                self.assertIn("Unit name '%s' is invalid" % name, str(cm.exception))
+
+    def test_valid_unit_names_pass_name_check(self):
+        from configfile import error as ConfigError
+        for name in ('unit0', 'mmu', 'box_turtle', 'night-owl2'):
+            with self.subTest(name=name):
+                # Fails later on the missing num_gates option, not on the name
+                with self.assertRaises(ConfigError) as cm:
+                    self._build_unit(name)
+                self.assertIn('num_gates', str(cm.exception))
+
+
+class TestUnitsNotNamedByIndex(unittest.TestCase):
+    """
+    Nothing may assume units are called unit0, unit1, ... A rename in menuconfig
+    produces exactly this: every section, pin and sensor carrying the new names.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from test.hh import profiles, session
+        profile = profiles.clone_across_units('named_units', profiles.BOXTURTLE, ['right', 'left'])
+        cls.hh = session(profile)
+        cls.hh.boot()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.hh.close()
+
+    def test_boots_clean(self):
+        self.assertEqual(self.hh.errors, [])
+
+    def test_units_are_in_configured_order(self):
+        units = self.hh.mmu.mmu_machine.units
+        self.assertEqual([u.name for u in units], ['right', 'left'])
+        self.assertEqual([u.first_gate for u in units], [0, 4])
+
+
+class TestSingleUnitNamed(unittest.TestCase):
+    """A single unit renamed in menuconfig renders and boots under its own name."""
+
+    def test_boots_clean(self):
+        from test.hh import profiles, session
+        hh = session(profiles.BOXTURTLE.derive('boxturtle_named_box', unit_name='box'))
+        try:
+            hh.boot()
+            self.assertEqual(hh.errors, [])
+            self.assertEqual([u.name for u in hh.mmu.mmu_machine.units], ['box'])
+        finally:
+            hh.close()
+
+
+class TestSharedEncoderOwnerAfterSharer(unittest.TestCase):
+    """Reordering units may put a unit sharing an encoder before the unit that owns it."""
+
+    def test_boots_clean(self):
+        from test.hh import profiles, session
+        p = profiles.get('encoder_shared')
+        owner, sharer = p.units
+        hh = session(p.derive('encoder_shared_reordered',
+                              units=[sharer.derive(index=0), owner.derive(index=1)]))
+        try:
+            hh.boot()
+            self.assertEqual(hh.errors, [])
+            units = hh.mmu.mmu_machine.units
+            self.assertEqual([u.name for u in units], ['unit1', 'unit0'])
+            self.assertIs(units[0].encoder, units[1].encoder)
+        finally:
+            hh.close()
+
+
 class TestPinBindings(unittest.TestCase):
     """
     A2: every pin description is recorded with the type it was bound as. This is the
@@ -212,6 +313,38 @@ class TestPinBindings(unittest.TestCase):
         kinds = {b.type for b in self.hh.pins.bindings
                  if b.type in ('pwm', 'digital_out')}
         self.assertTrue(kinds, 'espooler bound no pwm/digital_out pins')
+
+    def test_digital_espooler_ignores_scale(self):
+        """With pwm off, value is on/off, so a hidden scale below it must not reject it."""
+        hh = session(profiles.get('boxturtle').derive(
+            'espooler_digital_low_scale',
+            syms={'PARAM_ESPOOLER_PWM': 0, 'PARAM_ESPOOLER_SCALE': 0.5, 'PARAM_ESPOOLER_VALUE': 1}))
+        try:
+            hh.build()
+            self.assertEqual(hh.errors, [])
+            espooler = hh.printer.lookup_object('mmu_machine').units[0].espooler
+            self.assertEqual(espooler.motor_mcu_pins['respool_0']._start_value, 1)
+        finally:
+            hh.close()
+
+    def test_soft_pwm_espooler_rejects_fractional_shutdown(self):
+        """Klipper's soft PWM only takes a 0 or full shutdown duty; the fake MCU doesn't check it."""
+        from configfile import error as ConfigError
+        hh = session(profiles.get('boxturtle').derive(
+            'espooler_soft_pwm_fractional_shutdown',
+            syms={'PARAM_ESPOOLER_SHUTDOWN_VALUE': 0.5}))
+        try:
+            with self.assertRaises(ConfigError) as cm:
+                hh.build()
+            self.assertIn('shutdown_value', str(cm.exception))
+        finally:
+            hh.close()
+
+    def test_espooler_enable_pin_starts_at_configured_value(self):
+        """BoxTurtle's gate 0 eSpooler enable pin (unit0:PA2) starts at `value` (0), not on."""
+        starts = [b.obj._start_value for b in self.hh.pins.find('unit0:PA2')
+                  if b.type == 'digital_out']
+        self.assertEqual(starts, [0])
 
     def test_unknown_chip_is_rejected(self):
         """
@@ -337,7 +470,8 @@ class TestReady(BootedSessionMixin, unittest.TestCase):
         self.assertIsNone(status['encoder'])
         for key in ('sync_feedback_state', 'sync_feedback_enabled',
                     'sync_feedback_bias_raw', 'sync_feedback_bias_modelled',
-                    'sync_feedback_flow_rate', 'flowguard', 'tangle_prevention'):
+                    'sync_feedback_flow_rate', 'sync_feedback_rd_correction',
+                    'flowguard', 'tangle_prevention'):
             self.assertIn(key, status)
             self.assertIsNotNone(status[key])
 
@@ -449,7 +583,7 @@ class TestBootup(BootedSessionMixin, unittest.TestCase):
 
 class TestSensorDriving(BootedSessionMixin, unittest.TestCase):
     """
-    First test of HH BEHAVIOUR rather than construction: drive a sensor through its
+    First test of HH BEHAVIOR rather than construction: drive a sensor through its
     real button callback and observe HH react.
     """
 
@@ -481,6 +615,57 @@ class TestSensorDriving(BootedSessionMixin, unittest.TestCase):
     def test_sensor_lookup_errors_are_helpful(self):
         with self.assertRaises(KeyError):
             self.hh.sensor('no_such_sensor')
+
+
+class TestSharedEncoderAndBuffer(unittest.TestCase):
+    """
+    A second unit sharing the first unit's encoder and buffer through the "Shared with
+    existing unit?" flags boots, and both units resolve the same objects.
+
+    The sharer still needs its own gate_endstop_to_encoder: the distance is from THAT unit's
+    gate endstop to the shared encoder, and is read from the unit's parameters, not from the
+    encoder object. Asserted here because this is where the value is actually read.
+
+    Its own session rather than BootedSessionMixin: a multi-unit machine is three Kconfig
+    parses, and this profile is deliberately not in the PROFILES registry (a fixture, not a
+    machine anyone would run - see the note in profiles.py).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.hh = session(profiles.SHARED_ENCODER)
+        cls.hh.boot()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.hh.close()
+
+    def test_the_machine_boots(self):
+        self.assertEqual(self.hh.errors, [])
+
+    def test_both_units_resolved_the_one_encoder_and_buffer(self):
+        """
+        Not merely "no error" - the SAME objects. A sharer that quietly built its own would
+        be a second encoder or buffer with its own pins and calibration, which is the
+        failure the whole shared path exists to prevent.
+        """
+        units = self.hh.printer.lookup_object('mmu_machine').units
+        self.assertEqual([u.name for u in units], ['unit0', 'unit1'])
+        for kind in ('encoder', 'buffer'):
+            for unit in units:
+                with self.subTest(kind=kind, unit=unit.name):
+                    self.assertIsNotNone(getattr(unit, kind))
+                    self.assertIs(getattr(unit, kind), getattr(units[0], kind))
+            self.assertIn('mmu_%s unit0' % kind, self.hh.printer.objects)
+            self.assertNotIn('mmu_%s unit1' % kind, self.hh.printer.objects)
+
+    def test_each_unit_keeps_its_own_encoder_offset(self):
+        """
+        unit0 has a shared_exit endstop, so Kconfig gives it 10; unit1 shares the encoder
+        but sets its own 25, which must not be lost or replaced by the owner's value.
+        """
+        units = self.hh.printer.lookup_object('mmu_machine').units
+        self.assertEqual([u.p.gate_endstop_to_encoder for u in units], [10.0, 25.0])
 
 
 class TestNoExtruderTmc(BootedSessionMixin, unittest.TestCase):

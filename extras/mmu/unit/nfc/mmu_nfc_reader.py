@@ -1,15 +1,27 @@
-# klippy/extras/mmu_nfc_reader.py
+# Happy Hare MMU Software
+# RFID/NFC reader chip driver
 #
-# mmu_nfc_reader — standalone RFID/NFC reader chip driver for Happy Hare
-# Version 1.1.0
-# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2022-2026  moggieuk#6538 (discord)
+#                          moggieuk@hotmail.com
 #
-# Extracted from a larger NFC gate-management extension. This module keeps
-# only the hardware layer: it builds the configured reader chip driver
-# (PN532 / PN5180 / PN7160 / RC522) from config and exposes read_tag/read_target as
-# both a Python API (for other extras) and GCode commands (for macros).
-# It deliberately does not do lane state machines, Spoolman lookups, LED
-# effects, or scan-jog motion — those live in your macros if you want them.
+# Original NFC gate reader extension
+# Copyright (C) 2026  WoodWorker
+#
+# Goal: Build the configured reader chip driver (PN532 / PN5180 / PN7160 / RC522)
+#       from config and expose read_tag/read_target as both a Python API (for other
+#       extras) and GCode commands (for macros)
+#
+# Extracted from a larger NFC gate-management extension, this module keeps only
+# the hardware layer. It deliberately does not do lane state machines, Spoolman
+# lookups, LED effects, or scan-jog motion — those live in your macros if you
+# want them.
+#
+# (\_/)
+# ( *,*)
+# (")_(") Happy Hare Ready
+#
+# This file may be distributed under the terms of the GNU GPLv3 license, or
+# (at your option) any later version.
 #
 # Config
 # ──────
@@ -44,12 +56,17 @@
 #   #i2c_mcu: mcu                   # which MCU owns the bus (default 'mcu')
 #   #i2c_bus:
 #   #i2c_speed: 100000              # Klipper rejects anything below 100000
+#                                   # With MCU firmware new enough for i2c_transfer, an I2C
+#                                   # NACK takes the reader offline instead of the MCU. A
+#                                   # pn532 on older firmware (or Kalico) warns at startup
 #   #ven_pin: mcu:PG13              # pn7160 only, optional hardware enable/reset
-#   #irq_pin: mcu:PG14              # pn7160 only, optional - recommended for tag homing.
-#                                   # Wired, the presence probe asks the IRQ line and costs
-#                                   # no bus traffic at all; without it the probe reads on
-#                                   # spec once per tick, which works but needs a Klipper
-#                                   # new enough to report an I2C NACK
+#   #irq_pin: mcu:PG14              # pn7160 only, recommended for tag homing. Wired, the
+#                                   # presence probe asks the IRQ line and costs no bus
+#                                   # traffic at all; without it every read is on spec,
+#                                   # which needs MCU firmware with i2c_transfer to report
+#                                   # an I2C NACK. On Kalico irq_pin is required, and the
+#                                   # reader refuses to start without it; with it, it
+#                                   # warns at startup that an I2C fault stops the MCU
 #
 # Transport selection - 'interface'
 # ─────────────────────────────────
@@ -274,6 +291,7 @@ class MmuNfcReader:
                                                    interface=self.interface)
 
         self.alive = False
+        self.startup_warnings = []   # Driver warnings from the last init(), for the console
         self.last_uid = None
         self.last_target_info = None
         self.present = False
@@ -337,7 +355,10 @@ class MmuNfcReader:
         self.last_uid = None
         self.last_target_info = None
         self.present = False
+        self.startup_warnings = []
         self.reader.init()
+        # Drivers without the attribute (SPI, UART) have nothing to report
+        self.startup_warnings = list(getattr(self.reader, 'startup_warnings', None) or [])
         self._apply_rx_gain()
         self.alive = bool(self.reader.is_alive())
         return self.alive
@@ -516,7 +537,7 @@ class MmuNfcReader:
 
         Returns (uid, metadata): metadata is the parsed tag dict (material,
         color_hex, brand, weight_g, temps, tag_format, ...) from
-        tag_parser, or None if the tag carries no recognised rich data
+        tag_parser, or None if the tag carries no recognized rich data
         or the driver can't do structured reads. Updates last_uid/present.
 
         The UID is banked (and returned) BEFORE any metadata work, so a deep read
@@ -759,6 +780,13 @@ class MmuNfcReader:
             gcmd.respond_info("mmu_nfc_reader %s: init error: %s" % (self.name, e))
             return
         gcmd.respond_info("mmu_nfc_reader %s: %s %s" % (self.name, self.reader_type, "OK" if alive else "not responding"))
+        mmu = getattr(getattr(self.mmu_unit, 'mmu_machine', None), 'mmu_controller', None)
+        for warning in self.startup_warnings:
+            msg = "NFC: reader '%s': %s" % (self.name, warning)
+            if mmu is not None:
+                (mmu.log_debug if mmu.p.suppress_klipper_warnings else mmu.log_warning)(msg)
+            else:
+                gcmd.respond_info(msg)
 
 
     def _do_read(self, gcmd):

@@ -10,7 +10,7 @@ Q  ?= @
 # For verbose output (mostly from python builder), set to -v to enable
 V  ?=
 
-# For unittests, e.g. make UT=test_build.py test
+# For unit tests, e.g. make UT=test_build.py test
 # A UT pattern skips the interactive picker, as do ALL=1 (run everything) and LAST=1
 # (re-run the last selection). See test/README.md section 1
 UT ?= *
@@ -24,7 +24,7 @@ JOBS ?= 4
 # vars: export PIP_ARGS='--user --break-system-packages' on a PEP 668 python with no venv
 PIP_ARGS ?=
 
-# CSpell version used by the opt-in spellcheck target. Keep this compatible with
+# CSpell version used by the spellcheck target and CI. Keep this compatible with
 # Node versions commonly found on contributor machines.
 CSPELL_VERSION ?= 9.8.0
 
@@ -40,7 +40,7 @@ ifeq ($(CHECK_OUTPUT_SYNC),)
   # 'console' and 'test' must stay in this list: --output-sync buffers a recipe's output
   # until it finishes, which for an interactive prompt means no prompt at all. 'test' opens
   # the file picker in test/select.py
-  ifeq ($(strip $(filter menuconfig uninstall variables gen_kconfig fix_links console test plot_sync,$(MAKECMDGOALS))),)
+  ifeq ($(strip $(filter menuconfig uninstall variables fix_links console test plot_sync,$(MAKECMDGOALS))),)
     ifneq ($(wildcard $(KCONFIG_CONFIG)),)
       # Check whether $KCONFIG_CONFIG is outdated. if so menuconfig will be triggered and output-sync should stay disabled
       ifeq ($(shell $(MAKE) CHECK_OUTPUT_SYNC=y -q $(KCONFIG_CONFIG) >/dev/null 2>&1 && echo y),y)
@@ -143,9 +143,11 @@ endif
 export OUT ?= $(OUTDIR)/out
 export IN  := $(OUT)/in
 
-# Default unit and mcu naming
-export UNIT_NAME ?= unit0
-export MCU_NAME ?= unit0
+# Default unit and mcu naming. A single unit keeps the name set in its menuconfig;
+# in multi-unit install.sh passes each unit's name instead
+single_unit_name = $(if $(filter y,$(CONFIG_MULTI_UNIT)),,$(call unwrap,$(CONFIG_UNIT_NAME)))
+export UNIT_NAME ?= $(or $(single_unit_name),unit0)
+export MCU_NAME ?= $(or $(single_unit_name),unit0)
 
 # Helper functions/constants
 comma := ,
@@ -166,9 +168,9 @@ MOONRAKER_HOME          := $(call unwrap,$(CONFIG_MOONRAKER_HOME))
 PRINTER_CONFIG_FILE     := $(call unwrap,$(CONFIG_PRINTER_CONFIG_FILE))
 MOONRAKER_CONFIG_FILE   := $(call unwrap,$(CONFIG_MOONRAKER_CONFIG_FILE))
 
-# unit_names: from CONFIG_MMU_UNITS in multi-unit, else default to unit0
+# unit_names: from CONFIG_MMU_UNITS in multi-unit, else the single unit's name
 #unit_names := $(if $(filter y,$(CONFIG_MULTI_UNIT)),$(strip $(subst ",,$(call convert_list,$(call strip_ws_around_commas,$(CONFIG_MMU_UNITS))))),unit0)
-unit_names := $(if $(filter y,$(CONFIG_MULTI_UNIT)),$(call convert_list,$(subst ",,$(CONFIG_MMU_UNITS))),unit0)
+unit_names := $(if $(filter y,$(CONFIG_MULTI_UNIT)),$(call convert_list,$(subst ",,$(CONFIG_MMU_UNITS))),$(UNIT_NAME))
 
 # Use sudo if the klipper home is at a system location (not owned by user)
 SUDO := $(shell \
@@ -185,7 +187,7 @@ restart_klipper = 0
 .SECONDEXPANSION:
 .DEFAULT_GOAL := build
 .PRECIOUS: $(KCONFIG_CONFIG) $(KCONFIG_CONFIG)_%
-.PHONY: menuconfig install uninstall check_version diff lint spellcheck test console filament_display plot_sync venv installer_venv clean_venv build clean variables python_deps fix_links gen_kconfig kconfig_needs_update olddefconfig verify_pickle
+.PHONY: menuconfig install uninstall check_version diff lint spellcheck test console filament_display plot_sync venv installer_venv clean_venv build clean variables python_deps fix_links kconfig_needs_update olddefconfig kconfig_import kconfig_baseline_clean verify_pickle
 .SECONDARY: \
 	$(call backup_name,$(KLIPPER_CONFIG_HOME)/mmu) \
 	$(call backup_name,$(KLIPPER_CONFIG_HOME)/$(MOONRAKER_CONFIG_FILE)) \
@@ -197,9 +199,10 @@ restart_klipper = 0
 ##### File sets #####
 #####################
 
-hh_klipper_extras_files := $(wildcard extras/*.py extras/mmu/*.py extras/mmu/unit/*.py extras/mmu/unit/nfc/*.py extras/mmu/unit/selectors/*.py extras/mmu/commands/*.py)
+hh_klipper_extras_files := $(wildcard extras/*.py extras/mmu/*.py extras/mmu/unit/*.py extras/mmu/unit/nfc/*.py extras/mmu/unit/td1/*.py extras/mmu/unit/selectors/*.py extras/mmu/commands/*.py)
 hh_old_klipper_modules  := mmu_toolhead.py mmu_encoder.py mmu_espooler.py mmu_leds.py mmu_sensors.py mmu/* # These will get removed upon install/uninstall
 hh_old_config_files     := macros/mmu_fan_control.cfg # These will get removed upon install
+hh_old_klipper_files    := extras/mmu/commands/mmu_cut_tip_motion.py # These will get removed upon install
 hh_moonraker_components := $(wildcard components/*.py)
 
 # All repo configs files less mmu_vars.cfg. Zero-length files (e.g. config/base/*.cfg
@@ -246,9 +249,15 @@ install_targets := \
 	$(KLIPPER_CONFIG_HOME)/$(PRINTER_CONFIG_FILE) \
 	$(KLIPPER_CONFIG_HOME)/$(MOONRAKER_CONFIG_FILE)
 
+# GNU make has no globstar: installer/**/Kconfig* matches one level only, so
+# the nested board and starter files need their own patterns or a change to
+# them never marks a config stale.
 kconfig_sources := \
-	$(wildcard $(SRC)/installer/Kconfig* $(SRC)/installer/**/Kconfig*) \
-	$(SRC)/installer/lib/kconfiglib/kconfigfunctions.py
+	$(wildcard $(SRC)/installer/Kconfig* $(SRC)/installer/*/Kconfig* \
+	           $(SRC)/installer/*/*/Kconfig*) \
+	$(SRC)/installer/lib/kconfiglib/kconfigfunctions.py \
+	$(SRC)/installer/lib/kconfiglib/shared_components.py \
+	$(SRC)/installer/lib/kconfiglib/kconfiglib.py
 
 
 ############################
@@ -295,13 +304,21 @@ restart_service = \
 ##### Build targets #####
 #########################
 
+# Interactive Refresh only: each Kconfig file as it was just before menuconfig opened, so
+# the build applies just what menuconfig changed (installer/cfg_import.py writes them)
+MENUCONFIG_BASE := $(OUT)/menuconfig_base
+summary_base = $(or $(HH_RESTORED_FROM),$(call backup_name,$(KLIPPER_CONFIG_HOME)/mmu))
+baseline_pickles := $(if $(filter y,$(F_MENUCONFIG_BASELINE)), \
+	$(addsuffix .pickle,$(filter-out %.pickle,$(wildcard $(MENUCONFIG_BASE)/$(notdir $(KCONFIG_CONFIG))*))))
+
 KCONFIG_PREREQS := \
 	$(KCONFIG_CONFIG) \
-	$(OUT)/$(notdir $(KCONFIG_CONFIG)).pickle
+	$(OUT)/$(notdir $(KCONFIG_CONFIG)).pickle \
+	$(baseline_pickles)
 
 ## Conditional per-unit prerequisite ".mmu_config_<unit>" when multi-unit, else to ".mmu_config" (and pickles)
 KCONF_REQS = $(if $(filter y,$(CONFIG_MULTI_UNIT)), \
-	$(KCONFIG_CONFIG)_% $(OUT)/$(notdir $(KCONFIG_CONFIG))_%.pickle, \
+	$(KCONFIG_CONFIG)_% $(OUT)/$(notdir $(KCONFIG_CONFIG))_%.pickle $(baseline_pickles), \
 	$(KCONFIG_PREREQS))
 
 # Link existing config files to the out/in directory to break circular dependency
@@ -333,6 +350,8 @@ $(OUT)/mmu/%.cfg: $(SRC)/config/%.cfg $(hh_configs_to_parse) $(KCONFIG_PREREQS)
 	$(Q)$(if $(filter $@,$(processed_targets)), \
 		$(PY) -m installer.build $(V) --build "$<" "$@" "$(KCONFIG_CONFIG)" $(hh_configs_to_parse), \
 	        $(info $(C_INFO)Skipping build of mmu/$*$(C_OFF)))
+
+$(OUT)/mmu/base/mmu.cfg $(addprefix $(OUT)/mmu/,$(filter base/mmu_hardware_%.cfg,$(hh_unit_config_files))): $(SRC)/config/components/tmc_options.jinja
 
 # Shared target rules don't work on old make so separate for portability
 $(OUT)/mmu/base/mmu_hardware_%.cfg: \
@@ -426,8 +445,18 @@ install: $(install_targets)
 	$(Q)for f in $(kconfig_files); do \
 		[ -f "$$f" ] && $(SUDO)cp -p "$$f" "$(KLIPPER_CONFIG_HOME)/mmu/$$(basename "$$f")"; \
 	done
-	@# Remove config files retired by this release. The mmu directory backup above preserves them.
+	@# Remove config files retired by this release (the mmu directory backup above preserves them)
+	@# and klipper modules whose links would dangle and break klippy startup
 	$(Q)$(SUDO)rm -f $(addprefix $(KLIPPER_CONFIG_HOME)/mmu/,$(hh_old_config_files))
+	$(Q)$(SUDO)rm -f $(addprefix $(KLIPPER_HOME)/klippy/,$(hh_old_klipper_files))
+	@# Verify installed migration history and retire files of renamed or removed units
+	$(Q)$(if $(wildcard $(KCONFIG_CONFIG).unit_migration),$(eval restart_klipper = 1))
+	$(Q)$(PY) -m installer.unit_migration apply --kconfig "$(KCONFIG_CONFIG)"
+	-$(Q)$(PY) -m installer.unit_migration gate-lists --kconfig "$(KCONFIG_CONFIG)" --config-home "$(KLIPPER_CONFIG_HOME)"
+	@# What this install changed in the Happy Hare .cfg files, against the backup it made or the one
+	@# install.sh restored (none on a first install)
+	-$(Q)[ ! -d "$(summary_base)" ] || $(PY) -m installer.cfg_diff $(V) $(if $(HH_RESTORED_FROM),--restored) \
+		--replaced "$(HH_REPLACED_REPORT)" "$(summary_base)" "$(KLIPPER_CONFIG_HOME)/mmu"
 	@# We are done. Restart everything
 	$(Q)$(call restart_service,$(restart_moonraker),Moonraker,$(CONFIG_SERVICE_MOONRAKER))
 	$(Q)$(call restart_service,$(restart_klipper),Klipper,$(CONFIG_SERVICE_KLIPPER))
@@ -455,7 +484,7 @@ uninstall: clean | python_deps
 	@# Restart services if needed
 	$(Q)$(call restart_service,1,Moonraker,$(CONFIG_SERVICE_MOONRAKER))
 	$(Q)$(call restart_service,1,Klipper,$(CONFIG_SERVICE_KLIPPER))
-	$(Q)rm -f $(KCONFIG_CONFIG) $(KCONFIG_CONFIG).old $(KCONFIG_CONFIG)_*
+	$(Q)rm -f $(KCONFIG_CONFIG) $(KCONFIG_CONFIG).old $(KCONFIG_CONFIG)_* $(KCONFIG_CONFIG).*.changes $(KCONFIG_CONFIG).unit_migration
 	$(Q)$(PY) -m installer.build $(V) --print-unhappy-hare "Done. Very unHappy Hare."
 
 fix_links:
@@ -474,10 +503,6 @@ fix_links:
 # Look for version number in current config files and report
 check_version: $(hh_configs_to_parse) $(KCONFIG_PREREQS) | python_deps
 	$(Q)$(PY) -m installer.build $(V) --check-version "$(KCONFIG_CONFIG)" $(hh_configs_to_parse)
-
-gen_kconfig: | python_deps
-	@echo "$(C_NOTICE)kconfig=$(KCONFIG_CONFIG)$(C_OFF)"
-	$(Q)$(PY) -m installer.build $(V) --gen-kconfig-options "$(KCONFIG_CONFIG)"
 
 clean:
 	$(Q)rm -rf $(OUT)
@@ -528,13 +553,20 @@ $(STAMP_DIR)/.python-deps-installed-$(python_deps_pyid): $(SRC)/installer/requir
 	}
 	$(Q)touch $@
 
-$(OUT)/$(notdir $(KCONFIG_CONFIG)).pickle: $(KCONFIG_CONFIG) | python_deps $(OUT)
+# The Kconfig sources are prerequisites too: the pickle holds the parsed TREE,
+# not just the saved values, so a pulled-in Kconfig change invalidates it even
+# when .mmu_config is untouched. install.sh hides this by running olddefconfig
+# first, but a bare `make install` after a `git pull` does not.
+$(OUT)/$(notdir $(KCONFIG_CONFIG)).pickle: $(KCONFIG_CONFIG) $(kconfig_sources) | python_deps $(OUT)
 	$(Q)echo "$(C_INFO)Pre-parsing Kconfig $(notdir $(KCONFIG_CONFIG))$(C_OFF)"
 	$(Q)$(PY) -m installer.build $(V) --pre-parse-kconfig "$(KCONFIG_CONFIG)"
 
-$(OUT)/$(notdir $(KCONFIG_CONFIG))_%.pickle: $(KCONFIG_CONFIG)_% | python_deps $(OUT)
+$(OUT)/$(notdir $(KCONFIG_CONFIG))_%.pickle: $(KCONFIG_CONFIG)_% $(kconfig_sources) | python_deps $(OUT)
 	$(Q)echo "$(C_INFO)Pre-parsing Kconfig $(notdir $(KCONFIG_CONFIG)_$*)$(C_OFF)"
 	$(Q)$(PY) -m installer.build $(V) --pre-parse-kconfig "$(KCONFIG_CONFIG)_$*"
+
+$(MENUCONFIG_BASE)/%.pickle: $(MENUCONFIG_BASE)/% | python_deps
+	$(Q)$(PY) -m installer.build $(V) --pre-parse-kconfig "$<" "$@"
 
 
 diff= \
@@ -671,6 +703,7 @@ variables:
 	@echo "$(C_NOTICE)hh_klipper_extras_files        =$(C_INFO) $(hh_klipper_extras_files)$(C_OFF)"
 	@echo "$(C_NOTICE)hh_old_klipper_modules         =$(C_INFO) $(hh_old_klipper_modules)$(C_OFF)"
 	@echo "$(C_NOTICE)hh_old_config_files            =$(C_INFO) $(hh_old_config_files)$(C_OFF)"
+	@echo "$(C_NOTICE)hh_old_klipper_files           =$(C_INFO) $(hh_old_klipper_files)$(C_OFF)"
 	@echo "$(C_NOTICE)hh_moonraker_components        =$(C_INFO) $(hh_moonraker_components)$(C_OFF)"
 	@echo "$(C_NOTICE)repo_cfgs                      =$(C_INFO) $(repo_cfgs)$(C_OFF)"
 	@echo "$(C_NOTICE)unit_names                     =$(C_INFO) $(unit_names)$(C_OFF)"
@@ -722,16 +755,35 @@ menuconfig: $(SRC)/installer/Kconfig | python_deps
 ##### Upgrade helper targets #####
 ##################################
 
+# KCONFIG_PARENT is the top-level config a per-unit config inherits printer-level
+# values from, so saving the top level also marks every unit stale. A unit sharing
+# another unit's component is also stale once that owner's saved values differ from
+# the ones it was configured against (shared_components.py).
 kconfig_needs_update:
 	$(Q)if [ ! -f "$(KCONFIG_CONFIG)" ]; then \
 		echo y; \
 		exit 0; \
 	fi; \
-	for f in $(kconfig_sources); do \
+	for f in $(kconfig_sources) $(KCONFIG_PARENT); do \
 		[ "$$f" -nt "$(KCONFIG_CONFIG)" ] && { echo y; exit 0; }; \
 	done; \
-	echo n
+	if [ -n "$(KCONFIG_PARENT)" ]; then \
+		$(PY) -m shared_components stale "$(KCONFIG_CONFIG)" "$(KCONFIG_PARENT)" 2>/dev/null || echo n; \
+	else \
+		echo n; \
+	fi
 
 olddefconfig: | python_deps
 	$(Q)$(PY) -m olddefconfig $(SRC)/installer/Kconfig >/dev/null
 	$(Q)touch "$(KCONFIG_CONFIG)"
+
+# Interactive Refresh: report .cfg values menuconfig doesn't show to HH_IMPORT_REPORT and
+# save the menuconfig baseline, or with HH_IMPORT_APPLY import those reported. A unit's
+# config has no paths, so install.sh passes the top level's in HH_CONFIG_HOME
+kconfig_import: | python_deps
+	-$(Q)$(PY) -m installer.cfg_import $(V) --kconfig "$(KCONFIG_CONFIG)" \
+		--config-home "$(or $(HH_CONFIG_HOME),$(KLIPPER_CONFIG_HOME))" \
+		$(if $(HH_IMPORT_APPLY),--apply,--report) "$(HH_IMPORT_REPORT)" --baseline "$(MENUCONFIG_BASE)"
+
+kconfig_baseline_clean:
+	$(Q)rm -rf "$(MENUCONFIG_BASE)"

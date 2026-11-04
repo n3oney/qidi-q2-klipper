@@ -1,5 +1,11 @@
+# Happy Hare MMU Software
+#
+# Copyright (C) 2022-2026  moggieuk#6538 (discord)
+#                          moggieuk@hotmail.com
+#
 # IMPORTANT: Happy Hare TOKEN naming convention and kconfig features:
 #   PARAM_*                Symbols of various types used in template rendering
+#   VAR_*                  String symbols for macro variables; written as '' rather than empty
 #   PIN_*                  Used for string symbols representing pins
 #   BOOL_*                 Boolean symbols often used to set prompt-less int PARAMS
 #   MMU_HAS_*              Used for MMU hardware components like encoder
@@ -40,27 +46,86 @@
 #   generated_default "neopixel:$(UNIT_NAME)_gate%i_leds (1-%d)" "PARAM_NUM_GATES" PARAM_NUM_GATES
 #   generated_default "{(%i + 1) % %d}" "PARAM_NUM_GATES" ", " 0 PARAM_NUM_GATES
 #
-# 2. Added float type
-# 3. Option 'forceshow' to force symbols or menus to display even if their dependency isn't met
+# 2. Added float type (also accepts quoted numbers in saved configurations)
+# 3. Option 'forceshow' to force symbols or menus to display even if their dependency isn't met.
+#    'forceshow if <expr>' does so only while <expr> holds
+#    A forced row whose prompt condition is false is read-only: neither space nor 'r' changes it,
+#    and it shows as fixed (-*- or - -) even when another prompt can change the symbol
 # 4. Recording of default value with #~DEFAULT~# magic token
 # 5. Preprocessor function 'saved-config-value' to read a symbol's previous assignment from
 #    KCONFIG_CONFIG before normal config loading, including lines marked with #~DEFAULT~#
-# 6. repeat expansion macro to avoid multiple lines (can be nested):
+# 6. repeat expansion macro to avoid multiple lines (can be nested); min/max may also be
+#    preprocessor variables or functions, e.g. max=$(owner-max,buffer):
 #      @repeat var=i min=0 max=3@
 #        config PARAM_MMU_CANBUS_UNIT_$(i)
 #          string "CANbus UUID for MMU unit $(i)"
 #      @endrepeat@
+#    A 'source' in the body works; $(i) is substituted only in the body, so pass
+#    it to the sourced file in a variable assigned on the line before
 # 7. help added to menus
 # 8. "if XX" construct is allowed on comment lines
 # 9. Added 'array_editor <separator> [size]' option for strings that represent lists
 #    E.g. `array_editor ";" PARAM_NUM_GATES
 # 10. Added 'boolint' and 'defboolint' types: Boolean UI/logic with numeric 0/1 output
-# 11. Font manipulators like [[B]]xx[[/B] can be used in prompts and comments
+# 11. Font manipulators like [[B]]xx[[/B]] can be used in prompts, comments and help
 #    and include: B,BOLD,DIM,U,UNDERLINE,REV,REVERSE,C:n,COLOR:n (color), RESET
 # 12. Derived array-size mismatch checks for warnings:
 #      config WARN_ARRAY_LENGTH
 #        bool
 #        array_size_mismatch PARAM_ARRAY
+# 13. $(macro) references expand in a named choice, not just a config name.
+#     This is what lets a shared fragment under components/ be sourced once
+#     per consumer and still declare its own choices:
+#       prefix := GEAR
+#       source "components/Kconfig.tmc_driver_types"
+#     Re-assign every variable immediately before each source - they are
+#     global for the whole parse.
+# 14. HH_RENAMED_SYMBOLS in kconfiglib.py carries a saved .mmu_config value
+#     from a renamed symbol to its replacement at load time. Add an entry in
+#     the same commit as the rename. Cannot be used for a symbol that make or
+#     install.sh reads by name, since both read the file before this runs.
+#     HH_MCU_PREFIXED_RENAMES adds the MCU to a carried pin, and
+#     HH_REMOVED_I2C_BUSES keeps a v4.0 environment sensor i2c bus
+# 15. 'default_when_hidden' on a menuconfig/menu (or symbol) saves a symbol
+#     under it whose prompt is hidden as a #~DEFAULT~# value, so turning the
+#     entry off reverts any customization to the (still tracked) default.
+# 16. 'validator "<regexp>"' on a string symbol makes menuconfig reject an edit whose value
+#     (or, with array_editor, any element) doesn't fullmatch the regexp, ignoring surrounding
+#     whitespace. Kconfig strings drop backslashes, so write '\\d' for \d, or prefer
+#     classes like [0-9] and [(]. A $(macro) can hold a shared pattern (see Kconfig.leds)
+# 17. $(macro) references are expanded in help text, e.g. the shared $(pin_help).
+#     $(nl) is a newline, so one variable can hold several help lines
+#     [[VALUE:SYM]] (or [[VALUE:SYM:width]]) in a prompt, comment or help shows SYM's
+#     live value in menuconfig; $(pad,...) counts it as 'width' and other markup as 0
+# 18. 'sequence_editor <separator> [baseline]' on a string symbol holding unique names edits
+#     it as a list that tracks adds, renames, removals and moves relative to the baseline,
+#     recorded in a '<config>.<SYMBOL>.changes' sidecar on save. 'append_only_unless <expr>'
+#     limits it to appending while <expr> is n
+# 19. 'reparse_env "<VAR> [<VAR>...]"' on a symbol whose value the tree is built from via
+#     those env vars (UNIT_NAME): changing it in menuconfig re-parses with the new value
+#     so every default derived from them is recomputed in the same session
+# 20. Shared components: 'owner-*' preprocessor functions (shared_components.py) let a unit
+#     parse read the OTHER units' saved configs via KCONFIG_PARENT: the names of the units'
+#     own encoders/buffers and an owner's capabilities, for a sharer naming it. Used through
+#     the components/Kconfig.shared_export fragment.
+#     $(printer-flag,SYM) reads a printer-level flag from the top-level config
+# 21. 'range' accepts multiple low/high pairs: 'range 0 0 5 200' allows 0 or 5-200.
+# 22. 'dim' on a comment draws its whole row dimmed, including the "***" decoration:
+#       comment "Note" if COND
+#         dim
+# 23. A $(macro) in a symbol position whose expansion holds whitespace or starts with '!'
+#     or '(' is lexed as that expression, so a component can take a condition from its
+#     caller (anything else stays one symbol name, as upstream):
+#       servo_visible := MMU_HAS_BLOBIFIER && CHOICE_BLOBIFIER_TYPE_SERVO
+#       prompt "..." if $(servo_visible)
+# 24. 'link <SYMBOL>' on a comment makes it a menuconfig row that jumps to where SYMBOL is
+#     shown (its menu, cursor on it); ESC from there returns. Comments accept help for it:
+#       comment "Blobifier macro variables"
+#         link VAR_BLOBIFIER_PURGE_SPD
+# 25. 'keep_when_hidden' on a menuconfig/menu (or symbol) saves a symbol under it
+#     whose prompt is hidden (or absent) with the user's value, so turning a
+#     parent off doesn't lose the customization (the opposite of 15). Use it where
+#     the .cfg still renders the option while hidden and hiding doesn't impose a value
 #
 # Menuconfig:
 # 1. 'r' to reset value to default
@@ -68,6 +133,10 @@
 # 3. Lots of formatting changes and style options
 # 4. Variable input dialogs with better parsing
 # 5. Added array editor - used on "," or ";" separated strings
+# 6. Edited strings are checked against their 'validator' regexp
+# 7. Added sequence editor - list editor with explicit add/rename/remove/move
+# 8. Link rows ('link <SYMBOL>' comments) jump elsewhere in the tree; ESC returns to them
+# 9. The help separator names the [section], option and .cfg file a symbol or choice sets
 #
 #
 # Capability params:
@@ -79,6 +148,7 @@
 #   MMU_HAS_FILAMENT_BUFFER
 #   MMU_HAS_HEATER
 #   MMU_HAS_HEATER_FANS
+#   MMU_HAS_CONTROLLER_FAN
 #   MMU_HAS_LEDS
 #   MMU_HAS_FANS
 #   MMU_HAS_PER_GATE_CONFIG
@@ -111,13 +181,19 @@ happy_hare_version := $(HH_VERSION)
 hh_message  := Happy Hare v$(happy_hare_version)
 unit_suffix := $(unit-suffix,$(UNIT_NAME))
 title       := $(menu-title,$(F_MULTI_UNIT_ENTRY_POINT),$(hh_message),$(unit_suffix))
-caption     := $(menu-caption,$(F_MULTI_UNIT_ENTRY_POINT),$(hh_message),$(unit_suffix))
-caption_pad := 61
+caption     := $(menu-caption,$(F_MULTI_UNIT_ENTRY_POINT),$(hh_message),$(unit-suffix,$(UNIT_NAME),20))
+caption_pad := 50
 
-# Expose these capability params to each unit
-mmu_has_sensor_toolhead := $(env-is-y,HAS_SENSOR_TOOLHEAD)
-mmu_has_sensor_extruder := $(env-is-y,HAS_SENSOR_EXTRUDER)
-mmu_has_toolhead_cutter := $(env-is-y,HAS_TOOLHEAD_CUTTER)
+# Most gates one unit can configure: ./install.sh -g, else the saved MAX_GATES, else 12.
+# Every per-gate @repeat runs 0..max_gate
+saved_max_gates := $(first-nonempty,$(saved-config-value,MAX_GATES),12)
+max_gates := $(first-nonempty,$(env-default,F_MAX_GATES),$(saved_max_gates))
+max_gate  := $(last-index,$(max_gates))
+
+# Printer-level capabilities each unit takes from the top-level config (KCONFIG_PARENT)
+mmu_has_sensor_toolhead := $(printer-flag,MMU_HAS_SENSOR_TOOLHEAD)
+mmu_has_sensor_extruder := $(printer-flag,MMU_HAS_SENSOR_EXTRUDER)
+mmu_has_toolhead_cutter := $(printer-flag,MMU_HAS_TOOLHEAD_CUTTER)
 
 # Used to dynamically get the serial device paths
 all_serial_devices  := $(shell, ls /dev/serial/by-id/* 2>/dev/null || true)
@@ -147,10 +223,27 @@ buffer_canbus_config = $(buffer-canbus-choice,$(canbus_connection,$(1)))
 # Used for comment padding
 pad = $(hh-pad,$(1),$(2))
 
+# Validator and help syntax shared by every PIN_ prompt. An empty pin is valid.
+# $(nl) is a real newline, so help text can span lines
+nl            := $(hh-newline)
+pin_item           := [~^]?!?([A-Za-z0-9_-]+:)?[A-Za-z0-9_./-]+
+pin_validator      := ($(pin_item))?
+pin_list_validator := ($(pin_item)( *, *$(pin_item))*)?
+
+# A Klipper object name (as for a unit), or empty
+object_name_validator := ([a-z][a-z0-9_-]*)?
+pin_syntax    := Syntax:  [[REV]][^|~] [!] [chip_name:] pin_or_alias_name[[/REV]]
+pin_example   := $(hh-pin-example,$(F_MULTI_UNIT_ENTRY_POINT))
+pin_help      := $(pin_syntax)$(nl)$(pin_example)
+diag_pin_help := $(pin_help)$(nl)$(nl)TMC2209/2226 DIAG usually needs a pullup: [[REV]]^[[/REV]]$(nl)TMC2130/2240/5160 DIAG is active low so it usually needs pullup and invert: [[REV]]^![[/REV]]
+
 # To allow multiline config strings.
 # Important: Use $(comma) & $(quote) instead of real comma's or double quotes in multiline strings
 # The Python preprocessor keeps this portable without launching awk for every board.
 comma := ,
+
+# Shown under a feature whose hardware a board supplies itself (CUSTOM_* flag)
+misc_hardware_hint := Defined and fixed by design/mcu
 quote := "
 ml = $(hh-multiline,$(1))
 
@@ -170,9 +263,15 @@ config MULTI_UNIT_ENTRY_POINT
   bool
   default "$(F_MULTI_UNIT_ENTRY_POINT)"
 
-config PER_GATE_MCU
-  bool
-  default "$(F_PER_GATE_MCU)"
+# Installer-owned history: retained even when menuconfig rewrites hidden values.
+config PARAM_STATE_MIGRATION
+  string
+  default "{}"
+  keep_when_hidden
+
+config MAX_GATES
+  int
+  default $(max_gates)
 
 if MULTI_UNIT_ENTRY_POINT || !MULTI_UNIT
   config MMU_UNITS
@@ -205,26 +304,18 @@ if MULTI_UNIT && !MULTI_UNIT_ENTRY_POINT
 endif
 
 comment "$(pad,50,)"
-comment "$(pad,50,(\\_/))"
+comment "$(pad,50,(\_/))"
 comment "$(pad,50,( *,*))"
-comment "$(pad,$(caption_pad),(\")_(\") $(caption))"
+comment "$(pad,$(caption_pad),($(quote))_($(quote)) $(caption))"
 comment "$(pad,50,)"
 comment "_"
-
-# UI rendering option:
-#  y to shows MMU additions menu inline with type
-#  n to show as top level menu
-config SHOW_MMU_ADDITIONS_WITH_TYPE
-  def_bool n
 
 config SHOW_HIDDEN
   def_bool n
 
-# Optional auto generated config for shared components to
-# adds options for sharing previously defined components
-# (like mmu_toolhead, encoder, sync-feedback, ...)
-osource "/tmp/.Kconfig.generated"
-
+# A type that lets the user choose its MCU topology selects this
+config SHOW_PER_GATE_MCU
+  def_bool n
 
 # -------------------------------------
 # Initial menuconfig for multi-unit
@@ -232,15 +323,17 @@ osource "/tmp/.Kconfig.generated"
 
 if MULTI_UNIT_ENTRY_POINT
   config MMU_UNITS
-    prompt "MMU unit names"
-    array_editor ","
+    prompt "MMU units"
+    sequence_editor "," "$(env-default,F_UNITS_BASELINE,)"
+    append_only_unless "$(env-default,F_UNITS_RESTRUCTURE,n)"
+    validator "[a-z][a-z0-9_-]*"
     help
-      Comma-separated list of unit names. Careful: Use only alphanumeric characters.
-      If this is the first time configuring multi-unit from previous single-unit install
-      then the first name must be unit0 because that is how it was configured.
-      E.g. "unit0,unit1"
-
-      A separate configurator will be run for each MMU after this initial screen is closed
+      Units in gate order. Names: lowercase letters, digits, "_" and "-".
+      [a] add a unit at the end. [r] rename, [d] delete and [K/J] move keep
+      each unit's settings and saved state, but once installed are only
+      allowed in the installer's [[REV]]Replace[[/REV]] mode (option 2). Moving or
+      removing a unit renumbers the gates of the units after it.
+      Each unit is configured on its own screen after this one is closed
 
   comment "_"
   comment "_Shared System Options"
@@ -249,7 +342,9 @@ if MULTI_UNIT_ENTRY_POINT
   source "Kconfig.options"          # Main software options
   source "Kconfig.tip_shaping"
   source "Kconfig.purging"
-  source "Kconfig.speeds"           # Access to extruder speeds
+  menu "Extruder speeds"
+    source "Kconfig.extruder_speeds"
+  endmenu
   source "macro_vars/Kconfig"       # Variables for all macros
 
   # These are duplicated settings that are excluded from units when MULTI_UNIT
@@ -271,11 +366,9 @@ endif
 
 if !MULTI_UNIT_ENTRY_POINT
   source "mmu_types/Kconfig"        # Base MMU type menu
-  source "Kconfig.name"             # Simple display name
   source "boards/Kconfig"           # MCU Selection menu
-  if !SHOW_MMU_ADDITIONS_WITH_TYPE
-    source "Kconfig.mmu_additions"  # MMU Additions/Customization menu (if not inlined with MMU type)
-  endif
+  source "Kconfig.name"             # Simple display name
+  source "Kconfig.mmu_additions"    # MMU Additions/Customization menu
   comment "_"
   source "connection/Kconfig"       # MCU Connection
   source "Kconfig.pins"             # Raw pin editing
@@ -293,7 +386,7 @@ if !MULTI_UNIT_ENTRY_POINT
     source "Kconfig.tip_shaping"
     source "Kconfig.purging"
   endif
-  source "Kconfig.speeds"           # All speeds
+  source "Kconfig.kinematics"       # Gear/selector steppers, selector servo and speeds
   if !MULTI_UNIT
     source "macro_vars/Kconfig"     # Variables for all macros
   endif

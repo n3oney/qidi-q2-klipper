@@ -3,7 +3,7 @@
 # The UART transport is structurally unlike I2C and SPI, and the differences are all
 # invisible from higher up. I2C/SPI are query-then-read with a host-chosen length;
 # UART is a push stream with neither. So the risk sits in three places, and this
-# file is organised around them:
+# file is organized around them:
 #
 #   1. THE FRAMER. Reassembling frames out of a byte stream: leading padding,
 #      garbage resync, partial frames held across ticks, both checksums. Tested as a
@@ -138,7 +138,7 @@ class TestHsuFramer(unittest.TestCase):
         f, got = self._one([PN532_UART_ACK])
         self.assertEqual(got[0], FRAME_ACK)
         self.assertEqual(list(got[1]), PN532_ACK,
-                         'the framer must normalise an ACK back to the canonical '
+                         'the framer must normalize an ACK back to the canonical '
                          'preamble-first form the driver compares against')
 
     def test_nack(self):
@@ -149,7 +149,7 @@ class TestHsuFramer(unittest.TestCase):
         """
         A real chip emits 0x00 padding ahead of a frame. Note the discard count is
         padding + 1: the frame's own preamble 0x00 is indistinguishable from padding,
-        so the framer syncs on the two-byte start code and re-synthesises a preamble.
+        so the framer syncs on the two-byte start code and re-synthesizes a preamble.
         """
         f, got = self._one([PN532_HSU_PADDING + PN532_UART_ACK])
         self.assertEqual(list(got[1]), PN532_ACK)
@@ -1073,23 +1073,21 @@ class TestRenderedConfig(unittest.TestCase):
         for name in ('unit0_nfc1', 'unit0_nfc2', 'unit0_nfc3'):
             self.assertEqual(sections[name]['reader_type'], 'rc522', name)
             self.assertIn('cs_pin', sections[name], name)
-            self.assertNotIn('interface', sections[name],
-                             '%s uses its default transport, so the key is noise'
-                             % name)
+            self.assertEqual(sections[name]['interface'], 'spi', name)
 
-    def test_default_transports_emit_no_interface_key(self):
+    def test_default_transports_render_the_chip_default(self):
         """
-        Every chip keeps the transport it has always had, and the rendered config
-        stays byte-identical for those - `interface:` is written only when it differs
-        from the chip default. Guards against churn in everyone else's config.
+        Every chip keeps the transport it has always had. `interface:` is always
+        written, so for these it must be exactly what klippy would have defaulted to.
         """
+        from extras.mmu.unit.nfc import reader_factory
         for profile in ('nfc_single', 'nfc_pn5180', 'nfc_pn532',
                         'nfc_pn532_sw_i2c', 'nfc_per_gate',
                         'nfc_pn5180_per_gate'):
             for name, keys in self.reader_sections(profile).items():
-                self.assertNotIn('interface', keys,
-                                 '%s/%s should not have gained an interface key'
-                                 % (profile, name))
+                self.assertEqual(keys.get('interface'),
+                                 reader_factory.default_interface(keys['reader_type']),
+                                 '%s/%s' % (profile, name))
 
     def test_existing_transports_still_render_their_blocks(self):
         """The other half of the dispatch change: SPI and I2C still work."""

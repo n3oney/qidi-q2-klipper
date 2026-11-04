@@ -35,9 +35,14 @@
 # behind `if MULTI_UNIT_ENTRY_POINT`. That is why a multi-unit profile cannot be expressed as
 # one larger syms dict, and why the env is per-parse rather than module state.
 #
+# A unit parse also reads the OTHER units' saved configs (KCONFIG_PARENT, see
+# installer/lib/kconfiglib/shared_components.py) for the encoders and buffers they own and
+# their capabilities, so a multi-unit render writes each config, in order, into a private
+# scratch directory - the only files the harness writes.
+#
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
-import os, re, sys, contextlib, configparser
+import os, re, sys, atexit, contextlib, configparser, glob, shutil, tempfile
 
 HARNESS_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(os.path.dirname(HARNESS_DIR))
@@ -112,7 +117,11 @@ _BASE_ENV = {
     'CONFIG_KLIPPER_CONFIG_HOME': '/nonexistent/printer_data/config',
     'CONFIG_MOONRAKER_HOME': '/nonexistent/moonraker',
     'CONFIG_SERVICE_KLIPPER': 'klipper.service',
-    'F_PER_GATE_MCU': '',
+    'F_MAX_GATES': '',
+    # `make test` exports KCONFIG_CONFIG=.mmu_config; saved-config-value must not read a
+    # developer's real one. A unit parse of a multi-unit render sets KCONFIG_PARENT itself.
+    'KCONFIG_CONFIG': '/nonexistent/.mmu_config',
+    'KCONFIG_PARENT': '',
 }
 
 # What install.sh passes when there is no MULTI_UNIT (install.sh:397-398 takes the else
@@ -233,14 +242,6 @@ def _kconfig(label, syms):
     return _apply_syms(_new_kconfig(label), label, syms)
 
 
-def _flag(kc, name):
-    """
-    A Kconfig bool as the 'y'/'' shape install.sh:424-426 hands down to each unit. Guarded
-    on existence because the symbol lives behind an `if` in some configurations.
-    """
-    return 'y' if (name in kc.syms and kc.is_enabled(name)) else ''
-
-
 def _render_templates(templates, kc, extra, name_of=None):
     """
     Render `templates` with `kc`, keyed by the INSTALLED name. `name_of` maps a template
@@ -279,12 +280,15 @@ def _render_kconfig_key():
     """Environment identity for a parsed tree used only during rendering.
 
     Kconfig expands environment variables while parsing, including variables referenced by
-    recursive preprocessor functions. Keying on the complete environment is intentionally
+    recursive preprocessor functions, and a unit parse's shared-component functions read the
+    other units' saved configs, so their view is part of the key too. Keying on the complete
+    environment is intentionally
     conservative: an unrelated change merely costs another parse, while omitting a relevant
     value could render valid-looking pins for the wrong unit. Dynamic discovery is already
-    assumed stable for a process by `_render_cache`, which memoises final output.
+    assumed stable for a process by `_render_cache`, which memoizes final output.
     """
-    return tuple(sorted(os.environ.items()))
+    import shared_components
+    return tuple(sorted(os.environ.items())), shared_components.context_key()
 
 
 def _kconfig_for_render(label, syms):
@@ -324,6 +328,8 @@ def render(profile):
     # multi-unit profiles differing only in a unit's config would collide, and - worse - the
     # unchanged-boxturtle leak test would pass by returning a cached render.
     key = (profile.name,
+           getattr(profile, 'unit_name', None),
+           getattr(profile, 'max_gates', None),
            tuple(sorted(profile.syms.items())),
            tuple(sorted(profile.extra_params.items())),
            tuple((u.name, u.mcu_name, u.index, tuple(sorted(u.syms.items())))
@@ -338,8 +344,17 @@ def render(profile):
     return out
 
 
+def profile_env(profile):
+    """The parse env a profile adds to every unit's, as install.sh exports it (-g)."""
+    max_gates = getattr(profile, 'max_gates', None)
+    return {'F_MAX_GATES': str(max_gates)} if max_gates else {}
+
+
 def _render_single_unit(profile):
-    with _env(_SINGLE_UNIT_ENV):
+    env = dict(_SINGLE_UNIT_ENV, **profile_env(profile))
+    if getattr(profile, 'unit_name', None):
+        env.update(UNIT_NAME=profile.unit_name, MCU_NAME=profile.unit_name)
+    with _env(env):
         kc = _kconfig_for_render(profile.name, profile.syms)
 
     # Note we do NOT inject UNIT_NAME/MCU_NAME as jinja params. Production does not
@@ -351,7 +366,32 @@ def _render_single_unit(profile):
     return _render_templates(BASE_TEMPLATES, kc, extra)
 
 
-def _render_multi_unit(profile, units):
+_scratch = []
+
+
+def _scratch_configs():
+    """The parent config path in a per-process directory, emptied of any earlier render."""
+    if not _scratch:
+        _scratch.append(tempfile.mkdtemp(prefix='hh-harness-'))
+        atexit.register(shutil.rmtree, _scratch[0], True)
+    for path in glob.glob(os.path.join(_scratch[0], '.mmu_config*')):
+        os.remove(path)
+    return os.path.join(_scratch[0], '.mmu_config')
+
+
+def render_via_files(profile):
+    """
+    A multi-unit render the way `make install` builds it: each unit's config is written as in
+    render(), then loaded back with the real build.KConfig in the build's env (no
+    KCONFIG_PARENT, UNIT_NAME=unit0, filter_defaults=False) and rendered from that. Not
+    memoised. render() should equal this; a difference means the harness and the build
+    read a saved config differently.
+    """
+    _prepare_imports()
+    return _render_multi_unit(profile, tuple(profile.units), via_files=True)
+
+
+def _render_multi_unit(profile, units, via_files=False):
     """
     Three parses, mirroring install.sh run_kconfig_top (:385-399) + run_kconfig_units
     (:401-432): one entry-point parse for the shared files, then one per unit.
@@ -365,33 +405,42 @@ def _render_multi_unit(profile, units):
     # Entry point. UNIT_NAME is set to the joined list because Kconfig:159-162 defaults
     # MMU_UNITS from it; a profile that sets MMU_UNITS explicitly (as it should) just
     # overrides that with the same value.
-    with _env(dict(_SINGLE_UNIT_ENV,
+    with _env(dict(_SINGLE_UNIT_ENV, **profile_env(profile),
                    F_MULTI_UNIT='y',
                    F_MULTI_UNIT_ENTRY_POINT='y',
                    UNIT_NAME=','.join(names),
                    MCU_NAME=','.join(names))):
         entry_kc = _kconfig_for_render(profile.name, profile.syms)
 
-    # Printer-level capabilities the units need to know about, read back off the entry parse
-    # exactly as install.sh:418-427 reads them back out of the top-level config file.
-    handed_down = {
-        'HAS_SENSOR_TOOLHEAD': _flag(entry_kc, 'MMU_HAS_SENSOR_TOOLHEAD'),
-        'HAS_SENSOR_EXTRUDER': _flag(entry_kc, 'MMU_HAS_SENSOR_EXTRUDER'),
-        'HAS_SENSOR_TOOLHEAD_CUTTER': _flag(entry_kc, 'MMU_HAS_TOOLHEAD_CUTTER'),
-    }
+    parent = _scratch_configs()
+    entry_kc.write_config(parent)
 
-    unit_kcs = []
-    for unit in units:
-        with _env(dict(_SINGLE_UNIT_ENV, **dict(
-                handed_down,
-                F_MULTI_UNIT='y',
-                F_MULTI_UNIT_ENTRY_POINT='',
-                UNIT_NAME=unit.name,
-                MCU_NAME=unit.mcu_name,
-                UNIT_INDEX=str(unit.index)))):
-            unit_kcs.append(
-                (unit, _kconfig_for_render(
-                    '%s:%s' % (profile.name, unit.name), unit.syms)))
+    def unit_kconfig(unit):
+        with _env(dict(_SINGLE_UNIT_ENV, **profile_env(profile),
+                       F_MULTI_UNIT='y',
+                       F_MULTI_UNIT_ENTRY_POINT='',
+                       UNIT_NAME=unit.name,
+                       MCU_NAME=unit.mcu_name,
+                       UNIT_INDEX=str(unit.index),
+                       KCONFIG_PARENT=parent)):
+            kc = _kconfig_for_render('%s:%s' % (profile.name, unit.name), unit.syms)
+        kc.write_config('%s_%s' % (parent, unit.name))
+        return kc
+
+    import shared_components
+    unit_kcs = [(unit, unit_kconfig(unit)) for unit in units]
+    # install.sh's second refresh: a sharer saved before its owner picks up the owner's values
+    unit_kcs = [(unit, unit_kconfig(unit)
+                 if shared_components.stale('%s_%s' % (parent, unit.name), parent) else kc)
+                for unit, kc in unit_kcs]
+
+    if via_files:
+        import installer.build as build
+        with _env(dict(_SINGLE_UNIT_ENV, **profile_env(profile), KCONFIG_CONFIG=parent)), \
+                _chdir(INSTALLER):
+            entry_kc = build.KConfig(parent)
+            unit_kcs = [(unit, build.KConfig('%s_%s' % (parent, unit.name)))
+                        for unit, _kc in unit_kcs]
 
     # The SUM across units, not this unit's count - build.py:481-492. It drives the Tx macro
     # wrappers, which are printer-wide.
@@ -568,7 +617,7 @@ def assemble(rendered, printer_stub='', macros=True):
     if printer_stub:
         fileconfig.read_string(printer_stub, source='printer_stub.cfg')
     # Insertion order IS include order. render() builds its dict by iterating
-    # BASE_TEMPLATES so this is identical for a profile, and it generalises to the
+    # BASE_TEMPLATES so this is identical for a profile, and it generalizes to the
     # arbitrary file set load_install_dir() produces.
     for name, text in rendered.items():
         fileconfig.read_string(text, source=name)

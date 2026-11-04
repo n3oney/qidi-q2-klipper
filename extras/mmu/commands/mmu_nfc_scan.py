@@ -104,6 +104,11 @@ class MmuNfcScanCommand(BaseCommand):
             self.mmu.log_error("Operation not possible: Can't crossload on this mmu type")
             return
 
+        # The scan jogs forward past the gate endstop, toward a selector held at another gate
+        if scan_unit.crossload_in_place(gate):
+            self.mmu.log_error("Operation not possible: Can't NFC scan another gate while filament is loaded on this mmu type")
+            return
+
         mmu.log_always("Scanning gate %d for NFC tag..." % gate)
         try:
             with mmu.wrap_sync_gear_to_extruder():
@@ -128,4 +133,4 @@ class MmuNfcScanCommand(BaseCommand):
                                     mmu.initialize_encoder() # Encoder 0000
 
         except MmuError as ee:
-            mmu.handle_mmu_error("NFC scan for gate %d failed: %s" % (gate, str(ee)))
+            mmu.handle_mmu_error(ee.with_message("NFC scan for gate %d failed: %s" % (gate, str(ee))))

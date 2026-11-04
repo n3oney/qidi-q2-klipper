@@ -54,7 +54,10 @@ class MmuMachineParameters(TunableParametersBase):
         ParamSpec('gcode_unload_sequence',         'int',       0, section="PRINTER", hidden=True),
         ParamSpec('force_form_tip_standalone',     'int',       0, section="PRINTER", limits=dict(minval=0, maxval=1)),
         ParamSpec('slicer_tip_park_pos',           'float',   0.0, section="PRINTER", limits=dict(minval=0.0), guard=lambda self: not self.force_form_tip_standalone),
+        ParamSpec('toolhead_unload_test',          'int',       0, section="PRINTER", limits=dict(minval=0, maxval=2), fmt="%d"),
         ParamSpec('force_purge_standalone',        'int',       0, section="PRINTER", limits=dict(minval=0, maxval=1)),
+        ParamSpec('purge_material_change_volume',  'float',   0.0, section="PRINTER", limits=dict(minval=0.0)),
+        ParamSpec('purge_change_min_volume',       'float',   0.0, section="PRINTER", limits=dict(minval=0.0)),
         ParamSpec('strict_filament_recovery',      'int',       0, section="PRINTER", limits=dict(minval=0, maxval=1)),
         ParamSpec('filament_recovery_on_pause',    'int',       1, section="PRINTER", limits=dict(minval=0, maxval=1)),
         ParamSpec('retry_tool_change_on_error',    'int',       0, section="PRINTER", limits=dict(minval=0, maxval=1)),
@@ -78,8 +81,7 @@ class MmuMachineParameters(TunableParametersBase):
         ParamSpec('unload_sequence_macro',         'str',   '_MMU_UNLOAD_SEQUENCE',    section="MACROS", hidden=True),
         ParamSpec('load_sequence_macro',           'str',   '_MMU_LOAD_SEQUENCE',      section="MACROS", hidden=True),
 
-        # These macros are not currently exposed but provide future flexability
-        ParamSpec('error_dialog_macro',            'str',   '_MMU_ERROR_DIALOG',       section="MACROS", hidden=True),
+        # These macros are not currently exposed but provide future flexibility
         ParamSpec('error_macro',                   'str',   '_MMU_ERROR',              section="MACROS", hidden=True),
         ParamSpec('toolhead_homing_macro',         'str',   '_MMU_AUTO_HOME',          section="MACROS", hidden=True),
         ParamSpec('park_macro',                    'str',   '_MMU_PARK',               section="MACROS", hidden=True),
@@ -93,11 +95,17 @@ class MmuMachineParameters(TunableParametersBase):
         ParamSpec('default_gate_filament_name',    'list',    [], section="DEFAULT MAPS", hidden=True),
         ParamSpec('default_gate_material',         'list',    [], section="DEFAULT MAPS", hidden=True),
         ParamSpec('default_gate_vendor',           'list',    [], section="DEFAULT MAPS", hidden=True),
+        # Unset is None (never measured), which a floatlist can't express, so a
+        # configured default has to cover every gate
+        ParamSpec('default_gate_td',               'floatlist', [], section="DEFAULT MAPS", hidden=True),
+        ParamSpec('default_gate_td1_color',        'list',    [], section="DEFAULT MAPS", hidden=True),
         ParamSpec('default_gate_color',            'list',    [], section="DEFAULT MAPS", hidden=True),
         ParamSpec('default_gate_temperature',      'intlist', [], section="DEFAULT MAPS", hidden=True),
         ParamSpec('default_gate_spool_id',         'intlist', [], section="DEFAULT MAPS", hidden=True),
         ParamSpec('default_gate_spool_rfid',       'list',    [], section="DEFAULT MAPS", hidden=True),
         ParamSpec('default_gate_speed_override',   'intlist', [], section="DEFAULT MAPS", hidden=True),
+        ParamSpec('default_gate_remaining_weight', 'intlist', [], section="DEFAULT MAPS", hidden=True),
+        ParamSpec('default_gate_initial_weight',   'intlist', [], section="DEFAULT MAPS", hidden=True),
         ParamSpec('default_endless_spool_groups',  'intlist', [], section="DEFAULT MAPS", hidden=True),
 
         # TMC current control
@@ -109,6 +117,7 @@ class MmuMachineParameters(TunableParametersBase):
         ParamSpec('extruder_unload_speed',         'float', 15.0, section="TOOLHEAD/EXTRUDER", limits=dict(minval=1.0)),
         ParamSpec('extruder_sync_load_speed',      'float', 15.0, section="TOOLHEAD/EXTRUDER", limits=dict(minval=1.0)),
         ParamSpec('extruder_sync_unload_speed',    'float', 15.0, section="TOOLHEAD/EXTRUDER", limits=dict(minval=1.0)),
+        ParamSpec('extruder_sync_accel',           'float', 400.0,section="TOOLHEAD/EXTRUDER", limits=dict(above=10.0)),
         ParamSpec('extruder_accel',                'float', 400.0,section="TOOLHEAD/EXTRUDER", limits=dict(above=10.0)),
         ParamSpec('extruder_homing_speed',         'float', 15.0, section="TOOLHEAD/EXTRUDER", limits=dict(minval=1.0)),
 
@@ -123,7 +132,6 @@ class MmuMachineParameters(TunableParametersBase):
         ParamSpec('spoolman_led_segment',          'choice', 'gate_status', section="FEATURES", choices={o: o for o in ('gate_status', 'status', 'both')}),
 
         ParamSpec('t_macro_color',                 'choice', T_MACRO_COLOR_SLICER, section="FEATURES", choices={o: o for o in T_MACRO_COLOR_OPTIONS}, on_change=_on_t_macro_color),
-        ParamSpec('endless_spool_groups',          'intlist', [], section="FEATURES"),
         ParamSpec('endless_spool_enabled',         'int',      0, section="FEATURES", limits=dict(minval=0, maxval=1)),
         ParamSpec('endless_spool_on_load',         'int',      0, section="FEATURES", limits=dict(minval=0, maxval=1)),
         ParamSpec('endless_spool_eject_gate',      'int',     -1, section="FEATURES", limits=dict(minval=-1)),
@@ -162,6 +170,7 @@ class MmuMachineParameters(TunableParametersBase):
         ParamSpec('canbus_comms_retries',          'int',      3, section="KLIPPER TUNING", limits=dict(minval=1, maxval=10), hidden=True),
         ParamSpec('update_bit_max_time',           'int',      0, section="KLIPPER TUNING", limits=dict(minval=0, maxval=1),  hidden=True),
         ParamSpec('update_aht10_commands',         'int',      0, section="KLIPPER TUNING", limits=dict(minval=0, maxval=1),  hidden=True),
+        ParamSpec('sensor_min_debounce_delay',     'float',  0.0, section="KLIPPER TUNING", limits=dict(minval=0.0, maxval=1.0)),
     )
 
 
@@ -192,14 +201,17 @@ class MmuMachineParameters(TunableParametersBase):
         self.default_gate_filament_name   = list(self.default_gate_filament_name)
         self.default_gate_material        = list(self.default_gate_material)
         self.default_gate_vendor          = list(self.default_gate_vendor)
+        self.default_gate_td              = list(self.default_gate_td)
+        self.default_gate_td1_color       = list(self.default_gate_td1_color)
         self.default_gate_color           = list(self.default_gate_color)
         self.default_gate_temperature     = list(self.default_gate_temperature)
         self.default_gate_spool_id        = list(self.default_gate_spool_id)
         self.default_gate_spool_rfid      = list(self.default_gate_spool_rfid)
         self.default_gate_speed_override  = list(self.default_gate_speed_override)
+        self.default_gate_remaining_weight = list(self.default_gate_remaining_weight)
+        self.default_gate_initial_weight  = list(self.default_gate_initial_weight)
         self.default_endless_spool_groups = list(self.default_endless_spool_groups)
 
-        self.endless_spool_groups         = list(self.endless_spool_groups)
         self.console_stat_columns         = list(self.console_stat_columns)
         self.console_stat_rows            = list(self.console_stat_rows)
 

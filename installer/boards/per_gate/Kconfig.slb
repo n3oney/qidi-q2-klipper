@@ -5,6 +5,8 @@ if BOARD_TYPE_SLB_1_0
   config PARAM_BOARD_TYPE
     default "SLB v1"
 
+  # PTC heater output for a [heater_generic]: PB3 (24V, 5A max). Thermistor: TEMP PB12
+
   choice CHOICE_MMU_CONNECTION_TYPE
     default CHOICE_MMU_CONNECTION_TYPE_CANBUS
   endchoice
@@ -31,10 +33,10 @@ if BOARD_TYPE_SLB_1_0
       default ""
 
     config PIN_ENTRY_SENSOR_0
-      default "^(MCU_NAME):PA1"
+      default "^$(MCU_NAME):PA1"
 
     config PIN_EXIT_SENSOR_0
-      default "^(MCU_NAME):PA0"
+      default "^$(MCU_NAME):PA0"
 
     config PIN_EJECT_BUTTON_0
       default "^!$(MCU_NAME):PB2"
@@ -46,8 +48,11 @@ if BOARD_TYPE_SLB_1_0
       string
       default "$(MCU_NAME):PA2"
 
+    # Fan headers (24V): Fan1 managed (circulation) fan, Fan2 heater fan
     config PIN_FAN
       default "$(MCU_NAME):PA15"
+    config PIN_HEATER_FAN
+      default "$(MCU_NAME):PA9"
 
     config PIN_BUFFER_TENSION
       default "^$(MCU_NAME):PB1"
@@ -78,7 +83,7 @@ if BOARD_TYPE_SLB_1_0
     config PIN_GEAR_DIAG
       default ""
 
-    @repeat var=gate min=1 max=11@
+    @repeat var=gate min=1 max=$(max_gate)@
     if PARAM_NUM_GATES > $(gate)
 
       config PIN_GEAR_UART_$(gate)
@@ -95,7 +100,7 @@ if BOARD_TYPE_SLB_1_0
     endif
     @endrepeat@
 
-    @repeat var=gate min=0 max=11@
+    @repeat var=gate min=0 max=$(max_gate)@
     if PARAM_NUM_GATES > $(gate)
 
       config PIN_ENTRY_SENSOR_$(gate)
@@ -114,9 +119,12 @@ if BOARD_TYPE_SLB_1_0
         string
         default "$(MCU_NAME)_gate$(gate):PA2"
 
+      # Fan headers (24V): Fan1 managed (circulation) fan, Fan2 heater fan
       config PIN_FAN_$(gate)
         string
         default "$(MCU_NAME)_gate$(gate):PA15"
+      config PIN_HEATER_FAN_$(gate)
+        default "$(MCU_NAME)_gate$(gate):PA9"
 
     endif
     @endrepeat@
@@ -131,6 +139,36 @@ if BOARD_TYPE_SLB_1_0
       config PIN_BUFFER_ANALOG
         default "$(MCU_NAME)_gate0:PA3"
     endif
+
+    # i2c2 (PB10/PB11) is the only hardware i2c bus routed on the SLB; it
+    # carries both the per-gate environment sensors and the per-gate NFC
+    # readers. Offer it to both by chipdef name - the feature files carry
+    # no chipdef knowledge of their own.
+    @repeat var=gate min=0 max=$(max_gate)@
+    if PARAM_NUM_GATES > $(gate)
+
+      choice CHOICE_ENVIRONMENT_SENSOR_I2C_BUS_$(gate)
+        default CHOICE_ENVIRONMENT_SENSOR_I2C_BUS_SLB_I2C2_PB10_PB11_$(gate) if BOARD_TYPE_SLB_1_0
+
+        config CHOICE_ENVIRONMENT_SENSOR_I2C_BUS_SLB_I2C2_PB10_PB11_$(gate)
+          bool "i2c2_PB10_PB11"
+          depends on BOARD_TYPE_SLB_1_0
+      endchoice
+      config PARAM_ENVIRONMENT_SENSOR_I2C_BUS_$(gate)
+        default "i2c2_PB10_PB11" if CHOICE_ENVIRONMENT_SENSOR_I2C_BUS_SLB_I2C2_PB10_PB11_$(gate)
+
+      choice CHOICE_NFC_READER_I2C_BUS_$(gate)
+        default CHOICE_NFC_READER_I2C_BUS_SLB_I2C2_PB10_PB11_$(gate) if BOARD_TYPE_SLB_1_0
+
+        config CHOICE_NFC_READER_I2C_BUS_SLB_I2C2_PB10_PB11_$(gate)
+          bool "i2c2_PB10_PB11"
+          depends on BOARD_TYPE_SLB_1_0
+      endchoice
+      config PARAM_NFC_READER_I2C_BUS_$(gate)
+        default "i2c2_PB10_PB11" if CHOICE_NFC_READER_I2C_BUS_SLB_I2C2_PB10_PB11_$(gate)
+
+    endif
+    @endrepeat@
 
   endif
 

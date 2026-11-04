@@ -8,6 +8,9 @@ if BOARD_TYPE_EBB_GEN1
   config PARAM_BOARD_TYPE
     default "EBB36/42 gen1"
 
+  # Heater output for a [heater_generic]: HE0 PA2 (v1.1) or PB13 (v1.2). Thermistor TH0 PA3
+  # is used for the PSF buffer
+
   choice CHOICE_MMU_CONNECTION_TYPE
     default CHOICE_MMU_CONNECTION_TYPE_CANBUS
   endchoice
@@ -34,10 +37,10 @@ if BOARD_TYPE_EBB_GEN1
       default ""
 
     config PIN_ENTRY_SENSOR_0
-      default "^(MCU_NAME):PB7"
+      default "^$(MCU_NAME):PB7"
 
     config PIN_EXIT_SENSOR_0
-      default "^(MCU_NAME):PB5"
+      default "^$(MCU_NAME):PB5"
 
     config PIN_EJECT_BUTTON_0
       default "^!$(MCU_NAME):PB6"
@@ -45,8 +48,11 @@ if BOARD_TYPE_EBB_GEN1
     config PIN_NEOPIXEL
       default "$(MCU_NAME):PD3"
 
+    # Fan headers (VIN): FAN1 managed fan, FAN2 controller fan
     config PIN_FAN
       default "$(MCU_NAME):PA0"
+    config PIN_CONTROLLER_FAN
+      default "$(MCU_NAME):PA1"
 
     config PIN_BUFFER_TENSION
       default "^$(MCU_NAME):PB8"
@@ -77,7 +83,7 @@ if BOARD_TYPE_EBB_GEN1
     config PIN_GEAR_DIAG
       default ""
 
-    @repeat var=gate min=1 max=11@
+    @repeat var=gate min=1 max=$(max_gate)@
     if PARAM_NUM_GATES > $(gate)
 
       config PIN_GEAR_UART_$(gate)
@@ -94,7 +100,7 @@ if BOARD_TYPE_EBB_GEN1
     endif
     @endrepeat@
 
-    @repeat var=gate min=0 max=11@
+    @repeat var=gate min=0 max=$(max_gate)@
     if PARAM_NUM_GATES > $(gate)
 
       config PIN_ENTRY_SENSOR_$(gate)
@@ -109,8 +115,11 @@ if BOARD_TYPE_EBB_GEN1
       config PIN_NEOPIXEL_$(gate)
         default "$(MCU_NAME)_gate$(gate):PD3"
 
+      # Fan headers (VIN): FAN1 managed fan, FAN2 controller fan
       config PIN_FAN_$(gate)
         default "$(MCU_NAME)_gate$(gate):PA0"
+      config PIN_CONTROLLER_FAN_$(gate)
+        default "$(MCU_NAME)_gate$(gate):PA1"
 
     endif
     @endrepeat@
@@ -125,6 +134,36 @@ if BOARD_TYPE_EBB_GEN1
       config PIN_BUFFER_ANALOG
         default "$(MCU_NAME)_gate0:PA3"
     endif
+
+    # i2c3 (PB3/PB4) is the only hardware i2c bus routed on the EBB; it
+    # carries both the per-gate environment sensors and the per-gate NFC
+    # readers. Offer it to both by chipdef name - the feature files carry
+    # no chipdef knowledge of their own.
+    @repeat var=gate min=0 max=$(max_gate)@
+    if PARAM_NUM_GATES > $(gate)
+
+      choice CHOICE_ENVIRONMENT_SENSOR_I2C_BUS_$(gate)
+        default CHOICE_ENVIRONMENT_SENSOR_I2C_BUS_EBB_I2C3_PB3_PB4_$(gate) if BOARD_TYPE_EBB_GEN1
+
+        config CHOICE_ENVIRONMENT_SENSOR_I2C_BUS_EBB_I2C3_PB3_PB4_$(gate)
+          bool "i2c3_PB3_PB4"
+          depends on BOARD_TYPE_EBB_GEN1
+      endchoice
+      config PARAM_ENVIRONMENT_SENSOR_I2C_BUS_$(gate)
+        default "i2c3_PB3_PB4" if CHOICE_ENVIRONMENT_SENSOR_I2C_BUS_EBB_I2C3_PB3_PB4_$(gate)
+
+      choice CHOICE_NFC_READER_I2C_BUS_$(gate)
+        default CHOICE_NFC_READER_I2C_BUS_EBB_I2C3_PB3_PB4_$(gate) if BOARD_TYPE_EBB_GEN1
+
+        config CHOICE_NFC_READER_I2C_BUS_EBB_I2C3_PB3_PB4_$(gate)
+          bool "i2c3_PB3_PB4"
+          depends on BOARD_TYPE_EBB_GEN1
+      endchoice
+      config PARAM_NFC_READER_I2C_BUS_$(gate)
+        default "i2c3_PB3_PB4" if CHOICE_NFC_READER_I2C_BUS_EBB_I2C3_PB3_PB4_$(gate)
+
+    endif
+    @endrepeat@
 
   endif
 

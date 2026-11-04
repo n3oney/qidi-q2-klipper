@@ -101,16 +101,16 @@ class TestSetLedReachesTheChain(LedTestCase):
         """
         set_gate_rgb sends TRANSMIT=0 for every index but the last, so honouring it is what
         makes a whole-segment repaint one flush instead of N. Ignoring the flag would still
-        LOOK right - the colours land either way - so assert the transmit count.
+        LOOK right - the colors land either way - so assert the transmit count.
         """
         physical = self.hh.printer.lookup_object('neopixel _unit0_leds')
-        before = len(physical.updates)
+        before = physical.transmits
         for index in range(1, 4):
             self.hh.run_gcode('SET_LED LED=unit0_mmu_exit_leds INDEX=%d RED=1 TRANSMIT=0'
                               % index)
-        self.assertEqual(len(physical.updates), before, 'TRANSMIT=0 flushed anyway')
+        self.assertEqual(physical.transmits, before, 'TRANSMIT=0 flushed anyway')
         self.hh.run_gcode('SET_LED LED=unit0_mmu_exit_leds INDEX=4 RED=1 TRANSMIT=1')
-        self.assertEqual(len(physical.updates), before + 1)
+        self.assertEqual(physical.transmits, before + 1)
         self.assertEqual(self.chain().get_status()['color_data'],
                          [(1., 0., 0., 0.)] * 4)
 
@@ -122,11 +122,22 @@ class TestSetLedReachesTheChain(LedTestCase):
         """
         physical = self.hh.printer.lookup_object('neopixel _unit0_leds')
         self.hh.run_gcode('SET_LED LED=unit0_mmu_exit_leds INDEX=1 RED=1')
-        before = len(physical.updates)
+        before = physical.transmits
         physical.led_helper.led_state[0] = (0., 0., 0., 0.)     # something else clobbered it
         self.hh.run_gcode('SET_LED LED=unit0_mmu_exit_leds INDEX=1 RED=1')
-        self.assertEqual(len(physical.updates), before + 1)
+        self.assertEqual(physical.transmits, before + 1)
         self.assertEqual(self.chain().get_status()['color_data'][0], (1., 0., 0., 0.))
+
+    def test_a_long_run_does_not_keep_every_frame(self):
+        """
+        Effects animate at 24fps, so a console left on its live clock for hours kept GBs of
+        frames and took minutes to free them on /quit.
+        """
+        physical = self.hh.printer.lookup_object('neopixel _unit0_leds')
+        before = physical.transmits
+        self.hh.reactor.advance(60.)
+        self.assertGreater(physical.transmits - before, 1000, 'no effect was animating')
+        self.assertLessEqual(len(physical.updates), 100)
 
 
 class TestStopReleasesTheLedsImmediately(LedTestCase):
@@ -138,7 +149,7 @@ class TestStopReleasesTheLedsImmediately(LedTestCase):
     getFrame emits on the pass after that, and _getFrames zeroes every LED of an updating
     effect before it sums. So "_MMU_STOP_LED_EFFECTS then SET_LED" - which is exactly what
     mmu_led_manager's filament_color, slicer_color and (r,g,b) branches emit - landed the
-    colours and then had them wiped by the timer. It came right only from the SECOND repaint,
+    colors and then had them wiped by the timer. It came right only from the SECOND repaint,
     because by then the effect had latched nextEventTime = NEVER.
 
     cmd_STOP_LED_EFFECTS now flushes the pass before returning (ledFrameHandler.flush_frames).
@@ -372,6 +383,48 @@ class TestEffectConfiguration(LedTestCase):
         self.assertEqual(self.leds.effect_name(0, 'no_such_operation'), '')
 
 
+LEDS_OPTIONAL_RGB = profiles.BOXTURTLE.derive(
+    'leds_optional_rgb',
+    syms={
+        'BOOL_CUSTOMIZE_LED_EFFECTS': True,
+        'PARAM_EMPTY_LIGHT': '(0.1, 0.2, 0.3)',
+        'PARAM_EFFECT_LOADING': 'mmu_blue_clockwise_slow',
+        'PARAM_EFFECT_UNLOADING_EXTRUDER': '',
+    })
+
+
+class TestOptionalStaticRgb(LedTestCase):
+    """
+    The (r,g,b) of an effect_* mapping is optional, and the whole mapping may be empty.
+    With animation off a bare effect name paints empty_light; an empty mapping paints
+    nothing, leaving the segment as it was.
+    """
+    PROFILE = LEDS_OPTIONAL_RGB
+
+    def setUp(self):
+        super().setUp()
+        from extras.mmu.mmu_constants import ACTION_IDLE, ACTION_LOADING, ACTION_UNLOADING
+        self.IDLE, self.LOADING, self.UNLOADING = ACTION_IDLE, ACTION_LOADING, ACTION_UNLOADING
+        self.hh.run_gcode('MMU_LED ANIMATION=0')
+        self.leds.action_changed(self.IDLE, self.LOADING)
+
+    def exit_color(self):
+        return self.unit.leds.virtual_chains['exit'].get_status()['color_data'][0]
+
+    def test_bare_effect_falls_back_to_empty_light(self):
+        self.assertEqual(self.unit.leds.get_rgb_for_effect('mmu_blue_clockwise_slow'),
+                         (0.1, 0.2, 0.3))
+        self.leds.action_changed(self.LOADING, self.IDLE)
+        self.assertEqual(self.exit_color(), (0.1, 0.2, 0.3, 0.))
+
+    def test_empty_effect_leaves_the_segment_alone(self):
+        self.assertEqual(self.leds.effect_name(0, 'unloading_extruder'), '')
+        before = self.exit_color()
+        self.leds.action_changed(self.UNLOADING, self.IDLE)
+        self.assertEqual(self.exit_color(), before)
+        self.assertEqual(self.state(), 'gate_status')
+
+
 class TestTransientFlash(LedTestCase):
     """set_transient_effect: paint a segment, then put back what was there."""
 
@@ -584,6 +637,34 @@ class TestPendingOverlay(LedTestCase):
         self.hh.run_gcode('MMU_GATE_MAP NEXT_SPOOLID=0')
         self.assertIsNone(self.hh.mmu.pending_phase)
         self.assertIsNone(self.overlay('exit'))
+
+
+class TestUnitsNotNamedByIndex(unittest.TestCase):
+    """
+    Virtual chains are named after the unit ('<unit>_mmu_<segment>_leds'), so painting
+    must not assume units are called unit0, unit1, ...
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        profile = profiles.clone_across_units(
+            'leds_named_units', LEDS_OPTIONAL_RGB, ['left', 'right'])
+        cls.hh = session(profile)
+        cls.hh.boot()
+        cls.hh.reactor.advance(WARMUP)
+        cls.hh.run_gcode('MMU_LED ANIMATION=0')
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.hh.close()
+
+    def test_each_named_unit_is_painted(self):
+        leds = self.hh.mmu.led_manager
+        for index, unit in enumerate(self.hh.mmu.mmu_machine.units):
+            with self.subTest(unit=unit.name):
+                leds._set_led(index, None, exit_effect=(0.1, 0.2, 0.3))
+                chain = unit.leds.virtual_chains['exit']
+                self.assertEqual(chain.get_status()['color_data'], [(0.1, 0.2, 0.3, 0.)] * 4)
 
 
 if __name__ == '__main__':

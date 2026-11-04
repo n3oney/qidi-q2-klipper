@@ -30,6 +30,12 @@ import logging, math, contextlib, re, copy
 from .mmu_constants import *
 
 
+def is_kalico(printer):
+    # Kalico ships its own [danger_options] module; vanilla Klipper has no
+    # such config object.
+    return bool(printer.lookup_object('danger_options', False))
+
+
 
 # -----------------------------------------------------------------------------------------------------------
 # DEDICATED MMU EXCEPTION
@@ -37,9 +43,32 @@ from .mmu_constants import *
 
 class MmuError(Exception):
     """
-    Wrapper exception for all MMU errors.
+    Wrapper exception for all MMU errors. The optional hint tells the user what to do next.
     """
-    pass
+    def __init__(self, *args, hint=None, context=None):
+        super().__init__(*args)
+        self.hint = hint
+        self.context = context # What was being attempted, already at the end of the message
+
+    def with_message(self, msg):
+        """The same error re-worded, e.g. with context prepended. Keeps the hint and context."""
+        return MmuError(msg, hint=self.hint, context=self.context)
+
+    def with_context(self, context):
+        """
+        The same error, saying what was being attempted ("Occurred when changing tool: ...").
+        The message ends with it, as the console and log show it, but it is also kept apart so
+        the pause dialog can lead with it.
+        """
+        return MmuError("%s.\n%s" % (str(self), context), hint=self.hint, context=context)
+
+
+class MmuGateHomingMiss(MmuError):
+    """A pickup that failed with nothing moved and no sensor seeing filament.
+
+    Reported separately because the gate can be treated as empty, where a pickup that
+    failed any other way leaves the filament position unknown.
+    """
 
 
 
@@ -56,7 +85,7 @@ class SaveVariableManager:
 
     SAVE_VARIABLE snapshots klipper's variable dict up front, then pauses and finally
     replaces it with a re-read of the file, so anything set mid-command is silently lost.
-    Every set()/delete() is therefore journalled in _pending and only dropped once a
+    Every set()/delete() is therefore recorded in _pending and only dropped once a
     post-write re-read proves it reached disk. Writes are coalesced onto a reactor timer.
     """
 

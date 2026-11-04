@@ -58,7 +58,11 @@ class ExtruderStepper:
 
     def _handle_connect(self):
         toolhead = self.printer.lookup_object('toolhead')
-        toolhead.register_step_generator(self.stepper.generate_steps)
+        # The new klippy does not register extruder steppers as step
+        # generators; the pre-motion_queuing generation does (its toolhead
+        # is the one that has the step_generators list - see toolhead.py).
+        if hasattr(toolhead, 'step_generators'):
+            toolhead.register_step_generator(self.stepper.generate_steps)
         self._set_pressure_advance(self.config_pa, self.config_smooth_time)
 
     def get_status(self, eventtime):
@@ -146,9 +150,16 @@ class PrinterExtruder:
         self.max_e_accel = config.getfloat('max_extrude_only_accel', 1000., above=0.)
         self.instant_corner_v = config.getfloat('instantaneous_corner_velocity', 1.,
                                                 minval=0.)
-        mq = self.printer.load_object(config, 'motion_queuing')
-        self.trapq = mq.allocate_trapq()
-        self.trapq_append = mq.lookup_trapq_append()
+        # The pre-motion_queuing generation owns a plain trapq instead (real
+        # old Klipper / Kalico allocate it through the chelper ffi,
+        # kinematics/extruder.py)
+        mq = self.printer.load_object(config, 'motion_queuing', None)
+        if mq is None:
+            self.trapq = object()
+            self.trapq_append = lambda *args: None
+        else:
+            self.trapq = mq.allocate_trapq()
+            self.trapq_append = mq.lookup_trapq_append()
 
         # Only build a stepper when one is configured - see module docstring.
         self.extruder_stepper = None
@@ -157,8 +168,14 @@ class PrinterExtruder:
             self.extruder_stepper.stepper.set_trapq(self.trapq)
 
         self.printer.add_object(self.name, self)
-        toolhead = self.printer.lookup_object('toolhead')
-        toolhead.set_extruder(self, 0.)
+        # As real Klipper: only [extruder] starts active and owns M104/M109, which act on
+        # whichever extruder is active unless T selects one.
+        if self.name == 'extruder':
+            toolhead = self.printer.lookup_object('toolhead')
+            toolhead.set_extruder(self, 0.)
+            gcode = self.printer.lookup_object('gcode')
+            gcode.register_command("M104", self.cmd_M104)
+            gcode.register_command("M109", self.cmd_M109)
         logging.info("Fake PrinterExtruder '%s' created (stepper=%s)",
                      self.name, self.extruder_stepper is not None)
 
@@ -177,6 +194,26 @@ class PrinterExtruder:
 
     def get_heater(self):
         return self.heater
+
+    def cmd_M104(self, gcmd, wait=False):
+        temp = gcmd.get_float('S', 0.)
+        index = gcmd.get_int('T', None, minval=0)
+        if index is not None:
+            section = 'extruder'
+            if index:
+                section = 'extruder%d' % (index,)
+            extruder = self.printer.lookup_object(section, None)
+            if extruder is None:
+                if temp <= 0.:
+                    return
+                raise gcmd.error("Extruder not configured")
+        else:
+            extruder = self.printer.lookup_object('toolhead').get_extruder()
+        pheaters = self.printer.lookup_object('heaters')
+        pheaters.set_temperature(extruder.get_heater(), temp, wait)
+
+    def cmd_M109(self, gcmd):
+        self.cmd_M104(gcmd, wait=True)
 
     def get_trapq(self):
         return self.trapq

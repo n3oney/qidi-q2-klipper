@@ -29,7 +29,7 @@
 # exactly like the linear one, and nothing it does differently (grip expressed as a carriage
 # position, gear direction per gate) is about where a switch sits. So it needs nothing here -
 # cad_gate0_pos and cad_gate_width, which the offsets below are built from, are parameters it
-# already has. Its own behaviour is covered in test_mmu_selector.TestRotarySelector.
+# already has. Its own behavior is covered in test_mmu_selector.TestRotarySelector.
 #
 # THE CARRIAGE IS TRACKED, not read off the stepper. This file used to be stateless with
 # respect to position - `carriage` was just `stepper.commanded_pos` - and that is what made
@@ -85,7 +85,8 @@ class SelectorAxis:
             spacing = self._cad('cad_gate_width') or 1.0
             self.circumference = self.unit.num_gates * spacing
         if offsets:
-            self.travel_max = offsets[-1] + (self._cad('cad_last_gate_offset') or 0.)
+            # max(), not the last gate: a rotary selector's gates can descend (HTLF)
+            self.travel_max = max(offsets) + (self._cad('cad_last_gate_offset') or 0.)
         elif positions:
             self.travel_max = max(positions.values())
         elif self.circumference is not None:
@@ -108,7 +109,7 @@ class SelectorAxis:
         return self.carriage
 
     def advance(self, delta):
-        """Move the carriage by `delta`, and return the distance it ACTUALLY travelled.
+        """Move the carriage by `delta`, and return the distance it ACTUALLY traveled.
 
         The return value is what the caller must feed to harness_note_motion: a move that
         runs into either end of travel moves the mcu position by less than it asked for.

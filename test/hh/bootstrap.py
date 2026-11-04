@@ -105,7 +105,7 @@ class Session:
 
     def __init__(self, profile='boxturtle', adc_api='new', adc_payload='samples',
                  strict_gcode=False, printer_stub=PRINTER_STUB, virtual_nfc=False,
-                 log_dir=None, klipper_aio=True):
+                 log_dir=None, klipper_aio=True, kalico=False, old_klipper=False):
         self.klippy = install()
         self.profile = (profile if isinstance(profile, profiles_mod.Profile)
                         else profiles_mod.get(profile))
@@ -116,8 +116,14 @@ class Session:
         # where SAVE_VARIABLE goes through aio_executor and PAUSES the calling
         # greenlet, and where the klippy:ready dispatch loop runs inside
         # reactor.assert_no_pause(). False models everything before that: a plain
-        # synchronous write and no pause guard. Defaults to the modern behaviour.
+        # synchronous write and no pause guard. Defaults to the modern behavior.
         self.klipper_aio = klipper_aio
+        # Pre-motion_queuing generations (MmuStepper then emulates the module
+        # via MotionQueuingEmulator): kalico adds the is_kalico() marker on top
+        # of old_klipper
+        self.kalico = kalico
+        self.old_klipper = old_klipper
+        self._orig_chelper_get_ffi = None
         self.strict_gcode = strict_gcode
         self.printer_stub = printer_stub
         # Swap reader chips for model-driven virtual ones instead of scripting the real
@@ -139,6 +145,75 @@ class Session:
         self.moonraker_link = None
         self._booted = False
 
+    # -- pre-motion_queuing generation emulation ----------------------------
+    def _install_pre_motion_queuing(self, printer, kalico_marker=False):
+        """
+        Emulate a Klipper generation without klippy/extras/motion_queuing.py
+        (old mainline; Kalico when kalico_marker is set) before any section
+        loads: the is_kalico() marker object, the motion_queuing module
+        absent, and a pure-Python chelper ffi stand-in for the trapq surface
+        MotionQueuingEmulator uses (real old Klipper / Kalico use the compiled
+        chelper; the harness has no C build - see klippy_root/chelper.py). Step
+        generation itself is not modelled, exactly as in the mainline
+        generation: moves are observed through the same plain-move observer as
+        the fake motion_queuing, and the filament model remains the source of
+        truth.
+        """
+        if kalico_marker:
+            printer.add_object('danger_options', object())
+        printer.harness_missing_modules = {'motion_queuing'}
+        import chelper
+        self._orig_chelper_get_ffi = chelper.get_ffi
+        chelper.get_ffi = lambda: self._pre_motion_queuing_ffi(printer)
+        return self
+
+    def _install_legacy_manual_home(self, printer):
+        """
+        Pre-motion_queuing generations also predate manual_home's probe_pos
+        argument (and its trigger-position return): swap the fake
+        PrinterHoming's for the old signature, so do_homing_move's signature
+        introspection takes the HomingMove-direct path exactly as on those
+        Klipper versions. Must run after the toolhead phase: the homing object is
+        registered by the toolhead module as it loads.
+        """
+        from extras.homing import HomingMove
+        homing = printer.lookup_object('homing')
+
+        def legacy_manual_home(toolhead, endstops, movepos, speed,
+                               triggered, check_triggered):
+            hmove = HomingMove(printer, endstops, toolhead)
+            hmove.homing_move(movepos, speed, probe_pos=False,
+                              triggered=triggered, check_triggered=check_triggered)
+            return movepos
+        homing.manual_home = legacy_manual_home
+        return self
+
+    def _pre_motion_queuing_ffi(self, printer):
+        class _Trapq:
+            def __init__(self):
+                self.moves = []
+        class _Main:
+            def gc(self, obj, free_fn):
+                return obj
+        class _Lib:
+            def trapq_alloc(self):
+                return _Trapq()
+            def trapq_free(self, trapq):
+                pass
+            def trapq_finalize_moves(self, trapq, move_end, clear_time):
+                pass
+            def trapq_append(self, trapq, print_time, accel_t, cruise_t, decel_t,
+                             start_x, start_y, start_z, axis_x, axis_y, axis_z,
+                             start_v, cruise_v, accel):
+                trapq.moves.append(print_time)
+                # Same signed-distance arithmetic as the fake motion_queuing:
+                # plain moves are the only ones that reach trapq_append
+                distance = axis_x * cruise_v * (accel_t + cruise_t)
+                observer = getattr(printer, 'harness_pre_mq_move_observer', None)
+                if observer is not None and distance:
+                    observer(trapq, distance)
+        return _Main(), _Lib()
+
     # -- lifecycle ---------------------------------------------------------
     def __enter__(self):
         self.build()
@@ -154,12 +229,21 @@ class Session:
             self.moonraker.close()
             self.moonraker = self.moonraker_link = None
         try:
+            if self.printer is not None:
+                self.printer.send_event('klippy:disconnect')
+        except Exception:
+            logging.debug('klippy:disconnect handler failed', exc_info=True)
+        try:
             mmu = self.printer.lookup_object('mmu', None) if self.printer else None
             logger = getattr(mmu, 'logger', None) if mmu else None
             if logger is not None and hasattr(logger, 'shutdown'):
                 logger.shutdown()
         except Exception:
             logging.debug('logger shutdown failed', exc_info=True)
+        if self._orig_chelper_get_ffi is not None:
+            import chelper
+            chelper.get_ffi = self._orig_chelper_get_ffi
+            self._orig_chelper_get_ffi = None
         if self.reactor is not None:
             self.reactor.finalize()
         shutil.rmtree(self.tmpdir, ignore_errors=True)
@@ -234,12 +318,14 @@ class Session:
         # Default of None matters - HH's own manually-parsed sections
         # ([mmu_unit], [mmu_sensors], [mmu_parameters], ...) have no load_config
         # module and must be skipped, exactly as in Klipper.
+        if self.kalico or self.old_klipper:
+            self._install_pre_motion_queuing(printer, kalico_marker=self.kalico)
         for section_config in self.config.get_prefix_sections(''):
             section = section_config.get_name()
             if section not in printer.objects:
                 printer.load_object(self.config, section, None)
 
-        # Both of these MUST happen before the readers are initialised: they are
+        # Both of these MUST happen before the readers are initialized: they are
         # constructed during the section loop above, but the chip is only talked to at
         # init, and a failed init is never retried - so doing either later leaves every
         # reader dead for the whole session. Init used to be at klippy:connect; it is now
@@ -288,6 +374,8 @@ class Session:
         import toolhead as toolhead_mod
         from kinematics import extruder as extruder_mod
         toolhead_mod.add_printer_objects(self.config)
+        if self.kalico or self.old_klipper:
+            self._install_legacy_manual_home(self.printer)
         extruder_mod.add_printer_objects(self.config)
         self.printer.send_event('klippy:connect')
         self.apply_initial_sensor_states()
@@ -360,7 +448,7 @@ class Session:
         # derive. Forcing the virtual sensors directly instead leaves them stuck: the
         # proportional sensor only re-evaluates them on a threshold crossing, so a
         # subsequently-fed neutral reading does not clear a hand-set tension flag - which
-        # showed up as EMU reading "tension" at a normalised value of 0.0.
+        # showed up as EMU reading "tension" at a normalized value of 0.0.
         derived = set()
         for name, sensor in self.sensors().items():
             handle = _SensorHandle(self, name, sensor)
@@ -446,6 +534,7 @@ class Session:
         self.printer.harness_filament = model
         self._install_move_observer()
         if self._encoders():
+            self._encoder_residual = {}
             model.observers.append(self._on_encoder_travel)
         return model
 
@@ -468,6 +557,7 @@ class Session:
         if effects is None:
             effects = self.printer.harness_macro_effects = {}
         effects.setdefault('_MMU_FORM_TIP', self._effect_form_tip)
+        effects.setdefault('_MMU_CUT_TIP', self._effect_cut_tip)
         # Purge moves a lot of filament through the nozzle, none of which this harness models -
         # but it TAKES TIME on a real machine, and a paced session that skips it in an instant
         # reads as if the operation were over when it is not. Time only; no movement.
@@ -526,16 +616,14 @@ class Session:
 
         WHAT MATTERS IS CONSISTENCY, not matching any particular printer. HH derives park_pos
         from the extruder movement it observes (park_pos = stepper_movement +
-        residual_filament + toolchange_retract), exactly as it would on real hardware - so as
+        residual_filament + retracted_length), exactly as it would on real hardware - so as
         long as the extruder and the filament model move by the SAME amount, HH's conclusion is
         self-consistent with the machine the harness is presenting.
 
         Both halves are done explicitly because the harness macro body does not emit either a
         manual trapq move or a toolhead extrusion for the motion observers to see.
         """
-        vars_macro = self.printer.lookup_object('gcode_macro %s_VARS' % macro.alias, None)
-        variables = dict(getattr(macro, 'variables', {}) or {})
-        variables.update(getattr(vars_macro, 'variables', {}) or {})
+        variables = self._macro_vars(macro)
         distance = (float(variables.get('cooling_tube_position', 0.0) or 0.0)
                     + float(variables.get('cooling_tube_length', 0.0) or 0.0))
         if distance <= 0:
@@ -543,13 +631,7 @@ class Session:
                           macro.alias)
             return
 
-        toolhead = self.printer.lookup_object('toolhead', None)
-        extruder = toolhead.get_extruder() if toolhead is not None else None
-        stepper = getattr(getattr(extruder, 'extruder_stepper', None), 'stepper', None)
-        model = getattr(self.printer, 'harness_filament', None)
-        gate = self.mmu.gate_selected
-        if gate is None or gate < 0:
-            model = None
+        stepper, model, gate = self._extruder_and_filament()
 
         # HOW LONG it takes, so a paced session does not do the whole retract in one instant -
         # it is the first thing an unload does, and it was the last step still finishing
@@ -561,14 +643,73 @@ class Session:
         # (unloading_speed_start put the whole thing at 0.5s). A flat few seconds is the honest
         # answer for a body that does not run.
         for amount in self._spend_macro_time(movement=-distance):
-            if stepper is not None:
-                # Retract: HH reads (initial_mcu_pos - final_mcu_pos) * step_dist
-                # (mmu_filament_movement.py:2541-2559), so BOTH have to move. set_position
-                # alone is not enough - it is mcu-preserving, by design (klippy_root/stepper.py)
-                stepper.set_position([stepper.get_commanded_position() + amount, 0., 0., 0.])
-                stepper.harness_note_motion(amount)
+            self._move_extruder(stepper, amount)
             if model is not None:
                 model.advance(gate, amount, 'tip forming')
+
+    def _effect_cut_tip(self, macro, gcmd):
+        """
+        Cut the filament as the shipped _MMU_CUT_TIP would, and report where it was cut.
+
+        The extruder and the filament no longer move by the same amount, which is what a cut
+        is. The extruder retracts retract_length then rip_length (the pushback nets to zero);
+        the filament's tip ends up blade_pos + rip_length behind the nozzle, the fragment in
+        front of the blade staying in the hotend. Both start from the retraction already in
+        place, as the macro's effective_retract_length does.
+
+        HH takes the cut position from output_park_pos and refuses a 0 there, so the effect
+        sets it as the macro's SET_GCODE_VARIABLE would.
+        """
+        variables = self._macro_vars(macro)
+        blade_pos = float(variables.get('blade_pos', 0.) or 0.)
+        rip_length = float(variables.get('rip_length', 0.) or 0.)
+        retract_length = float(variables.get('retract_length', 0.) or 0.)
+        park = self.printer.lookup_object('gcode_macro _MMU_PARK', None)
+        already_retracted = (
+            float(self.mmu.mmu_unit().extruder_wrapper.get_status(0)['extruder_filament_remaining'])
+            + float((getattr(park, 'variables', {}) or {}).get('retracted_length', 0.) or 0.))
+        retract = max(retract_length - already_retracted, 0.) + rip_length
+        severed = max(blade_pos - already_retracted, 0.) + rip_length
+        macro.variables = dict(macro.variables, output_park_pos=blade_pos + rip_length)
+
+        stepper, model, gate = self._extruder_and_filament()
+        if stepper is not None:
+            # Whole steps, as a G1 moves, so HH's measured travel and thus the fragment it
+            # derives do not depend on the stepper's starting phase
+            retract = round(retract / stepper.get_step_dist()) * stepper.get_step_dist()
+        total = max(retract, severed)
+        for amount in self._spend_macro_time(movement=-total):
+            if total:
+                self._move_extruder(stepper, amount * retract / total)
+                if model is not None:
+                    model.advance(gate, amount * severed / total, 'tip cutting')
+
+    def _macro_vars(self, macro):
+        # The variables live on <macro>_VARS, with a fallback to the calling macro
+        vars_macro = self.printer.lookup_object('gcode_macro %s_VARS' % macro.alias, None)
+        variables = dict(getattr(macro, 'variables', {}) or {})
+        variables.update(getattr(vars_macro, 'variables', {}) or {})
+        return variables
+
+    def _extruder_and_filament(self):
+        toolhead = self.printer.lookup_object('toolhead', None)
+        extruder = toolhead.get_extruder() if toolhead is not None else None
+        stepper = getattr(getattr(extruder, 'extruder_stepper', None), 'stepper', None)
+        model = getattr(self.printer, 'harness_filament', None)
+        gate = self.mmu.gate_selected
+        if gate is None or gate < 0:
+            model = None
+        return stepper, model, gate
+
+    @staticmethod
+    def _move_extruder(stepper, amount):
+        if stepper is None:
+            return
+        # HH reads (initial_mcu_pos - final_mcu_pos) * step_dist
+        # (mmu_filament_movement.py:2541-2559), so BOTH have to move. set_position
+        # alone is not enough - it is mcu-preserving, by design (klippy_root/stepper.py)
+        stepper.set_position([stepper.get_commanded_position() + amount, 0., 0., 0.])
+        stepper.harness_note_motion(amount)
 
     def calibrate(self):
         """
@@ -609,6 +750,7 @@ class Session:
                                               VARS_MMU_BOWDEN_LENGTHS,
                                               VARS_MMU_ENCODER_RESOLUTION,
                                               VARS_MMU_GEAR_ROTATION_DISTANCES,
+                                              VARS_MMU_SELECTOR_ANGLES,
                                               VARS_MMU_SELECTOR_OFFSETS)
 
         model = self.filament()
@@ -634,8 +776,25 @@ class Session:
                     axis.selector.calibrator.mark_calibrated(CALIBRATED_SELECTOR)
                 done['selector_offsets'] = list(offsets)
 
+            angles = self._servo_gate_angles(unit)
+            if angles:
+                unit.calibrator.var_manager.set(VARS_MMU_SELECTOR_ANGLES, angles,
+                                                namespace=unit.name)
+                # Pre-ready, ServoSelector.handle_ready merges the variable over its config and
+                # marks itself calibrated; afterwards it has to be applied here
+                if getattr(unit.calibrator, '_bowden_lengths', None) is not None:
+                    unit.selector.servo_gate_angles = list(angles)
+                    unit.selector._check_calibrated()
+                done['selector_angles'] = list(angles)
+
             if getattr(unit, 'require_bowden_move', False):
-                length = model.layout['extruder_entry'] - model.layout.get('mmu_exit', 0.0)
+                # HH measures it from the gate homing endstop, which on a hub machine (QIDI's
+                # mmu_shared_exit) is well past the gate; one the model does not place falls
+                # back to mmu_exit
+                start = model.position(unit.p.gate_homing_endstop)
+                if start is None:
+                    start = model.layout.get('mmu_exit', 0.0)
+                length = model.layout['extruder_entry'] - start
                 # Pre-ready there is no _bowden_lengths to update yet, so write the variable
                 # and let MmuCalibrator.handle_ready load it (mmu_calibrator.py:70-95).
                 if getattr(unit.calibrator, '_bowden_lengths', None) is None:
@@ -689,6 +848,28 @@ class Session:
                 applied[unit.name] = done
         return applied
 
+    @staticmethod
+    def _servo_gate_angles(unit):
+        """
+        Gate angles for a ServoSelector that ships without a complete set (PicoMMU leaves them
+        blank on purpose: the cam build decides them), else None.
+
+        Spread evenly over the servo's configured range by HH's own generator - the one
+        MMU_CALIBRATE_SERVO_SELECTOR SPACING= uses - so nothing outside the configured limits
+        is invented. Configured angles (MMX's vendor set) are left alone.
+        """
+        selector = getattr(unit, 'selector', None)
+        generate = getattr(selector, '_generate_gate_angles', None)
+        if generate is None:
+            return None
+        configured = list(selector.servo_gate_angles)[:unit.num_gates]
+        if len(configured) == unit.num_gates and -1 not in configured:
+            return None
+        low, high = selector.p.servo_min_angle, selector.p.servo_max_angle
+        spacing = (high - low) / max(unit.num_gates - 1, 1)
+        angles = generate(low, 0, spacing)
+        return angles if isinstance(angles, list) else None
+
     def _encoders(self):
         """(MmuEncoder, MCU_counter) for every encoder on this machine."""
         counters = getattr(self.printer, 'harness_counters', {})
@@ -722,7 +903,11 @@ class Session:
             return
         travel = model.travel_over(position, start_tip, start_tail, delta)
         for encoder, counter in self._encoders():
-            counter.pulse(int(round(travel / encoder.resolution)))
+            # Carry the part-pulse over, or a stream of small extrusion moves never pulses
+            pulses = self._encoder_residual.get(counter, 0.) + travel / encoder.resolution
+            whole = int(round(pulses))
+            self._encoder_residual[counter] = pulses - whole
+            counter.pulse(whole)
 
     def _on_manual_move(self, trapq, distance):
         """
@@ -805,6 +990,10 @@ class Session:
         if mq is not None:
             mq.move_observer = self._on_manual_move
             mq.toolhead_move_observer = self._on_toolhead_move
+        elif self.kalico or self.old_klipper:
+            # No motion_queuing to hook: the fake ffi's trapq_append consults
+            # this observer instead
+            self.printer.harness_pre_mq_move_observer = self._on_manual_move
         return self
 
     def _on_toolhead_move(self, distance):
@@ -825,7 +1014,7 @@ class Session:
         (mmu.drive(gate) -> MmuDrive.driving_stepper()).
 
         Falls back to the gear stepper if either is missing, so the harness degrades to its
-        older behaviour against a checkout that predates them rather than advancing nothing.
+        older behavior against a checkout that predates them rather than advancing nothing.
         """
         drive = self.mmu.drive(gate) if hasattr(self.mmu, 'drive') else None
         driving = getattr(drive, 'driving_stepper', None)
@@ -862,7 +1051,7 @@ class Session:
 
         Needed because a filament state change is a real event: putting filament at a
         gate trips the entry switch, which HH treats as an insert and responds to by
-        preloading that gate. Correct behaviour, but not what you want while arranging
+        preloading that gate. Correct behavior, but not what you want while arranging
         a starting position.
 
         Suppression uses min_event_systime = reactor.NEVER, which is exactly what
@@ -923,7 +1112,7 @@ class Session:
         return model
 
     # Plausible spool metadata for prime_gate_map(). Vendors and materials are real names a
-    # user would recognise, so the gate table, the LED filament_color render and the Spoolman
+    # user would recognize, so the gate table, the LED filament_color render and the Spoolman
     # paths all have something to show that is not "Unknown".
     FILAMENT_VENDORS = ('eSun', 'KVS', 'Bambu Labs', 'Prusa')
     FILAMENT_MATERIALS = ('ABS', 'ABS+', 'PLA', 'TPU', 'PLA+')
@@ -999,6 +1188,11 @@ class Session:
             hostname=hostname, **kwargs)
         self.moonraker.component_init()
         self.moonraker_link = MoonrakerLink(self, self.moonraker)
+        # Plug in every configured TD-1 serial, with nothing in front of the lens yet.
+        # One Moonraker never lists would read as disconnected
+        if getattr(self.mmu, 'td1', None) is not None:
+            self.moonraker.td1.attach(*self.mmu.td1.devices)
+            self.moonraker_link.enable_td1_bridge()
         self.moonraker_link.settle()
         return self.moonraker_link
 
@@ -1518,7 +1712,7 @@ class _SensorHandle:
 
     # -- proportional (ADC) sensors ----------------------------------------
     def neutral_value(self):
-        """The raw ADC reading meaning "no force" - normalises to 0.0."""
+        """The raw ADC reading meaning "no force" - normalizes to 0.0."""
         return getattr(self.sensor, '_neutral_point', 0.5)
 
     def _extreme_value(self):
@@ -1540,7 +1734,7 @@ class _SensorHandle:
 
     @property
     def value(self):
-        """Normalised [-1.0, 1.0] reading, for proportional sensors."""
+        """Normalized [-1.0, 1.0] reading, for proportional sensors."""
         return getattr(self.sensor, 'value', None)
 
     def clear(self, settle=True):

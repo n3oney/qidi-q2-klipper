@@ -96,25 +96,26 @@ if BOARD_TYPE_KMS_1_0
   config PIN_SHARED_EXIT_SENSOR
     default "$(MCU_NAME):PC0"
 
-  config PARAM_MISC_HARDWARE
-    default "$(ml,\
-[temperature_sensor $(UNIT_NAME)_environment]\n\
-sensor_type: HTU21D\n\
-i2c_mcu: $(MCU_NAME)\n\
-i2c_software_scl_pin: $(MCU_NAME):PB10\n\
-i2c_software_sda_pin: $(MCU_NAME):PB11\n\
-htu21d_report_time: 10\n\
-\n\
-[heater_fan $(UNIT_NAME)_fan_left]\n\
-pin: $(MCU_NAME):PC3\n\
-shutdown_speed: 0\n\
-heater: $(UNIT_NAME)_heater\n\
-\n\
-[heater_fan $(UNIT_NAME)_fan_right]\n\
-pin: $(MCU_NAME):PC1\n\
-shutdown_speed: 0\n\
-heater: $(UNIT_NAME)_heater\n\
-\n\
+  # -------------------------------------
+  # Environment sensor (generic feature)
+  # -------------------------------------
+
+  choice CHOICE_ENVIRONMENT_SENSOR_I2C_BUS_TYPE
+    default CHOICE_ENVIRONMENT_SENSOR_I2C_SOFTWARE
+  endchoice
+  config PIN_ENVIRONMENT_SENSOR_I2C_SCL
+    default "$(MCU_NAME):PB10"
+  config PIN_ENVIRONMENT_SENSOR_I2C_SDA
+    default "$(MCU_NAME):PB11"
+
+
+  # -------------------------------------
+  # Custom heater setup
+  # -------------------------------------
+
+  config CUSTOM_HEATER_SETUP
+    def_bool y
+mh_heater_kms := \
 [heater_generic $(UNIT_NAME)_heater]\n\
 gcode_id: $(UNIT_NAME)\n\
 heater_pin: $(MCU_NAME):PB1\n\
@@ -131,11 +132,35 @@ max_error: 300\n\
 check_gain_time: 600\n\
 hysteresis: 10\n\
 heating_gain: 1\n\
-)"
+\n\
 
-# -------------------------------------
-# Buffer
-# -------------------------------------
+
+  # -------------------------------------
+  # Custom heater fan setup
+  # Note: this could use default set mechanism but could cause upgrade issues
+  # -------------------------------------
+
+  config CUSTOM_HEATER_FAN_SETUP
+    def_bool y
+mh_heater_fan_kms := \
+[heater_fan $(UNIT_NAME)_fan_left]\n\
+pin: $(MCU_NAME):PC3\n\
+shutdown_speed: 0\n\
+heater: $(UNIT_NAME)_heater\n\
+\n\
+[heater_fan $(UNIT_NAME)_fan_right]\n\
+pin: $(MCU_NAME):PC1\n\
+shutdown_speed: 0\n\
+heater: $(UNIT_NAME)_heater\n\
+
+
+  config PARAM_MISC_HARDWARE
+    default "$(ml,$(mh_heater_kms)$(mh_heater_fan_kms))"
+
+
+  # -------------------------------------
+  # Buffer
+  # -------------------------------------
 
   if OPTION_KMS_BUFFER
     config PIN_BUFFER_TENSION
@@ -144,4 +169,14 @@ heating_gain: 1\n\
       default "!$(MCU_NAME)_buffer:PA0"
   endif
 
+  # The on-board HTU21D: hardware i2c2, SCL PB10 / SDA PB11
+  i2c_board       := BOARD_TYPE_KMS_1_0
+  i2c_tag         := KMS_I2C2
+  i2c_bus         := i2c2_PB10_PB11
+  i2c_label       := i2c2_PB10_PB11 [[DIM]]/ on-board sensor[[/DIM]]
+  i2c_env         := y
+  i2c_env_default := y
+  i2c_nfc         := n
+  i2c_nfc_default := n
+  source "components/Kconfig.i2c_board_bus"
 endif

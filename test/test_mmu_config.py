@@ -14,6 +14,8 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
 import ast
+import contextlib
+import io
 import os
 import re
 import tempfile
@@ -92,15 +94,100 @@ class TestBoxTurtleRender(unittest.TestCase):
         self.assertEqual(leds['entry_effect'], 'filament_color')
         self.assertEqual(leds['status_effect'], 'filament_color')
 
-    def test_led_effect_choices_remain_visible_for_empty_segments(self):
+    SEGMENT_LEDS = {
+        'PARAM_ENTRY_LEDS': 'neopixel:_unit0_leds (5-8)',
+        'PARAM_STATUS_LEDS': 'neopixel:_unit0_leds (9)',
+        'PARAM_LOGO_LEDS': 'neopixel:_unit0_leds (10)',
+    }
+
+    def test_led_effect_choices_are_hidden_for_empty_segments(self):
         with cfg._env(cfg._SINGLE_UNIT_ENV):
             kconfig = cfg._kconfig(
                 'boxturtle_led_effect_visibility',
                 profiles.get('boxturtle').syms)
 
+        self.assertGreater(kconfig.named_choices['CHOICE_EXIT_EFFECT'].visibility, 0)
+        for choice in ('CHOICE_ENTRY_EFFECT', 'CHOICE_STATUS_EFFECT', 'CHOICE_LOGO_EFFECT'):
+            self.assertEqual(kconfig.named_choices[choice].visibility, 0, choice)
+
+        # The template still gets each segment's default
+        leds = dict(cfg.assemble(self.rendered).items('mmu_leds unit0'))
+        self.assertEqual(leds['logo_effect'], '(0, 0, 0.3)')
+
+    def test_exit_effect_choice_is_hidden_without_exit_leds(self):
+        profile = profiles.get('boxturtle').derive(
+            'boxturtle_no_exit_leds',
+            syms=dict(PARAM_EXIT_LEDS='', PARAM_ENTRY_LEDS='neopixel:_unit0_leds (1-4)'))
+        with cfg._env(cfg._SINGLE_UNIT_ENV):
+            kconfig = cfg._kconfig(profile.name, profile.syms)
+        self.assertEqual(kconfig.named_choices['CHOICE_EXIT_EFFECT'].visibility, 0)
+        self.assertGreater(kconfig.named_choices['CHOICE_ENTRY_EFFECT'].visibility, 0)
+        leds = dict(cfg.assemble(cfg.render(profile)).items('mmu_leds unit0'))
+        self.assertEqual(leds['exit_effect'], 'gate_status')
+
+    def test_led_effect_choices_are_shown_when_segments_have_leds(self):
+        with cfg._env(cfg._SINGLE_UNIT_ENV):
+            kconfig = cfg._kconfig(
+                'boxturtle_led_effect_visible_segments',
+                dict(profiles.get('boxturtle').syms, **self.SEGMENT_LEDS))
+
         for choice in ('CHOICE_EXIT_EFFECT', 'CHOICE_ENTRY_EFFECT',
-                       'CHOICE_STATUS_EFFECT'):
-            self.assertGreater(kconfig.named_choices[choice].visibility, 0)
+                       'CHOICE_STATUS_EFFECT', 'CHOICE_LOGO_EFFECT'):
+            self.assertGreater(kconfig.named_choices[choice].visibility, 0, choice)
+
+    def test_led_effect_custom_and_on_choices_render(self):
+        profile = profiles.get('boxturtle').derive(
+            'boxturtle_led_effect_custom',
+            syms=dict(self.SEGMENT_LEDS, **{
+                'CHOICE_EXIT_EFFECT_CUSTOM': True,
+                'PARAM_EXIT_EFFECT_CUSTOM': '(0.25, 0.5, 0.75)',
+                'CHOICE_ENTRY_EFFECT_CUSTOM': True,
+                'PARAM_ENTRY_EFFECT_CUSTOM': 'mmu_rainbow',
+                'CHOICE_STATUS_EFFECT_ON': True,
+            }))
+        leds = dict(cfg.assemble(cfg.render(profile)).items('mmu_leds unit0'))
+        self.assertEqual(leds['exit_effect'], '(0.25, 0.5, 0.75)')
+        self.assertEqual(leds['entry_effect'], 'mmu_rainbow')
+        self.assertEqual(leds['status_effect'], 'on')
+        self.assertEqual(leds['logo_effect'], '(0, 0, 0.3)')
+
+    def test_led_effect_custom_value_is_nested_under_the_custom_choice(self):
+        with cfg._env(cfg._SINGLE_UNIT_ENV):
+            kconfig = cfg._kconfig('boxturtle_led_effect_nesting', profiles.get('boxturtle').syms)
+        for seg in ('EXIT', 'ENTRY', 'STATUS', 'LOGO'):
+            with self.subTest(segment=seg):
+                sym = kconfig.syms['PARAM_%s_EFFECT_CUSTOM' % seg]
+                self.assertIsNone(sym.choice)
+                self.assertEqual({n.parent.item.name for n in sym.nodes},
+                                 {'CHOICE_%s_EFFECT_CUSTOM' % seg})
+                self.assertNotIn(sym, kconfig.named_choices['CHOICE_%s_EFFECT' % seg].syms)
+
+    def test_led_effect_custom_value_defaults_when_selected(self):
+        profile = profiles.get('boxturtle').derive(
+            'boxturtle_led_effect_custom_default',
+            syms=dict(self.SEGMENT_LEDS, CHOICE_STATUS_EFFECT_CUSTOM=True))
+        leds = dict(cfg.assemble(cfg.render(profile)).items('mmu_leds unit0'))
+        self.assertEqual(leds['status_effect'], '(1, 1, 1)')
+
+    def test_saved_status_gate_status_falls_back_to_the_default(self):
+        # gate_status was offered for the status segment but never implemented there
+        with cfg._env(cfg._SINGLE_UNIT_ENV), tempfile.TemporaryDirectory() as tmp:
+            kc = cfg._kconfig('status_gate_status_saved', dict(
+                profiles.get('boxturtle').syms, CHOICE_STATUS_EFFECT_SLICER_COLOR=True,
+                **self.SEGMENT_LEDS))
+            path = os.path.join(tmp, '.mmu_config')
+            kc.write_config(path)
+            with open(path) as f:
+                saved = f.read()
+            self.assertIn('CONFIG_CHOICE_STATUS_EFFECT_SLICER_COLOR=y\n', saved)
+            saved = saved.replace('CONFIG_CHOICE_STATUS_EFFECT_SLICER_COLOR=y',
+                                  'CONFIG_CHOICE_STATUS_EFFECT_GATE_STATUS=y')
+            with open(path, 'w') as f:
+                f.write(saved)
+            reloaded = cfg._new_kconfig('status_gate_status_reload')
+            reloaded.warn = False
+            reloaded.load_config(path, filter_defaults=True)
+        self.assertEqual(reloaded.syms['PARAM_STATUS_EFFECT'].str_value, 'filament_color')
 
     def test_led_effect_choices_render_into_the_unit_config(self):
         profile = profiles.get('boxturtle').derive(
@@ -167,6 +254,23 @@ class TestBoxTurtleRender(unittest.TestCase):
                          'virtual_sdcard', 'display_status',
                          'gcode_macro _MMU_SEQUENCE_VARS'):
             self.assertIn(expected, secs)
+
+    def test_bowden_homing_max_is_menuconfigurable(self):
+        with cfg._env(cfg._SINGLE_UNIT_ENV):
+            kconfig = cfg._kconfig(
+                'boxturtle_bowden_homing_max', profiles.get('boxturtle').syms)
+        self.assertGreater(
+            kconfig.syms['PARAM_BOWDEN_HOMING_MAX'].visibility, 0)
+        self.assertEqual(kconfig.get('PARAM_BOWDEN_HOMING_MAX'), '2000')
+
+        params = cfg.assemble(self.rendered)['mmu_unit_parameters unit0']
+        self.assertEqual(params.getfloat('bowden_homing_max'), 2000.0)
+
+        profile = profiles.get('boxturtle').derive(
+            'boxturtle_custom_bowden_homing_max',
+            syms={'PARAM_BOWDEN_HOMING_MAX': 2750.5})
+        params = cfg.assemble(cfg.render(profile))['mmu_unit_parameters unit0']
+        self.assertEqual(params.getfloat('bowden_homing_max'), 2750.5)
 
     def test_sensorless_preload_choice_renders_none_and_one_attempt(self):
         profile = profiles.get('boxturtle').derive(
@@ -272,6 +376,8 @@ class TestConditionalMacroDefaults(unittest.TestCase):
             'VAR_CLIENT_UNLOAD_TOOL_ON_CANCEL': 'False',
             'VAR_CUT_TIP_RESTORE_POSITION': 'False',
             'VAR_CUT_TIP_BLADE_POS': '37.5',
+            'VAR_CUT_TIP_CUTTER_BEFORE_EXTRUDER': 'False',
+            'VAR_CUT_TIP_TENSION_LENGTH': '10.0',
             'VAR_BLOBIFIER_PURGE_SPD': '400',
             'VAR_SERVO_CUTTER_SERVO_DURATION': '1.5',
         }
@@ -279,6 +385,146 @@ class TestConditionalMacroDefaults(unittest.TestCase):
             with self.subTest(symbol=name):
                 self.assertEqual(kc.syms[name].str_value, value)
                 self.assertTrue(kc.syms[name].config_string)
+
+
+class TestEncoderValidationOptions(unittest.TestCase):
+
+    # .cfg option -> (Kconfig symbol, shipped default, custom value)
+    OPTIONS = {
+        'encoder_move_step_size':            ('PARAM_ENCODER_MOVE_STEP_SIZE', 15.0, 20.5),
+        'bowden_pre_unload_error_tolerance': ('PARAM_BOWDEN_PRE_UNLOAD_ERROR_TOLERANCE', 50, 35),
+        'bowden_move_error_tolerance':       ('PARAM_BOWDEN_MOVE_ERROR_TOLERANCE', 60, 70),
+        'toolhead_move_error_tolerance':     ('PARAM_TOOLHEAD_MOVE_ERROR_TOLERANCE', 80, 90),
+        'toolhead_post_load_tighten':        ('PARAM_TOOLHEAD_POST_LOAD_TIGHTEN', 60, 25),
+    }
+
+    @staticmethod
+    def _params(profile):
+        return cfg.assemble(cfg.render(profile))['mmu_unit_parameters unit0']
+
+    def test_defaults_and_custom_values_render_with_an_encoder(self):
+        params = self._params(profiles.get('encoder'))
+        for option, (_, default, _) in self.OPTIONS.items():
+            with self.subTest(option=option):
+                self.assertEqual(params.getfloat(option), default)
+
+        profile = profiles.get('encoder').derive(
+            'encoder_custom_validation_options',
+            syms={sym: custom for sym, _, custom in self.OPTIONS.values()})
+        params = self._params(profile)
+        for option, (_, _, custom) in self.OPTIONS.items():
+            with self.subTest(option=option):
+                self.assertEqual(params.getfloat(option), custom)
+
+    def test_not_rendered_without_an_encoder(self):
+        params = self._params(profiles.get('boxturtle'))
+        for option in self.OPTIONS:
+            with self.subTest(option=option):
+                self.assertNotIn(option, params)
+
+    def test_dependent_prompts_hide_but_keep_rendering_defaults(self):
+        hidden_by = {
+            'PARAM_BOWDEN_PRE_UNLOAD_TEST': ['PARAM_BOWDEN_PRE_UNLOAD_ERROR_TOLERANCE'],
+            'PARAM_ENCODER_MOVE_VALIDATION': ['PARAM_BOWDEN_ALLOWABLE_ENCODER_DELTA',
+                                              'PARAM_BOWDEN_APPLY_CORRECTION',
+                                              'PARAM_BOWDEN_MOVE_ERROR_TOLERANCE',
+                                              'PARAM_TOOLHEAD_MOVE_ERROR_TOLERANCE',
+                                              'PARAM_TOOLHEAD_POST_LOAD_TIGHTEN'],
+        }
+        defaults = {sym: default for sym, default, _ in self.OPTIONS.values()}
+        defaults.update(PARAM_BOWDEN_ALLOWABLE_ENCODER_DELTA=20.0, PARAM_BOWDEN_APPLY_CORRECTION=0)
+        for switch, dependents in hidden_by.items():
+            syms = dict(profiles.get('encoder').syms, **{switch: 0})
+            with cfg._env(cfg._SINGLE_UNIT_ENV):
+                kc = cfg._kconfig('encoder_without_' + switch.lower(), syms)
+                kc_on = cfg._kconfig('encoder_with_' + switch.lower(), profiles.get('encoder').syms)
+            for sym in dependents:
+                with self.subTest(switch=switch, symbol=sym):
+                    self.assertEqual(kc.syms[sym].visibility, 0)
+                    self.assertGreater(kc_on.syms[sym].visibility, 0)
+                    self.assertEqual(float(kc.syms[sym].str_value), defaults[sym])
+
+
+class TestHeaterRotateInPrint(unittest.TestCase):
+    """The experimental in-print rotation option only shows once a rotate interval is set."""
+
+    def _kconfig(self, name, **syms):
+        with cfg._env(cfg._SINGLE_UNIT_ENV):
+            return cfg._kconfig(name, dict(profiles.get('qidi').syms, **syms))
+
+    def test_defaults_off_in_the_rendered_parameters(self):
+        rendered = cfg.render(profiles.get('qidi'))[PARAMS]
+        self.assertRegex(rendered, r'(?m)^heater_rotate_in_print\s*: 0\s')
+
+    def test_not_offered_with_a_shared_gear(self):
+        vvd = profiles.get('ercf_vvd').units[-1].syms
+        with cfg._env(cfg._SINGLE_UNIT_ENV):
+            kc = cfg._kconfig('rotate_in_print_shared_gear', vvd)
+        self.assertTrue(kc.is_enabled('MMU_GEAR_ROTATES_SPOOL'))
+        self.assertGreater(kc.syms['PARAM_HEATER_ROTATE_INTERVAL'].visibility, 0)
+        self.assertEqual(kc.syms['PARAM_HEATER_ROTATE_IN_PRINT'].visibility, 0)
+
+    def test_shown_only_with_a_rotate_interval(self):
+        sym = 'PARAM_HEATER_ROTATE_IN_PRINT'
+        self.assertGreater(self._kconfig('rotate_interval_set').syms[sym].visibility, 0)
+        # Empty input is now rejected by the float editor.
+        for interval in ('0', '0.0', '-1'):
+            with self.subTest(interval=interval):
+                kc = self._kconfig('rotate_interval_unset', PARAM_HEATER_ROTATE_INTERVAL=interval,
+                                   PARAM_HEATER_ROTATE_IN_PRINT=1)
+                self.assertEqual(kc.syms[sym].visibility, 0)
+                with tempfile.TemporaryDirectory() as tmp:
+                    path = os.path.join(tmp, '.mmu_config')
+                    with cfg._chdir(cfg.INSTALLER):
+                        kc.write_config(path)
+                    with open(path) as f:
+                        self.assertNotIn('CONFIG_%s=' % sym, f.read())
+
+
+class TestAdvancedEncoderEspoolerOptions(unittest.TestCase):
+
+    # section -> {.cfg option: (Kconfig symbol, shipped default, custom value)}
+    OPTIONS = {
+        'mmu_encoder unit0': {
+            'desired_headroom':    ('PARAM_ENCODER_DESIRED_HEADROOM', 5.0, 7.5),
+            'average_samples':     ('PARAM_ENCODER_AVERAGE_SAMPLES', 4, 6),
+            'flowrate_samples':    ('PARAM_ENCODER_FLOWRATE_SAMPLES', 20, 30),
+            'no_movement_samples': ('PARAM_ENCODER_NO_MOVEMENT_SAMPLES', 10, 15),
+        },
+        'mmu_espooler unit0': {
+            'pwm':            ('PARAM_ESPOOLER_PWM', 1, 1),
+            'hardware_pwm':   ('PARAM_ESPOOLER_HARDWARE_PWM', 0, 1),
+            'cycle_time':     ('PARAM_ESPOOLER_CYCLE_TIME', 0.1, 0.01),
+            'scale':          ('PARAM_ESPOOLER_SCALE', 1, 2),
+            'value':          ('PARAM_ESPOOLER_VALUE', 0, 0.5),
+            'shutdown_value': ('PARAM_ESPOOLER_SHUTDOWN_VALUE', 0, 0.25),
+        },
+    }
+
+    def test_defaults_and_custom_values_render(self):
+        custom = {sym: value for options in self.OPTIONS.values()
+                  for sym, _, value in options.values()}
+        for label, profile, column in (
+                ('defaults', profiles.get('encoder'), 1),
+                ('custom', profiles.get('encoder').derive('encoder_custom_advanced', syms=custom), 2)):
+            config = cfg.assemble(cfg.render(profile))
+            for section, options in self.OPTIONS.items():
+                for option, values in options.items():
+                    with self.subTest(label=label, section=section, option=option):
+                        self.assertEqual(config[section].getfloat(option), values[column])
+
+    def test_pwm_only_options_still_render_with_pwm_off(self):
+        pwm_only = ('hardware_pwm', 'cycle_time', 'scale')
+        espooler = self.OPTIONS['mmu_espooler unit0']
+        custom = {espooler[option][0]: espooler[option][2] for option in pwm_only}
+        for label, syms, column in (('defaults', {}, 1), ('custom', custom, 2)):
+            profile = profiles.get('encoder').derive(
+                'encoder_espooler_digital_' + label, syms=dict(syms, PARAM_ESPOOLER_PWM=0))
+            section = cfg.assemble(cfg.render(profile))['mmu_espooler unit0']
+            self.assertEqual(section.getint('pwm'), 0)
+            for option in pwm_only:
+                with self.subTest(label=label, option=option):
+                    self.assertEqual(section.getfloat(option), espooler[option][column])
 
 
 class TestHardwareConfigurationWarnings(unittest.TestCase):
@@ -310,6 +556,14 @@ class TestHardwareConfigurationWarnings(unittest.TestCase):
         self.assertFalse(self._kconfig(
             'configured_per_gate_environment_names', profiles.get('emu').syms
         ).is_enabled('W14'))
+
+    def test_a_per_gate_environment_sensor_above_gate_11_is_seen(self):
+        syms = dict(profiles.get('emu').syms, PARAM_NUM_GATES=profiles.MAX_GATES)
+        syms.update({'PARAM_ENVIRONMENT_SENSOR_GATE_%d' % gate: False
+                     for gate in range(profiles.MAX_GATES - 1)})
+        with cfg._env(dict(cfg._SINGLE_UNIT_ENV, F_MAX_GATES=str(profiles.MAX_GATES))):
+            kc = cfg._kconfig('last_gate_environment_name', syms)
+        self.assertFalse(kc.is_enabled('W14'))
 
 
 class TestCustomHardwareCapabilities(unittest.TestCase):
@@ -473,19 +727,179 @@ class TestMenuconfigMacroStrings(unittest.TestCase):
 
 class TestEnvironmentSensorReportTime(unittest.TestCase):
 
-    def _single_sensor(self, name, choice):
+    # Choice member -> (sensor_type, i2c_address, report-time option or None), per the
+    # Klipper drivers: aht10.py, bme280.py (fixed 0.8s, no option), htu21d.py, sht3x.py and lm75.py
+    SENSOR_TYPES = {
+        'AHT10':  ('AHT10',  '56',  'aht10_report_time'),
+        'AHT1X':  ('AHT1X',  '56',  'aht10_report_time'),
+        'AHT2X':  ('AHT2X',  '56',  'aht10_report_time'),
+        'AHT3X':  ('AHT3X',  '56',  'aht10_report_time'),
+        'BME280': ('BME280', '118', None),
+        'HTU21D': ('HTU21D', '64',  'htu21d_report_time'),
+        'SI7013': ('SI7013', '64',  'htu21d_report_time'),
+        'SI7020': ('SI7020', '64',  'htu21d_report_time'),
+        'SI7021': ('SI7021', '64',  'htu21d_report_time'),
+        'SHT21':  ('SHT21',  '64',  'htu21d_report_time'),
+        'SHT3X':  ('SHT3X',  '68',  'sht3x_report_time'),
+        'LM75':   ('LM75',   '72',  'lm75_report_time'),
+    }
+    CHOICE = 'CHOICE_ENVIRONMENT_SENSOR_TYPE_'
+
+    def _single_sensor(self, name, choice, extra=None):
         profile = profiles.get('boxturtle').derive(
             name,
-            syms={
+            syms=dict({
                 'MMU_HAS_ENVIRONMENT_SENSOR': True,
                 choice: True,
-            })
+            }, **(extra or {})))
         with cfg._env(cfg._SINGLE_UNIT_ENV):
             kc = cfg._kconfig(name, profile.syms)
         rendered = cfg.render(profile)
         parser = cfg.assemble(rendered, macros=False)
         sensor = dict(parser.items('temperature_sensor unit0_Env'))
         return kc, sensor
+
+    def _per_gate_sensors(self, name, syms):
+        with cfg._env(cfg._SINGLE_UNIT_ENV):
+            kc = cfg._kconfig(name, dict({
+                'MMU_TYPE_EMU_1_0': True,
+                'MMU_HAS_PER_GATE_MCU': True,
+            }, **syms))
+        rendered = cfg._render_templates(
+            (HARDWARE,), kc,
+            {'PARAM_TOTAL_NUM_GATES': kc.getint('PARAM_NUM_GATES')})
+        parser = cfg.assemble(rendered, macros=False)
+        sensors = [dict(parser.items('temperature_sensor unit0_Env%d' % gate))
+                   for gate in range(kc.getint('PARAM_NUM_GATES'))]
+        return kc, sensors
+
+    def _assert_sensor(self, sensor, member):
+        # All driver alternatives must stay covered by the source declaration.
+        from installer.build import template_managed_options
+        with cfg._chdir(cfg.REPO_ROOT):
+            managed = template_managed_options(HARDWARE)['temperature_sensor']
+        self.assertFalse(set(sensor) - managed, set(sensor) - managed)
+        sensor_type, address, option = self.SENSOR_TYPES[member]
+        self.assertEqual(sensor['sensor_type'], sensor_type)
+        self.assertEqual(sensor['i2c_address'], address)
+        report_options = {k for k in sensor if k.endswith('_report_time')}
+        self.assertEqual(report_options, {option} if option else set())
+        self.assertNotIn('htu21d_resolution', sensor)
+        self.assertNotIn('htu21d_hold_master', sensor)
+        if option:
+            self.assertEqual(sensor[option], '60')
+
+    def test_every_shared_type_renders_its_driver_options(self):
+        for member in self.SENSOR_TYPES:
+            with self.subTest(member=member):
+                _, sensor = self._single_sensor(
+                    'environment_sensor_type_%s' % member.lower(), self.CHOICE + member)
+                self._assert_sensor(sensor, member)
+
+    def test_every_per_gate_type_renders_its_driver_options(self):
+        members = list(self.SENSOR_TYPES)
+        syms = {'%s%s_%d' % (self.CHOICE, member, gate): True
+                for gate, member in enumerate(members)}
+        syms['PARAM_NUM_GATES'] = len(members)
+        kc, sensors = self._per_gate_sensors('environment_sensor_types_per_gate', syms)
+        self.assertEqual(len(sensors), len(members))
+        for gate, member in enumerate(members):
+            with self.subTest(gate=gate, member=member):
+                self._assert_sensor(sensors[gate], member)
+
+    def test_shared_and_per_gate_offer_the_same_types(self):
+        with cfg._env(cfg._SINGLE_UNIT_ENV):
+            kc = cfg._kconfig('environment_sensor_type_members', {})
+        pattern = re.compile(r'^%s([A-Z0-9]+?)(_0)?$' % self.CHOICE)
+        shared, per_gate = set(), set()
+        for name in kc.syms:
+            m = pattern.match(name)
+            if m:
+                (per_gate if m.group(2) else shared).add(m.group(1))
+        self.assertEqual(shared, set(self.SENSOR_TYPES))
+        self.assertEqual(per_gate, set(self.SENSOR_TYPES))
+
+    def test_zero_report_time_leaves_klipper_default(self):
+        for member in ('AHT2X', 'HTU21D', 'SHT3X', 'LM75'):
+            with self.subTest(member=member):
+                kc, sensor = self._single_sensor(
+                    'environment_sensor_zero_report_time_%s' % member.lower(),
+                    self.CHOICE + member,
+                    {'PARAM_ENVIRONMENT_SENSOR_REPORT_TIME': 0})
+                self.assertEqual(
+                    kc.syms['PARAM_ENVIRONMENT_SENSOR_REPORT_TIME'].str_value, '0')
+                self.assertNotIn(self.SENSOR_TYPES[member][2], sensor)
+
+        _, sensors = self._per_gate_sensors('environment_sensor_zero_report_time_per_gate', {
+            self.CHOICE + 'AHT2X_0': True,
+            'PARAM_ENVIRONMENT_SENSOR_REPORT_TIME_0': 0,
+            self.CHOICE + 'HTU21D_1': True,
+            'PARAM_ENVIRONMENT_SENSOR_REPORT_TIME_1': 0,
+        })
+        self.assertNotIn('aht10_report_time', sensors[0])
+        self.assertNotIn('htu21d_report_time', sensors[1])
+
+    def test_report_time_between_zero_and_klipper_minimum_is_rejected(self):
+        # A rejected user value falls back to the default
+        min_five = ((0, '0'), (1, '60'), (4, '60'), (5, '5'), (300, '300'), (301, '60'))
+        min_one = ((0, '0'), (1, '1'), (4, '4'), (300, '300'), (301, '60'))
+        cases = {'AHT2X': min_five, 'HTU21D': min_five, 'SHT3X': min_one, 'LM75': min_one}
+        base = dict(profiles.get('boxturtle').syms, MMU_HAS_ENVIRONMENT_SENSOR=True)
+        for member, member_cases in cases.items():
+            for value, expected in member_cases:
+                with self.subTest(member=member, value=value):
+                    with cfg._env(cfg._SINGLE_UNIT_ENV):
+                        kc = cfg._kconfig('environment_sensor_report_time_range', dict(base, **{
+                            self.CHOICE + member: True,
+                            'PARAM_ENVIRONMENT_SENSOR_REPORT_TIME': value}))
+                    self.assertEqual(
+                        kc.syms['PARAM_ENVIRONMENT_SENSOR_REPORT_TIME'].str_value, expected)
+
+        for gate, member in ((1, 'HTU21D'), (2, 'SHT3X'), (3, 'LM75')):
+            for value, expected in cases[member]:
+                with self.subTest(gate=gate, member=member, value=value):
+                    with cfg._env(cfg._SINGLE_UNIT_ENV):
+                        kc = cfg._kconfig('environment_sensor_report_time_range_per_gate', {
+                            'MMU_TYPE_EMU_1_0': True,
+                            'MMU_HAS_PER_GATE_MCU': True,
+                            '%s%s_%d' % (self.CHOICE, member, gate): True,
+                            'PARAM_ENVIRONMENT_SENSOR_REPORT_TIME_%d' % gate: value})
+                    self.assertEqual(
+                        kc.syms['PARAM_ENVIRONMENT_SENSOR_REPORT_TIME_%d' % gate].str_value,
+                        expected)
+
+    def test_htu21d_resolution_and_hold_master_render_only_when_chosen(self):
+        resolution = 'CHOICE_ENVIRONMENT_SENSOR_HTU21D_RESOLUTION_'
+        hold_master = 'PARAM_ENVIRONMENT_SENSOR_HTU21D_HOLD_MASTER'
+
+        _, sensor = self._single_sensor(
+            'environment_sensor_htu21d_options', self.CHOICE + 'HTU21D',
+            {resolution + 'TEMP14_HUM12': True, hold_master: 1})
+        self.assertEqual(sensor['htu21d_resolution'], 'TEMP14_HUM12')
+        self.assertEqual(sensor['htu21d_hold_master'], '1')
+
+        # Values left over from an HTU21D-family type must not reach another driver
+        _, sensor = self._single_sensor(
+            'environment_sensor_htu21d_options_on_aht', self.CHOICE + 'AHT2X',
+            {resolution + 'TEMP14_HUM12': True, hold_master: 1})
+        self.assertNotIn('htu21d_resolution', sensor)
+        self.assertNotIn('htu21d_hold_master', sensor)
+
+        _, sensors = self._per_gate_sensors('environment_sensor_htu21d_options_per_gate', {
+            self.CHOICE + 'SI7021_0': True,
+            resolution + 'TEMP11_HUM11_0': True,
+            hold_master + '_0': 1,
+            self.CHOICE + 'HTU21D_1': True,
+            self.CHOICE + 'AHT2X_2': True,
+            resolution + 'TEMP13_HUM10_2': True,
+            hold_master + '_2': 1,
+        })
+        self.assertEqual(sensors[0]['htu21d_resolution'], 'TEMP11_HUM11')
+        self.assertEqual(sensors[0]['htu21d_hold_master'], '1')
+        for gate in (1, 2):
+            with self.subTest(gate=gate):
+                self.assertNotIn('htu21d_resolution', sensors[gate])
+                self.assertNotIn('htu21d_hold_master', sensors[gate])
 
     def test_aht_sensor_uses_selected_report_time_parameter(self):
         kc, sensor = self._single_sensor(
@@ -508,9 +922,34 @@ class TestEnvironmentSensorReportTime(unittest.TestCase):
         self.assertNotIn('bme_report_time', sensor)
         self.assertNotIn('bme280_report_time', sensor)
 
+    def test_htu21d_sensor_uses_its_own_report_time_and_address(self):
+        kc, sensor = self._single_sensor(
+            'environment_sensor_htu21d_report_time',
+            'CHOICE_ENVIRONMENT_SENSOR_TYPE_HTU21D')
+
+        self.assertEqual(kc.get('PARAM_SENSOR_REPORT_TIME_PARAM'), 'htu21d_report_time')
+        self.assertEqual(sensor['sensor_type'], 'HTU21D')
+        self.assertEqual(sensor['htu21d_report_time'], '60')
+        self.assertEqual(sensor['i2c_address'], '64')
+        self.assertNotIn('aht10_report_time', sensor)
+
+    def test_htu21d_per_gate_sensor(self):
+        with cfg._env(cfg._SINGLE_UNIT_ENV):
+            kc = cfg._kconfig('environment_sensor_htu21d_per_gate', {
+                'MMU_TYPE_EMU_1_0': True,
+                'MMU_HAS_PER_GATE_MCU': True,
+                'CHOICE_ENVIRONMENT_SENSOR_TYPE_HTU21D_0': True,
+            })
+        rendered = cfg._render_templates(
+            (HARDWARE,), kc,
+            {'PARAM_TOTAL_NUM_GATES': kc.getint('PARAM_NUM_GATES')})
+        sensor = dict(cfg.assemble(rendered, macros=False).items('temperature_sensor unit0_Env0'))
+        self.assertEqual(sensor['sensor_type'], 'HTU21D')
+        self.assertEqual(sensor['htu21d_report_time'], '60')
+        self.assertEqual(sensor['i2c_address'], '64')
+
     def test_mixed_per_gate_sensors_select_report_parameter_independently(self):
-        env = dict(cfg._SINGLE_UNIT_ENV, F_PER_GATE_MCU='y')
-        with cfg._env(env):
+        with cfg._env(cfg._SINGLE_UNIT_ENV):
             kc = cfg._kconfig('environment_sensor_mixed_per_gate', {
                 'MMU_TYPE_EMU_1_0': True,
                 'MMU_HAS_PER_GATE_MCU': True,
@@ -600,6 +1039,413 @@ class TestOptionalBlobifierBucketSwitch(unittest.TestCase):
             })
         self.assertTrue(kc.is_enabled('SW4'))
 
+class TestBlobifierTmcDriverChoice(unittest.TestCase):
+    """Driver section comes from Kconfig; a hand edit is reverted on every install."""
+
+    def _render_mmu(self, name, syms, base=None):
+        profile = (base or profiles.get('boxturtle')).derive(
+            name,
+            syms=dict({
+                'MMU_HAS_BLOBIFIER': True,
+                'CHOICE_BLOBIFIER_TYPE_STEPPER': True,
+                'PIN_BLOBIFIER_STEP': 'unit0:PD4',
+                'PIN_BLOBIFIER_DIR': '!unit0:PD3',
+                'PIN_BLOBIFIER_ENABLE': '!unit0:PD6',
+                'PIN_BLOBIFIER_ENDSTOP': '^!unit0:PC15',
+            }, **syms))
+        return cfg.render(profile)[MMU]
+
+    @staticmethod
+    def _drivers(mmu):
+        return [s for s in cfg.sections(mmu)
+                if s.startswith('tmc') and s.endswith('manual_stepper stepper_blobifier')]
+
+    def test_uart_driver_is_the_default(self):
+        mmu = self._render_mmu('blobifier_tmc_default', {
+            'PIN_BLOBIFIER_UART': 'unit0:PC14',
+        })
+        self.assertEqual(self._drivers(mmu), ['tmc2209 manual_stepper stepper_blobifier'])
+        driver = dict(cfg.assemble({MMU: mmu}).items(
+            'tmc2209 manual_stepper stepper_blobifier'))
+        self.assertEqual(driver['uart_pin'], 'unit0:PC14')
+        self.assertEqual(driver['run_current'], '0.6')
+        self.assertEqual(driver['hold_current'], '0.1')
+        self.assertEqual(driver['sense_resistor'], '0.110')
+        self.assertNotIn('cs_pin', driver)
+
+    def test_spi_driver_replaces_the_section_rather_than_adding_one(self):
+        mmu = self._render_mmu('blobifier_tmc2240', {
+            'CHOICE_BLOBIFIER_TMC2240_SPI': True,
+            'PIN_BLOBIFIER_CS': 'unit0:PC14',
+            'PIN_BLOBIFIER_SPI_SCLK': 'unit0:PG8',
+            'PIN_BLOBIFIER_SPI_MOSI': 'unit0:PG6',
+            'PIN_BLOBIFIER_SPI_MISO': 'unit0:PG7',
+            # A saved hardware bus must not leak into software-SPI output.
+            'PARAM_BLOBIFIER_SPI_BUS': 'spi2',
+        })
+        # Exactly one, or Klipper's mux registry rejects the second at boot
+        self.assertEqual(self._drivers(mmu), ['tmc2240 manual_stepper stepper_blobifier'])
+        driver = dict(cfg.assemble({MMU: mmu}).items(
+            'tmc2240 manual_stepper stepper_blobifier'))
+        self.assertEqual(driver['cs_pin'], 'unit0:PC14')
+        self.assertEqual(driver['spi_software_sclk_pin'], 'unit0:PG8')
+        self.assertEqual(driver['spi_software_miso_pin'], 'unit0:PG7')
+        self.assertNotIn('uart_pin', driver)
+        self.assertNotIn('spi_bus', driver)
+        # tmc2240 takes 'rref', not 'sense_resistor' - Klipper rejects the unknown option
+        self.assertNotIn('sense_resistor', driver)
+
+    def test_partial_spi_pins_do_not_silently_select_hardware_spi(self):
+        """Keep the requested wiring visible; missing pins must not select another bus."""
+        mmu = self._render_mmu('blobifier_tmc2240_partial_spi', {
+            'CHOICE_BLOBIFIER_TMC2240_SPI': True,
+            'PIN_BLOBIFIER_CS': 'unit0:PC14',
+            'PIN_BLOBIFIER_SPI_SCLK': 'unit0:PG8',
+        })
+        driver = dict(cfg.assemble({MMU: mmu}).items(
+            'tmc2240 manual_stepper stepper_blobifier'))
+        self.assertEqual(driver['cs_pin'], 'unit0:PC14')
+        self.assertEqual(driver['spi_software_sclk_pin'], 'unit0:PG8')
+        self.assertEqual(driver['spi_software_mosi_pin'], '')
+        self.assertEqual(driver['spi_software_miso_pin'], '')
+        self.assertNotIn('spi_bus', driver)
+
+    def test_partial_spi_pins_are_warned(self):
+        with cfg._env(cfg._SINGLE_UNIT_ENV):
+            kc = cfg._kconfig('blobifier_partial_spi_warning', {
+                'MMU_HAS_BLOBIFIER': True,
+                'MMU_HAS_BLOBIFIER_BUCKET_SWITCH': False,
+                'CHOICE_BLOBIFIER_TYPE_STEPPER': True,
+                'CHOICE_BLOBIFIER_TMC5160': True,
+                'PIN_BLOBIFIER_CS': 'unit0:PC14',
+            })
+        pins = ('SCLK', 'MOSI', 'MISO')
+        for mask in range(8):
+            with self.subTest(mask=mask):
+                for index, pin in enumerate(pins):
+                    kc.syms['PIN_BLOBIFIER_SPI_' + pin].set_value(
+                        'unit0:PG%d' % index if mask & (1 << index) else '')
+                self.assertEqual(kc.is_enabled('SW6'), mask not in (0, 7))
+        kc.syms['PIN_BLOBIFIER_SPI_MISO'].set_value('')
+        for choice in ('CHOICE_BLOBIFIER_TMC2209', 'CHOICE_BLOBIFIER_TMC_NONE'):
+            kc.syms[choice].set_value(2)
+            self.assertFalse(kc.is_enabled('SW6'))
+
+    def test_named_hardware_spi_bus(self):
+        mmu = self._render_mmu('blobifier_named_spi', {
+            'CHOICE_BLOBIFIER_TMC5160': True,
+            'PIN_BLOBIFIER_CS': 'unit0:PC14',
+            'PARAM_BLOBIFIER_SPI_BUS': 'spi2',
+        })
+        driver = dict(cfg.assemble({MMU: mmu}).items(
+            'tmc5160 manual_stepper stepper_blobifier'))
+        self.assertEqual(driver['spi_bus'], 'spi2')
+        self.assertNotIn('spi_software_sclk_pin', driver)
+        self.assertEqual(driver['sense_resistor'], '0.075')
+
+    def test_5160_default_bus_and_custom_resistor(self):
+        mmu = self._render_mmu('blobifier_5160_custom_resistor', {
+            'CHOICE_BLOBIFIER_TMC5160': True,
+            'PIN_BLOBIFIER_CS': 'unit0:PC14',
+            'PARAM_BLOBIFIER_SENSE_RESISTOR': '0.050',
+        })
+        self.assertEqual(self._drivers(mmu), ['tmc5160 manual_stepper stepper_blobifier'])
+        driver = dict(cfg.assemble({MMU: mmu}).items(self._drivers(mmu)[0]))
+        self.assertEqual(driver['sense_resistor'], '0.050')
+        self.assertNotIn('spi_bus', driver)
+        self.assertNotIn('spi_software_sclk_pin', driver)
+        self.assertNotIn('uart_pin', driver)
+        self.assertNotIn('driver_slope_control', driver)
+
+    def test_spi_settings_survive_save_and_reload(self):
+        with cfg._env(cfg._SINGLE_UNIT_ENV):
+            kc = cfg._kconfig('blobifier_save_spi', {
+                'MMU_HAS_BLOBIFIER': True,
+                'CHOICE_BLOBIFIER_TYPE_STEPPER': True,
+                'CHOICE_BLOBIFIER_TMC5160': True,
+                'PIN_BLOBIFIER_CS': 'mcu:PC14',
+                'PARAM_BLOBIFIER_SPI_BUS': 'spi2',
+                'PARAM_BLOBIFIER_SENSE_RESISTOR': '0.050',
+            })
+            with tempfile.TemporaryDirectory() as tmp:
+                path = os.path.join(tmp, '.mmu_config')
+                kc.write_config(path)
+                for filter_defaults in (True, False):
+                    with self.subTest(filter_defaults=filter_defaults):
+                        loaded = cfg._new_kconfig('blobifier_reload_spi')
+                        # menuconfig filters defaults; the builder preserves them.
+                        loaded.load_config(path, filter_defaults=filter_defaults)
+                        mmu = cfg._render_templates(
+                            (MMU,), loaded, {'PARAM_TOTAL_NUM_GATES': 4})[MMU]
+                        driver = dict(cfg.assemble({MMU: mmu}).items(
+                            'tmc5160 manual_stepper stepper_blobifier'))
+                        self.assertEqual(driver['cs_pin'], 'mcu:PC14')
+                        self.assertEqual(driver['spi_bus'], 'spi2')
+                        self.assertEqual(driver['sense_resistor'], '0.050')
+                        self.assertNotIn('uart_pin', driver)
+
+    def test_multi_unit_renders_one_shared_blobifier_driver(self):
+        mmu = self._render_mmu('two_units_blobifier_spi', {
+            'CHOICE_BLOBIFIER_TMC5160': True,
+            'PIN_BLOBIFIER_CS': 'unit0:PC14',
+            'PARAM_BLOBIFIER_SPI_BUS': 'spi2',
+        }, base=TWO_UNIT)
+        self.assertEqual(self._drivers(mmu), ['tmc5160 manual_stepper stepper_blobifier'])
+        driver = dict(cfg.assemble({MMU: mmu}).items(self._drivers(mmu)[0]))
+        self.assertEqual(driver['cs_pin'], 'unit0:PC14')
+        self.assertEqual(driver['spi_bus'], 'spi2')
+
+    def test_disabling_blobifier_hides_prompts_and_emits_no_driver(self):
+        with cfg._env(cfg._SINGLE_UNIT_ENV):
+            kc = cfg._kconfig('blobifier_disabled_spi', {'MMU_HAS_BLOBIFIER': False})
+        import kconfiglib
+        for name, sym_type in (
+                ('PIN_BLOBIFIER_CS', kconfiglib.STRING),
+                ('PIN_BLOBIFIER_SPI_SCLK', kconfiglib.STRING),
+                ('PARAM_BLOBIFIER_SPI_BUS', kconfiglib.STRING),
+                ('PARAM_BLOBIFIER_SENSE_RESISTOR', kconfiglib.FLOAT)):
+            self.assertEqual(kc.syms[name].orig_type, sym_type)
+            self.assertEqual(kc.syms[name].visibility, 0)
+        self.assertEqual(kc.syms['PARAM_BLOBIFIER_TMC'].str_value, '')
+        self.assertFalse(kc.is_enabled('BOOL_BLOBIFIER_TMC_SPI'))
+        self.assertFalse(kc.is_enabled('SW5'))
+        self.assertFalse(kc.is_enabled('SW6'))
+        mmu = self._render_mmu('blobifier_disabled_output', {'MMU_HAS_BLOBIFIER': False})
+        self.assertEqual(self._drivers(mmu), [])
+
+    def test_hardware_controlled_driver_emits_no_section(self):
+        mmu = self._render_mmu('blobifier_tmc_none', {'CHOICE_BLOBIFIER_TMC_NONE': True})
+        self.assertIn('manual_stepper stepper_blobifier', cfg.sections(mmu))
+        self.assertEqual(self._drivers(mmu), [])
+
+    # Option sets Klipper's own driver modules accept, chip by chip. Every
+    # entry below was read off klippy/extras/tmc*.py, not off our templates -
+    # an option a chip does not take is a hard config error at boot, not a
+    # warning, so the blobifier never comes back until the line is deleted.
+    DRIVER_MATRIX = (
+        # label      chip choice   klipper section  bus pin     extra syms
+        ('2209',     'TMC2209',    'tmc2209', 'uart_pin', {}),
+        ('2226',     'TMC2226',    'tmc2209', 'uart_pin', {}),
+        ('2208',     'TMC2208',    'tmc2208', 'uart_pin', {}),
+        ('2130',     'TMC2130',    'tmc2130', 'cs_pin',   {}),
+        ('2660',     'TMC2660',    'tmc2660', 'cs_pin',   {}),
+        ('5160',     'TMC5160',    'tmc5160', 'cs_pin',   {}),
+        ('2240_spi', 'TMC2240_SPI','tmc2240', 'cs_pin',   {}),
+        ('2240_uart','TMC2240_UART','tmc2240', 'uart_pin', {}),
+    )
+
+    # sense_resistor is the shunt value; the TMC2240 has no shunt and sizes
+    # current from rref instead. The TMC2660 is spreadCycle-only with no
+    # hold_current, so both of those lines must be absent for it.
+    EXPECTED_OPTIONS = {
+        '2209':      {'run_current', 'hold_current', 'interpolate',
+                      'stealthchop_threshold', 'sense_resistor'},
+        '2226':      {'run_current', 'hold_current', 'interpolate',
+                      'stealthchop_threshold', 'sense_resistor'},
+        '2208':      {'run_current', 'hold_current', 'interpolate',
+                      'stealthchop_threshold', 'sense_resistor'},
+        '2130':      {'run_current', 'hold_current', 'interpolate',
+                      'stealthchop_threshold', 'sense_resistor'},
+        '2660':      {'run_current', 'interpolate', 'sense_resistor'},
+        '5160':      {'run_current', 'hold_current', 'interpolate',
+                      'stealthchop_threshold', 'sense_resistor'},
+        '2240_spi':  {'run_current', 'hold_current', 'interpolate',
+                      'stealthchop_threshold', 'rref'},
+        '2240_uart': {'run_current', 'hold_current', 'interpolate',
+                      'stealthchop_threshold', 'rref'},
+    }
+
+    def _render_driver(self, label, choice, section, bus_pin, extra):
+        syms = {'CHOICE_BLOBIFIER_' + choice: True}
+        syms['PIN_BLOBIFIER_' +
+             ('UART' if bus_pin == 'uart_pin' else 'CS')] = 'unit0:PC14'
+        syms.update(extra)
+        mmu = self._render_mmu('blobifier_matrix_' + label, syms)
+        full = section + ' manual_stepper stepper_blobifier'
+        self.assertEqual(self._drivers(mmu), [full])
+        return dict(cfg.assemble({MMU: mmu}).items(full))
+
+    def test_every_chip_renders_only_options_that_chip_accepts(self):
+        for label, choice, section, bus_pin, extra in self.DRIVER_MATRIX:
+            with self.subTest(chip=label):
+                driver = self._render_driver(label, choice, section, bus_pin, extra)
+                other_pin = 'cs_pin' if bus_pin == 'uart_pin' else 'uart_pin'
+                self.assertEqual(driver[bus_pin], 'unit0:PC14')
+                self.assertNotIn(other_pin, driver)
+                self.assertEqual(set(driver) - {bus_pin},
+                                 self.EXPECTED_OPTIONS[label])
+
+    def test_chip_specific_current_defaults(self):
+        """The shunt fitted to the stick differs per chip; rref is not a shunt."""
+        expected = {'2209': ('sense_resistor', '0.110'),
+                    '2226': ('sense_resistor', '0.150'),
+                    '2208': ('sense_resistor', '0.110'),
+                    '2130': ('sense_resistor', '0.110'),
+                    '2660': ('sense_resistor', '0.110'),
+                    '5160': ('sense_resistor', '0.075'),
+                    '2240_spi': ('rref', '12000')}
+        for label, choice, section, bus_pin, extra in self.DRIVER_MATRIX:
+            if label not in expected:
+                continue
+            with self.subTest(chip=label):
+                driver = self._render_driver(label, choice, section, bus_pin, extra)
+                option, value = expected[label]
+                self.assertEqual(driver[option], value)
+
+    def test_tmc2660_omits_hold_current_and_stealthchop(self):
+        """Klipper's tmc2660 has neither option and rejects the config outright."""
+        driver = self._render_driver('2660', 'TMC2660', 'tmc2660', 'cs_pin', {})
+        self.assertNotIn('hold_current', driver)
+        self.assertNotIn('stealthchop_threshold', driver)
+        # sense_resistor has no Klipper default for this chip - it must be emitted
+        self.assertEqual(driver['sense_resistor'], '0.110')
+
+    def test_the_chip_choice_carries_the_bus(self):
+        """One choice, not two.
+
+        Every chip but the TMC2240 is single-bus, so a separate bus prompt
+        showed a single option almost everywhere. The bus is part of the
+        chip entry instead, and the TMC2240 simply appears twice.
+        """
+        with cfg._env(cfg._SINGLE_UNIT_ENV):
+            kc = cfg._kconfig('blobifier_chip_bus', {
+                'MMU_HAS_BLOBIFIER': True,
+                'CHOICE_BLOBIFIER_TYPE_STEPPER': True,
+            })
+        expected = {'TMC2209': False, 'TMC2226': False, 'TMC2208': False,
+                    'TMC2130': True, 'TMC2660': True, 'TMC5160': True,
+                    'TMC2240_SPI': True, 'TMC2240_UART': False,
+                    'TMC_NONE': False}
+        # Kconfig.purging is sourced by both the shared and the per-unit
+        # tree, so every member appears twice - dedupe.
+        members = list(dict.fromkeys(
+            m.name for m in kc.named_choices['CHOICE_BLOBIFIER_TMC'].syms))
+        self.assertEqual(members, ['CHOICE_BLOBIFIER_' + c for c in expected])
+        for chip, spi in expected.items():
+            with self.subTest(chip=chip):
+                kc.syms['CHOICE_BLOBIFIER_' + chip].set_value(2)
+                self.assertEqual(kc.is_enabled('BOOL_BLOBIFIER_TMC_SPI'), spi)
+
+    def test_both_tmc2240_entries_use_the_same_klipper_module(self):
+        """They differ in how the chip is wired, not in the driver."""
+        with cfg._env(cfg._SINGLE_UNIT_ENV):
+            kc = cfg._kconfig('blobifier_2240_pair', {
+                'MMU_HAS_BLOBIFIER': True,
+                'CHOICE_BLOBIFIER_TYPE_STEPPER': True,
+            })
+        for chip in ('TMC2240_SPI', 'TMC2240_UART'):
+            with self.subTest(chip=chip):
+                kc.syms['CHOICE_BLOBIFIER_' + chip].set_value(2)
+                self.assertEqual(kc.get('PARAM_BLOBIFIER_TMC'), 'tmc2240')
+                self.assertTrue(kc.is_enabled('BOOL_BLOBIFIER_TMC_HAS_RREF'))
+
+    def test_existing_chips_render_exactly_as_before_the_bus_split(self):
+        """Pins the three chips that shipped in #1235 so this stays additive.
+
+        rref is the one addition, and 12000 is Klipper's own default for it,
+        so an installed machine's behaviour is unchanged either way.
+        """
+        unchanged = {
+            'tmc2209': ({'CHOICE_BLOBIFIER_TMC2209': True,
+                         'PIN_BLOBIFIER_UART': 'unit0:PC14'},
+                        {'uart_pin': 'unit0:PC14', 'run_current': '0.6',
+                         'hold_current': '0.1', 'interpolate': 'true',
+                         'stealthchop_threshold': '99999999',
+                         'sense_resistor': '0.110'}),
+            'tmc5160': ({'CHOICE_BLOBIFIER_TMC5160': True,
+                         'PIN_BLOBIFIER_CS': 'unit0:PC14'},
+                        {'cs_pin': 'unit0:PC14', 'run_current': '0.6',
+                         'hold_current': '0.1', 'interpolate': 'true',
+                         'stealthchop_threshold': '99999999',
+                         'sense_resistor': '0.075'}),
+            'tmc2240': ({'CHOICE_BLOBIFIER_TMC2240_SPI': True,
+                         'PIN_BLOBIFIER_CS': 'unit0:PC14'},
+                        {'cs_pin': 'unit0:PC14', 'run_current': '0.6',
+                         'hold_current': '0.1', 'interpolate': 'true',
+                         'stealthchop_threshold': '99999999',
+                         'rref': '12000'}),
+        }
+        for section, (syms, expected) in unchanged.items():
+            with self.subTest(chip=section):
+                mmu = self._render_mmu('blobifier_parity_' + section, syms)
+                full = section + ' manual_stepper stepper_blobifier'
+                self.assertEqual(self._drivers(mmu), [full])
+                self.assertEqual(dict(cfg.assemble({MMU: mmu}).items(full)), expected)
+
+    def test_config_saved_before_the_bus_split_still_resolves(self):
+        """A real installed .mmu_config, predating both changes at once.
+
+        It names no bus at all, so the bus has to fall out of the chip
+        choice or olddefconfig moves the machine onto the wrong one. And
+        it still spells the pins with the STEPPER infix, so the value only
+        survives if HH_RENAMED_SYMBOLS carries it across. Those are the two
+        ways this change could silently break an installed machine, and this
+        is the fixture where they meet - so the pin names here are
+        deliberately the OLD ones and must not be renamed.
+        """
+        legacy = ('CONFIG_MMU_HAS_BLOBIFIER=y\n'
+                  'CONFIG_CHOICE_BLOBIFIER_TYPE_STEPPER=y\n'
+                  'CONFIG_%s=y\n'
+                  'CONFIG_PIN_BLOBIFIER_STEPPER_%s="unit0:PC14"\n')
+        for chip, pin, section, wanted_spi in (
+                ('CHOICE_BLOBIFIER_TMC2209', 'UART', 'tmc2209', False),
+                ('CHOICE_BLOBIFIER_TMC5160', 'CS', 'tmc5160', True),
+                ('CHOICE_BLOBIFIER_TMC2240', 'CS', 'tmc2240', True)):
+            with self.subTest(chip=chip):
+                with cfg._env(cfg._SINGLE_UNIT_ENV):
+                    kc = cfg._new_kconfig('legacy_' + chip)
+                    with tempfile.TemporaryDirectory() as tmp:
+                        path = os.path.join(tmp, '.mmu_config')
+                        with open(path, 'w') as handle:
+                            handle.write(legacy % (chip, pin))
+                        kc.load_config(path, filter_defaults=True)
+                        mmu = cfg._render_templates(
+                            (MMU,), kc, {'PARAM_TOTAL_NUM_GATES': 4})[MMU]
+                self.assertEqual(kc.is_enabled('BOOL_BLOBIFIER_TMC_SPI'), wanted_spi)
+                full = section + ' manual_stepper stepper_blobifier'
+                self.assertEqual(self._drivers(mmu), [full])
+                driver = dict(cfg.assemble({MMU: mmu}).items(full))
+                self.assertEqual(driver['cs_pin' if wanted_spi else 'uart_pin'],
+                                 'unit0:PC14')
+
+    def test_missing_driver_pin_is_warned(self):
+        with cfg._env(cfg._SINGLE_UNIT_ENV):
+            kc = cfg._kconfig('blobifier_tmc_missing_uart_pin', {
+                'MMU_HAS_BLOBIFIER': True,
+                'CHOICE_BLOBIFIER_TYPE_STEPPER': True,
+                'PIN_BLOBIFIER_UART': '',
+            })
+        self.assertTrue(kc.is_enabled('SW5'))
+
+        # Whichever bus the chip lands on, SW5 must key off that bus's pin.
+        for chip, pin in (('TMC2226', 'UART'), ('TMC2208', 'UART'),
+                          ('TMC2130', 'CS'), ('TMC2660', 'CS'),
+                          ('TMC5160', 'CS'), ('TMC2240_SPI', 'CS')):
+            with self.subTest(chip=chip):
+                kc.syms['CHOICE_BLOBIFIER_' + chip].set_value(2)
+                self.assertTrue(kc.is_enabled('SW5'))
+                kc.syms['PIN_BLOBIFIER_' + pin].set_value('unit0:PC14')
+                self.assertFalse(kc.is_enabled('SW5'))
+                kc.syms['PIN_BLOBIFIER_' + pin].set_value('')
+
+        # A TMC2240 moved to UART must warn about the UART pin, not the CS one
+        kc.syms['CHOICE_BLOBIFIER_TMC2240_UART'].set_value(2)
+        kc.syms['PIN_BLOBIFIER_CS'].set_value('unit0:PC14')
+        self.assertTrue(kc.is_enabled('SW5'))
+        kc.syms['PIN_BLOBIFIER_UART'].set_value('unit0:PC13')
+        self.assertFalse(kc.is_enabled('SW5'))
+        kc.syms['PIN_BLOBIFIER_CS'].set_value('')
+        kc.syms['PIN_BLOBIFIER_UART'].set_value('')
+
+        with cfg._env(cfg._SINGLE_UNIT_ENV):
+            kc = cfg._kconfig('blobifier_tmc_none_needs_no_pin', {
+                'MMU_HAS_BLOBIFIER': True,
+                'CHOICE_BLOBIFIER_TYPE_STEPPER': True,
+                'CHOICE_BLOBIFIER_TMC_NONE': True,
+            })
+        self.assertFalse(kc.is_enabled('SW5'))
+
+
 # Deliberately TWO IDENTICAL BOXTURTLES rather than the real ercf_vvd profile. The point is
 # to test the multi-unit RENDER PATH, so both units being the machine every other test
 # already trusts means a failure here is the path and not an ERCF or ViViD quirk. It lives
@@ -612,6 +1458,187 @@ class TestOptionalBlobifierBucketSwitch(unittest.TestCase):
 TWO_UNIT = profiles.clone_across_units(
     'two_boxturtles', profiles.get('boxturtle'), ('unit0', 'unit1'),
     description='two BoxTurtles, for the multi-unit render path')
+
+
+class TestMmuCfgTunables(unittest.TestCase):
+    """mmu.cfg callback macros and servo geometry come from Kconfig, defaulting to the old literals"""
+
+    MACROS = {
+        'pause_macro': 'PAUSE',
+        'action_changed_macro': '_MMU_ACTION_CHANGED',
+        'print_state_changed_macro': '_MMU_PRINT_STATE_CHANGED',
+        'mmu_event_macro': '_MMU_EVENT',
+        'post_preload_macro': '_MMU_POST_PRELOAD',
+        'pre_unload_macro': '_MMU_PRE_UNLOAD',
+        'post_form_tip_macro': '_MMU_POST_FORM_TIP',
+        'post_unload_macro': '_MMU_POST_UNLOAD',
+        'pre_load_macro': '_MMU_PRE_LOAD',
+        'post_load_macro': '_MMU_POST_LOAD',
+        'unload_sequence_macro': '_MMU_UNLOAD_SEQUENCE',
+        'load_sequence_macro': '_MMU_LOAD_SEQUENCE',
+    }
+    GANTRY = {'maximum_servo_angle': '180', 'minimum_pulse_width': '0.00075',
+              'maximum_pulse_width': '0.00225', 'initial_angle': '180'}
+    CUTTER = {'maximum_servo_angle': '180', 'minimum_pulse_width': '0.0005',
+              'maximum_pulse_width': '0.0025'}
+    SERVOS = {
+        'MMU_HAS_TOOLHEAD_CUTTER': True,
+        'MMU_HAS_GANTRY_BUMPER_SERVO': True,
+        'PIN_GANTRY_BUMPER_SERVO': 'unit0:PA3',
+        'MMU_HAS_SERVO_CUTTER': True,
+        'PIN_SERVO_CUTTER_SERVO': 'unit0:PA4',
+        'MMU_HAS_BLOBIFIER': True,
+        'PIN_BLOBIFIER_SERVO': 'unit0:PA1',
+        'MMU_HAS_BLOBIFIER_BUCKET_SWITCH': False,
+    }
+
+    def _render(self, name, syms):
+        rendered = cfg.render(profiles.get('boxturtle').derive(name, syms=syms))
+        cfg.assert_sane(rendered)
+        return cfg.assemble({MMU: rendered[MMU]}, macros=False)
+
+    def _assert_options(self, parser, section, expected):
+        options = dict(parser.items(section))
+        for key, value in expected.items():
+            with self.subTest(section=section, option=key):
+                self.assertEqual(options[key], value)
+
+    def test_defaults_match_previous_literals(self):
+        parser = self._render('mmu_cfg_tunable_defaults', self.SERVOS)
+        self._assert_options(parser, 'mmu_parameters', self.MACROS)
+        self._assert_options(parser, 'mmu_servo mmu_gantry_servo', self.GANTRY)
+        self._assert_options(parser, 'mmu_servo cut_servo', self.CUTTER)
+        self._assert_options(parser, 'mmu_servo blobifier', {
+            'maximum_servo_angle': '180', 'minimum_pulse_width': '0.00053',
+            'maximum_pulse_width': '0.0023'})
+        # Only the gantry servo set an initial angle before it was optional
+        self.assertNotIn('initial_angle', parser['mmu_servo cut_servo'])
+        self.assertNotIn('initial_angle', parser['mmu_servo blobifier'])
+
+    def test_initial_angle_toggles(self):
+        parser = self._render('mmu_cfg_tunable_initial_angles', dict(self.SERVOS, **{
+            'BOOL_GANTRY_SERVO_INITIAL_ANGLE': False,
+            'BOOL_SERVO_CUTTER_INITIAL_ANGLE': True,
+            'BOOL_BLOBIFIER_SERVO_INITIAL_ANGLE': True,
+        }))
+        self.assertNotIn('initial_angle', parser['mmu_servo mmu_gantry_servo'])
+        self._assert_options(parser, 'mmu_servo cut_servo', {'initial_angle': '70'})
+        self._assert_options(parser, 'mmu_servo blobifier', {'initial_angle': '180'})
+
+    def test_gantry_defaults_survive_hidden_prompts(self):
+        # Gantry servo enabled (e.g. implied) while tip cutting, and so its prompts, is off
+        syms = dict(self.SERVOS, MMU_HAS_TOOLHEAD_CUTTER=False)
+        parser = self._render('mmu_cfg_tunable_hidden_gantry', syms)
+        self._assert_options(parser, 'mmu_servo mmu_gantry_servo', self.GANTRY)
+
+    def test_values_are_rendered(self):
+        parser = self._render('mmu_cfg_tunable_values', dict(self.SERVOS, **{
+            'PARAM_PAUSE_MACRO': 'MY_PAUSE',
+            'PARAM_LOAD_SEQUENCE_MACRO': 'MY_LOAD_SEQUENCE',
+            'PARAM_GANTRY_SERVO_MAXIMUM_ANGLE': 270,
+            'PARAM_GANTRY_SERVO_MIN_PULSE_WIDTH': '0.0006',
+            'PARAM_GANTRY_SERVO_MAX_PULSE_WIDTH': '0.0024',
+            'PARAM_GANTRY_SERVO_INITIAL_ANGLE': 170,
+            'PARAM_SERVO_CUTTER_MAXIMUM_ANGLE': 60,
+            'PARAM_SERVO_CUTTER_MIN_PULSE_WIDTH': '0.0007',
+            'PARAM_SERVO_CUTTER_MAX_PULSE_WIDTH': '0.0023',
+            'BOOL_SERVO_CUTTER_INITIAL_ANGLE': True,
+            'PARAM_SERVO_CUTTER_INITIAL_ANGLE': 15,
+            'PARAM_BLOBIFIER_SERVO_MAXIMUM_ANGLE': 270,
+            'BOOL_BLOBIFIER_SERVO_INITIAL_ANGLE': True,
+            'PARAM_BLOBIFIER_SERVO_INITIAL_ANGLE': 160,
+        }))
+        self._assert_options(parser, 'mmu_parameters', dict(
+            self.MACROS, pause_macro='MY_PAUSE', load_sequence_macro='MY_LOAD_SEQUENCE'))
+        self._assert_options(parser, 'mmu_servo mmu_gantry_servo', {
+            'maximum_servo_angle': '270', 'minimum_pulse_width': '0.0006',
+            'maximum_pulse_width': '0.0024', 'initial_angle': '170'})
+        self._assert_options(parser, 'mmu_servo cut_servo', {
+            'maximum_servo_angle': '60', 'minimum_pulse_width': '0.0007',
+            'maximum_pulse_width': '0.0023', 'initial_angle': '15'})
+        self._assert_options(parser, 'mmu_servo blobifier', {
+            'maximum_servo_angle': '270', 'initial_angle': '160'})
+
+    STEPPER = {
+        'MMU_HAS_BLOBIFIER': True,
+        'CHOICE_BLOBIFIER_TYPE_STEPPER': True,
+        'MMU_HAS_BLOBIFIER_BUCKET_SWITCH': False,
+        'PIN_BLOBIFIER_STEP': 'unit0:PD4',
+        'PIN_BLOBIFIER_DIR': '!unit0:PD3',
+        'PIN_BLOBIFIER_ENABLE': '!unit0:PD6',
+        'PIN_BLOBIFIER_ENDSTOP': '^!unit0:PC15',
+    }
+
+    def test_blobifier_stepper_defaults_match_previous_literals(self):
+        parser = self._render('mmu_cfg_tunable_stepper_defaults', self.STEPPER)
+        self._assert_options(parser, 'manual_stepper stepper_blobifier', {
+            'microsteps': '4', 'gear_ratio': '1:1', 'rotation_distance': '62.83',
+            'position_min': '0', 'position_max': '21', 'homing_speed': '20',
+            'velocity': '150', 'accel': '1000'})
+
+    def test_blobifier_stepper_values_are_rendered(self):
+        parser = self._render('mmu_cfg_tunable_stepper_values', dict(self.STEPPER, **{
+            'PARAM_BLOBIFIER_STEPPER_MICROSTEPS': 16,
+            'PARAM_BLOBIFIER_STEPPER_GEAR_RATIO': '57:11, 2:1',
+            'PARAM_BLOBIFIER_STEPPER_ROTATION_DISTANCE': '40.5',
+            'PARAM_BLOBIFIER_STEPPER_POSITION_MIN': '-1',
+            'PARAM_BLOBIFIER_STEPPER_POSITION_MAX': '25',
+            'PARAM_BLOBIFIER_STEPPER_HOMING_SPEED': '10',
+            'PARAM_BLOBIFIER_STEPPER_VELOCITY': '120',
+            'PARAM_BLOBIFIER_STEPPER_ACCEL': '800',
+        }))
+        self._assert_options(parser, 'manual_stepper stepper_blobifier', {
+            'microsteps': '16', 'gear_ratio': '57:11, 2:1', 'rotation_distance': '40.5',
+            'position_min': '-1', 'position_max': '25', 'homing_speed': '10',
+            'velocity': '120', 'accel': '800'})
+
+    def test_multi_unit_renders_macro_defaults(self):
+        rendered = cfg.render(TWO_UNIT)
+        parser = cfg.assemble({MMU: rendered[MMU]}, macros=False)
+        self._assert_options(parser, 'mmu_parameters', self.MACROS)
+
+
+class TestConsoleStatistics(unittest.TestCase):
+    """mmu.cfg console statistics options come from Kconfig, defaulting to the old literals"""
+
+    DEFAULTS = {
+        'console_stat_columns': 'unload, load, post_load, total',
+        'console_stat_rows': 'total, total_average, job, job_average, last',
+        'console_gate_stat': 'emoticon',
+        'console_always_output_full': '1',
+        'console_show_colored_text': '1',
+        'console_show_filament_color': '1',
+    }
+
+    def _options(self, rendered):
+        cfg.assert_sane(rendered)
+        parser = cfg.assemble({MMU: rendered[MMU]}, macros=False)
+        return {k: parser['mmu_parameters'][k] for k in self.DEFAULTS}
+
+    def test_defaults_match_previous_literals(self):
+        rendered = cfg.render(profiles.get('boxturtle').derive('console_stat_defaults', syms={}))
+        self.assertEqual(self._options(rendered), self.DEFAULTS)
+
+    def test_values_are_rendered(self):
+        rendered = cfg.render(profiles.get('boxturtle').derive('console_stat_values', syms={
+            'PARAM_CONSOLE_STAT_COLUMNS': 'pre_load, purge, total',
+            'PARAM_CONSOLE_STAT_ROWS': 'last, job',
+            'CHOICE_CONSOLE_GATE_STAT_PERCENTAGE': True,
+            'PARAM_CONSOLE_ALWAYS_OUTPUT_FULL': 0,
+            'PARAM_CONSOLE_SHOW_COLORED_TEXT': 0,
+            'PARAM_CONSOLE_SHOW_FILAMENT_COLOR': 0,
+        }))
+        self.assertEqual(self._options(rendered), {
+            'console_stat_columns': 'pre_load, purge, total',
+            'console_stat_rows': 'last, job',
+            'console_gate_stat': 'percentage',
+            'console_always_output_full': '0',
+            'console_show_colored_text': '0',
+            'console_show_filament_color': '0',
+        })
+
+    def test_multi_unit_renders_defaults(self):
+        self.assertEqual(self._options(cfg.render(TWO_UNIT)), self.DEFAULTS)
 
 
 class TestMultiUnitRender(unittest.TestCase):
@@ -703,6 +1730,96 @@ class TestMultiUnitRender(unittest.TestCase):
             self.assertEqual(before[name], again[name],
                              '%s changed after an intervening multi-unit render - env '
                              'leaked out of _env()' % name)
+
+
+# A component is named in TWO places in the generated config: the `encoder : X` /
+# `buffer : X` line in [mmu_unit] and the `[mmu_encoder X]` / `[mmu_buffer X]` section that
+# defines it. The section is always named after the owning unit, and only a unit sharing
+# another's component chooses the name it points at, so the two cannot disagree.
+class TestComponentNames(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.shared = cfg.render(profiles.SHARED_ENCODER)
+        cfg.assert_sane(cls.shared)
+
+    @staticmethod
+    def _declared(hardware, unit, option):
+        """The component name a unit's [mmu_unit] section points at."""
+        parser = cfg.assemble({'mmu_hardware': hardware}, macros=False)
+        return dict(parser.items('mmu_unit %s' % unit))[option]
+
+    def test_an_owned_component_is_named_after_its_unit(self):
+        rendered = cfg.render(profiles.get('boxturtle').derive('owned_names', syms={
+            'MMU_HAS_ENCODER': True,
+            'PIN_ENCODER': 'unit0:PB7',
+        }))
+        cfg.assert_sane(rendered)
+        sections = cfg.sections(rendered[HARDWARE])
+        for kind in ('encoder', 'buffer'):
+            with self.subTest(kind=kind):
+                self.assertIn('mmu_%s unit0' % kind, sections)
+                self.assertEqual(self._declared(rendered[HARDWARE], 'unit0', kind), 'unit0')
+
+    def test_a_name_saved_by_an_older_install_names_the_section_too(self):
+        """
+        v4.0 prompted for these names on an owning unit but named the section after the
+        unit, so a typed name left [mmu_unit] pointing at nothing. It now names the section.
+        """
+        rendered = cfg.render(profiles.get('boxturtle').derive('stale_names', syms={
+            'MMU_HAS_ENCODER': True,
+            'PIN_ENCODER': 'unit0:PB7',
+            'PARAM_ENCODER_NAME': 'headcoder',
+            'PARAM_SYNC_FEEDBACK_BUFFER_NAME': 'shared_bowden_buffer'}))
+        cfg.assert_sane(rendered)
+        sections = cfg.sections(rendered[HARDWARE])
+        for kind, name in (('encoder', 'headcoder'), ('buffer', 'shared_bowden_buffer')):
+            with self.subTest(kind=kind):
+                self.assertIn('mmu_%s %s' % (kind, name), sections)
+                self.assertNotIn('mmu_%s unit0' % kind, sections)
+                self.assertEqual(self._declared(rendered[HARDWARE], 'unit0', kind), name)
+
+    def test_only_the_owning_unit_defines_a_shared_component(self):
+        """The sharer points at the owner's sections and renders none of its own."""
+        owner = self.shared['config/base/mmu_hardware_unit0.cfg']
+        sharer = self.shared['config/base/mmu_hardware_unit1.cfg']
+        for kind in ('encoder', 'buffer'):
+            with self.subTest(kind=kind):
+                self.assertIn('mmu_%s unit0' % kind, cfg.sections(owner))
+                self.assertEqual(
+                    [s for s in cfg.sections(sharer) if s.startswith('mmu_%s ' % kind)], [])
+                self.assertEqual(self._declared(owner, 'unit0', kind), 'unit0')
+                self.assertEqual(self._declared(sharer, 'unit1', kind), 'unit0')
+
+    @staticmethod
+    def _encoder_offsets(rendered):
+        offsets = {}
+        for unit in ('unit0', 'unit1'):
+            name = 'config/base/mmu_parameters_%s.cfg' % unit
+            params = dict(cfg.assemble({name: rendered[name]}, macros=False).items(
+                'mmu_unit_parameters %s' % unit))
+            offsets[unit] = params.get('gate_endstop_to_encoder')
+        return offsets
+
+    def test_a_sharer_sets_its_own_encoder_offset(self):
+        """gate_endstop_to_encoder is per unit, so a sharer's own value is rendered."""
+        self.assertEqual(self._encoder_offsets(self.shared), {'unit0': '10', 'unit1': '25'})
+
+    def test_a_sharer_gets_its_own_encoder_offset_default(self):
+        """
+        With no value set, the sharer gets the Kconfig default from its own exit sensor.
+        The harness renders explicit values even on hidden symbols, so only the default
+        shows whether the prompt is visible on a sharer: hidden, it rendered as an empty,
+        unparsable `gate_endstop_to_encoder :`.
+        """
+        owner, sharer = profiles.SHARED_ENCODER.units
+        syms = dict(sharer.syms)
+        del syms['PARAM_GATE_ENDSTOP_TO_ENCODER']
+        rendered = cfg.render(profiles.SHARED_ENCODER.derive(
+            'shared_encoder_default_offset',
+            units=[owner, profiles.UnitProfile('unit1', syms, index=1)]))
+        cfg.assert_sane(rendered)
+        self.assertEqual(self._encoder_offsets(rendered), {'unit0': '10', 'unit1': '10'})
 
 
 class TestSelectorTypeChoice(unittest.TestCase):
@@ -996,7 +2113,6 @@ esac
 
         env = {
             'KCONFIG_CONFIG': self.config_path,
-            'F_PER_GATE_MCU': 'y',
             'UNIT_NAME': 'unit0',
             'MCU_NAME': 'unit0',
             'UNIT_INDEX': '0',
@@ -1041,7 +2157,6 @@ esac
         vvd = profiles.get('ercf_vvd').units[1]
         buffer_env = {
             'KCONFIG_CONFIG': self.config_path,
-            'F_PER_GATE_MCU': '',
             'UNIT_NAME': vvd.name,
             'MCU_NAME': vvd.mcu_name,
             'UNIT_INDEX': str(vvd.index),
@@ -1103,15 +2218,22 @@ esac
                          values['PARAM_MMU_SERIAL_DEVICE'])
 
 
+class TestVividAlwaysGripped(unittest.TestCase):
+
+    def test_vvd_renders_filament_always_gripped(self):
+        rendered = cfg.render(profiles.get('ercf_vvd'))['config/base/mmu_hardware_unit1.cfg']
+        self.assertRegex(rendered, r'(?m)^filament_always_gripped\s*: 1\s')
+
+
 # ---------------------------------------------------------------------------
 # LED chain-name resolution - a render-level guard, because it must also cover
 # machine types the harness does not boot.
 #
-# QuattroBox is a real shipped machine but is not wired up here (no board/gate-homing/
-# NFC pin definitions), so it dies on empty pins at boot long before the LED load -
-# the render path is the only place its generated config can be checked. These are
-# inline fixtures rather than PROFILES-registry entries for that reason (see the note
-# above TWO_UNIT).
+# QuattroBox v1.0/v1.1 have no default board, so they die on empty pins at boot long
+# before the LED load - the render path is the only place their generated config can be
+# checked. v2 defaults to the Chameleon X5 and boots as the quattrobox_v2 profile; it is
+# kept here so all three versions get the same render check. These are inline fixtures
+# rather than PROFILES-registry entries for that reason (see the note above TWO_UNIT).
 # ---------------------------------------------------------------------------
 
 
@@ -1233,6 +2355,69 @@ class TestLedChainReferencesResolve(unittest.TestCase):
             'PARAM_LOGO_LEDS': 'neopixel:unit0_leds (15-32)',
         })
         self.assertEqual(len(self._unresolved(profile)), 3)
+
+
+class TestPerGateEffectsDefinedOnGates(unittest.TestCase):
+    """
+    mmu_led_manager.py paints these effects per gate (as '<effect>_<segment>_<gate>'), and
+    mmu_led_effect.py only creates the per-gate instances when define_on is empty or lists
+    'gates'. An effect assigned to one of these actions but defined only on whole segments
+    renders fine and then fails to light anything - EMU's effect_checking used
+    mmu_breathing_white_fast, which was defined on 'exit, status' only.
+    """
+
+    PER_GATE_ACTIONS = (
+        'checking', 'preloading', 'gate_selected',
+        'gate_available', 'gate_available_sel',
+        'gate_unknown', 'gate_unknown_sel',
+        'gate_empty', 'gate_empty_sel',
+        'pending_spoolid', 'pending_spoolid_expiring',
+    )
+
+    def _not_on_gates(self, profile):
+        parser = cfg.assemble(cfg.render(profile))
+        bad = []
+        for sec in parser.sections():
+            if not sec.startswith('mmu_leds '):
+                continue
+            items = dict(parser.items(sec))
+            for action in self.PER_GATE_ACTIONS:
+                effect = items.get('effect_' + action, '').split(',')[0].strip()
+                effect_sec = 'mmu_led_effect ' + effect
+                if not effect or not parser.has_section(effect_sec):
+                    continue
+                define_on = parser.get(effect_sec, 'define_on', fallback='')
+                segments = [s.strip() for s in define_on.split(',') if s.strip()]
+                if segments and 'gates' not in segments:
+                    bad.append('%s.effect_%s -> %s (define_on: %s)'
+                               % (sec, action, effect, define_on))
+        return bad
+
+    def test_every_per_gate_effect_is_defined_on_gates(self):
+        for profile in profiles.CONSOLE_PROFILES:
+            with self.subTest(profile=profile.name):
+                self.assertEqual(self._not_on_gates(profile), [])
+
+
+class TestEmuMcus(unittest.TestCase):
+    """EMU's MCU topology: one per gate by default, or one board for the unit."""
+
+    def test_every_gate_mcu_has_a_connection(self):
+        hw = cfg.render(profiles.get('emu'))[HARDWARE]
+        mcus = re.findall(r'^\[mcu (\S+)\]\n(?:serial|canbus_uuid) *: *(\S*)', hw, re.M)
+        self.assertEqual([name for name, _ in mcus], ['unit0_gate%d' % i for i in range(5)])
+        self.assertTrue(all(value for _, value in mcus), mcus)
+
+    def test_one_mcu_and_cpu_sensor_with_per_gate_off(self):
+        syms = dict(profiles.get('emu').syms, MMU_HAS_PER_GATE_MCU=False)
+        with cfg._env(cfg._SINGLE_UNIT_ENV):
+            kc = cfg._kconfig('emu-one-mcu', syms)
+        self.assertEqual(kc.syms['MMU_HAS_PER_GATE_MCU'].visibility, 2)
+        self.assertEqual(kc.syms['BOARD_TYPE_MMB_2_0'].visibility, 2)
+
+        hw = cfg.render(profiles.get('emu').derive('emu_one_mcu', syms=syms))[HARDWARE]
+        self.assertEqual([s for s in cfg.sections(hw) if s.startswith('mcu ')], ['mcu unit0'])
+        self.assertEqual(re.findall(r'^sensor_mcu *: *(\S+)', hw, re.M), ['unit0'])
 
 
 if __name__ == '__main__':

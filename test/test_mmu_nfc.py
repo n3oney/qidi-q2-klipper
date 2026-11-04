@@ -57,7 +57,7 @@ class TestPerGateNfcBoots(unittest.TestCase):
     def test_gate_map_displays_uppercase_rfid_uid_as_own_field_without_spool_id(self):
         self.hh.run_gcode('MMU_GATE_MAP GATE=0 RFID=ab12cd34 QUIET=1')
 
-        gate_row = self.hh.mmu.gate_maps.gate_map_to_string().splitlines()[1]
+        gate_row = self.hh.mmu.gate_maps.gate_map_to_string().splitlines()[2]
 
         self.assertIn('(AB12CD34);', gate_row)
         self.assertNotIn('Unknown | AB12CD34', gate_row)
@@ -68,14 +68,14 @@ class TestPerGateNfcBoots(unittest.TestCase):
             hh.boot()
             hh.run_gcode('MMU_GATE_MAP GATE=0 SPOOLID=8 RFID=ab12cd34 QUIET=1')
 
-            gate_row = hh.mmu.gate_maps.gate_map_to_string().splitlines()[1]
+            gate_row = hh.mmu.gate_maps.gate_map_to_string().splitlines()[2]
 
             self.assertIn('Id: 8 (AB12CD34) -->', gate_row)
             self.assertNotIn('(AB12CD34);', gate_row)
         finally:
             hh.close()
 
-    def test_gate_map_justifies_material_to_five_characters(self):
+    def test_gate_map_aligns_headers_and_filament_columns(self):
         self.hh.run_gcode('MMU_GATE_MAP GATE=1 MATERIAL=TPU QUIET=1')
         self.hh.run_gcode('MMU_GATE_MAP GATE=2 MATERIAL=PLA+ QUIET=1')
 
@@ -84,8 +84,17 @@ class TestPerGateNfcBoots(unittest.TestCase):
             for line in self.hh.mmu.gate_maps.gate_map_to_string().splitlines()
         ]
 
-        self.assertIn('TPU   |', gate_rows[2])
-        self.assertIn('PLA+  |', gate_rows[3])
+        self.assertEqual(gate_rows[0], 'Gates / Filaments:')
+        self.assertIn('TPU      |', gate_rows[3])
+        self.assertIn('PLA+     |', gate_rows[4])
+        header = gate_rows[1]
+        self.assertTrue(header.startswith('Gate'))
+        self.assertIn('Material', header)
+        self.assertIn('Color', header)
+        self.assertIn('Filament', header)
+        separators = [i for i, char in enumerate(header) if char == '|']
+        for row in gate_rows[2:]:
+            self.assertEqual([i for i, char in enumerate(row) if char == '|'], separators)
 
     def test_reader_sections_are_registered_objects(self):
         for i in range(4):
@@ -118,7 +127,7 @@ class TestPerGateNfcBoots(unittest.TestCase):
 
     def test_defaults_inheritance_is_currently_inert(self):
         """
-        Documents a KNOWN LIMITATION rather than asserting desired behaviour.
+        Documents a KNOWN LIMITATION rather than asserting desired behavior.
 
         With the argument order fixed, the call still yields None: nothing ever
         registers a bare 'mmu_nfc_reader' printer object (the manager only ever
@@ -413,6 +422,22 @@ class TestSharedGatePairReader(unittest.TestCase):
     def tearDown(self):
         self.hh.close()
 
+    def test_the_status_report_is_a_comma_separated_field_list(self):
+        """
+        The shape MMU_TD1 was aligned to, so it is worth pinning on this side too. One
+        line per reader, grouped by unit, fields separated by commas - without them
+        'enabled=1 active=1 alive=1' reads as one run-on token.
+        """
+        from unittest.mock import patch
+        with patch.object(self.hh.mmu, 'log_always') as report:
+            self.hh.run_gcode('MMU_NFC')
+        message = '\n'.join(c.args[0] for c in report.call_args_list)
+        self.assertIn('MMU NFC readers:', message)
+        self.assertIn('Unit unit0:', message)
+        self.assertIn('shared:   enabled=1, active=1, alive=1, tag=none', message)
+        self.assertIn('Unit unit1:', message)
+        self.assertIn('gate 12:  enabled=1, active=1, alive=1, tag=none', message)
+
     def test_reader_identity_is_shared_within_a_pair_not_across_pairs(self):
         self.assertIs(self.mgr.gate_readers[0], self.mgr.gate_readers[1])
         self.assertIs(self.mgr.gate_readers[2], self.mgr.gate_readers[3])
@@ -477,6 +502,58 @@ class TestSharedGatePairReader(unittest.TestCase):
         finally:
             self.mgr.set_active(True, gate=10)
             chip.clear()
+
+
+class TestStartupWarningsReachTheConsole(unittest.TestCase):
+    """
+    A driver's startup_warnings (e.g. "this firmware cannot report an I2C NACK") are
+    only in klippy.log unless Happy Hare forwards them. They must go through
+    mmu.log_warning, once per physical reader - a gate pair shares one.
+    """
+
+    WARNING = 'test firmware warning'
+
+    def setUp(self):
+        self.hh = session('ercf_vvd', virtual_nfc=True)
+        self.hh.boot()
+        self.assertEqual(self.hh.errors, [], 'bootup was not clean')
+        self.mgr = {u.name: u for u in self.hh.mmu.mmu_machine.units}['unit1'].nfc_manager
+        self.hh.chip(9).startup_warnings = [self.WARNING]
+
+    def tearDown(self):
+        self.hh.close()
+
+    def warnings(self, logged):
+        return [c.args[0] for c in logged.call_args_list if self.WARNING in c.args[0]]
+
+    def test_bootup_init_logs_one_warning_per_physical_reader(self):
+        with mock.patch.object(self.hh.mmu, 'log_warning') as logged:
+            self.mgr._init_all_readers()
+        warnings = self.warnings(logged)
+        self.assertEqual(len(warnings), 1, 'gates 9/10 share one reader: %r' % warnings)
+        self.assertIn("reader '%s'" % self.mgr.gate_readers[0].name, warnings[0])
+
+    def test_mmu_rfid_init_logs_the_warning(self):
+        name = self.mgr.gate_readers[0].name
+        with mock.patch.object(self.hh.mmu, 'log_warning') as logged:
+            self.hh.run_gcode('MMU_RFID_INIT NAME=%s' % name)
+        self.assertEqual(len(self.warnings(logged)), 1)
+
+    def test_suppress_klipper_warnings_demotes_to_debug(self):
+        self.hh.mmu.p.suppress_klipper_warnings = 1
+        name = self.mgr.gate_readers[0].name
+        with mock.patch.object(self.hh.mmu, 'log_warning') as warned, \
+                mock.patch.object(self.hh.mmu, 'log_debug') as debugged:
+            self.mgr._init_all_readers()
+            self.hh.run_gcode('MMU_RFID_INIT NAME=%s' % name)
+        self.assertEqual(self.warnings(warned), [])
+        self.assertEqual(len(self.warnings(debugged)), 2, 'bootup init and MMU_RFID_INIT')
+
+    def test_readers_without_warnings_log_none(self):
+        self.hh.chip(9).startup_warnings = []
+        with mock.patch.object(self.hh.mmu, 'log_warning') as logged:
+            self.mgr._init_all_readers()
+        self.assertEqual(self.warnings(logged), [])
 
 
 if __name__ == '__main__':

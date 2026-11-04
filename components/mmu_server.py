@@ -57,8 +57,8 @@
 #
 from __future__ import annotations
 import json
-import logging, os, sys, re, time, asyncio
-import runpy, argparse, shutil, traceback, tempfile, filecmp
+import logging, os, sys, re, time, asyncio, signal
+import runpy, argparse, traceback, filecmp
 import urllib.parse
 from typing import (
     TYPE_CHECKING,
@@ -169,11 +169,11 @@ class MmuServer:
         # Example: {2: ('BigRed', 0, {"material": "pla", "color": "ff56e0"}), 3: ('BigRed', 3, {"material": "abs"}), ...
         self.spool_location = {}
 
-        # Reverse map of normalised NFC/RFID tag UID -> spool_id, built alongside
+        # Reverse map of normalized NFC/RFID tag UID -> spool_id, built alongside
         # spool_location so a tag scan can be resolved without a per-lookup fetch
         self.uid_to_spool_id = {}
 
-        # Negative cache of normalised UID -> expiry (monotonic) for tags recently
+        # Negative cache of normalized UID -> expiry (monotonic) for tags recently
         # confirmed absent from Spoolman, so frequent scans of an unknown tag
         # don't trigger a full spool fetch every time
         self.uid_miss_cache = {}
@@ -204,7 +204,8 @@ class MmuServer:
             self.server.register_remote_method("spoolman_get_spool_by_uid", self.get_spool_by_uid)     # tag scan -> pending spool_id
             self.server.register_remote_method("spoolman_set_spool_uid", self.set_spool_uid)           # register a tag UID onto a spool
 
-        # Moonraker lane data push for slicer integration
+        # TD-1 bridge and lane data push for slicer integration
+        self.server.register_remote_method("mmu_td1_request", self.td1_request)
         self.server.register_remote_method("moonraker_push_lane_data", self.push_lane_data)
         self.server.register_remote_method("moonraker_cleanup_lane_data", self.cleanup_lane_data)
 
@@ -424,7 +425,7 @@ class MmuServer:
     @staticmethod
     def _parse_uid_list(raw) -> list[str]:
         '''
-        Split a (possibly comma-separated) UID value into normalised UIDs.
+        Split a (possibly comma-separated) UID value into normalized UIDs.
         Blank entries are dropped and duplicates removed, order preserved.
         None/'' -> [].
         '''
@@ -473,7 +474,12 @@ class MmuServer:
         filament_id = filament.get('id', '')
         rfid_uids = self._get_uid_list_from_extra(spool_info.get('extra'))
         rfids = ','.join(rfid_uids)
-        return {'spool_id': spool_id, 'material': material, 'color': color_hex, 'name': name, 'temp': temp, 'bed_temp': bed_temp, 'vendor': vendor, 'filament_id': filament_id, 'rfids': rfids}
+        # Net filament weights in grams (-1 if unknown). A spool without its own initial weight is
+        # assumed to have started with the filament's nominal net weight
+        remaining_weight = round(self._to_float(spool_info.get('remaining_weight'), -1))
+        initial_weight = round(self._to_float(spool_info.get('initial_weight'), self._to_float(filament.get('weight'), -1)))
+        return {'spool_id': spool_id, 'material': material, 'color': color_hex, 'name': name, 'temp': temp, 'bed_temp': bed_temp, 'vendor': vendor, 'filament_id': filament_id, 'rfids': rfids,
+                'remaining_weight': remaining_weight, 'initial_weight': initial_weight}
 
 
     async def _build_spool_location_cache(self, fix=False, silent=False) -> bool:
@@ -599,6 +605,16 @@ class MmuServer:
         return True
 
 
+    async def _cache_missing_spools(self, spool_ids):
+        '''
+        Fetch and cache spools created in Spoolman since the cache was built
+        '''
+        missing = [sid for sid in spool_ids if not self.spool_location.get(sid, (None, None, None))[2]]
+        for spool_info in await asyncio.gather(*[self._fetch_spool_info(sid) for sid in missing]):
+            if spool_info:
+                self._cache_insert_spool(spool_info)
+
+
     async def _unset_spool_gate(self, spool_id, silent=False) -> bool:
         if not await self._check_init_spoolman(): return False
 
@@ -647,7 +663,7 @@ class MmuServer:
                             self._cache_insert_spool(spool_info) # A failed/404 fetch keeps the existing cached value
 
             # A negative gate addresses the bypass: it has no gate-map row on the Klipper side
-            # so its attributes are delivered via the singular 'BYPASS=1' form (-> active_filament)
+            # so its attributes are delivered via the singular 'BYPASS=1' form (-> bypass_filament)
             bypass_ids = [(g, sid) for g, sid in gate_ids if g is not None and g < 0]
             gate_ids = [(g, sid) for g, sid in gate_ids if g is None or g >= 0]
             for _g, spool_id in bypass_ids:
@@ -754,6 +770,7 @@ class MmuServer:
                 for sid in updates.keys()
             }
             results = await asyncio.gather(*[task for task,_ in tasks.values()])
+            await self._cache_missing_spools([sid for sid, result in zip(tasks.keys(), results) if result and updates[sid] >= 0])
 
             # Log results and update cache
             for sid, result in zip(tasks.keys(), results):
@@ -860,6 +877,8 @@ class MmuServer:
             }
             tasks[spool_id] = (self._set_spool_gate(spool_id, self.printer_hostname, gate, silent=silent), gate)
             results = await asyncio.gather(*[task for task,_ in tasks.values()])
+            if dict(zip(tasks.keys(), results)).get(spool_id):
+                await self._cache_missing_spools([spool_id])
 
             # Log results and update cache
             updated_gate_ids = {}
@@ -1327,11 +1346,14 @@ class MmuServer:
             return None
         items = resp.json()
         if isinstance(items, list) and items:
-            if color_hex:
-                for f in items:
-                    if str(f.get("color_hex") or "").upper() == color_hex:
-                        return int(f["id"])
-            return int(items[0]["id"])
+            if not color_hex:
+                return int(items[0]["id"])
+            for f in items:
+                if str(f.get("color_hex") or "").upper() == color_hex:
+                    return int(f["id"])
+            # The tag carries a color that none of the existing filaments of this
+            # material (+ vendor) has. Fall through and create a filament for it
+            # instead of attaching the spool to an unrelated color.
 
         # --- Create: tag data first, filling gaps from SpoolmanDB (Bambu) ---
         # Vendor is stored separately (vendor_id), so keep it OUT of the filament
@@ -1492,7 +1514,7 @@ class MmuServer:
     async def _fetch_spoolmandb_bambu(self) -> list:
         '''
         Fetch + cache the SpoolmanDB Bambu Lab filament list (bambulab.json) and
-        the top-level manufacturer name (used for vendor normalisation). Returns
+        the top-level manufacturer name (used for vendor normalization). Returns
         [] on failure (cached so it isn't retried on every scan).
         '''
         if self._spoolmandb_bambu is not None:
@@ -1743,6 +1765,57 @@ class MmuServer:
             await self._log_n_send(msg)
 
 
+    async def td1_request(self, request_id: int, serial: str = "",
+                          reset: bool = False) -> None:
+        '''
+        Replies to the mmu/td1 webhook endpoint, never the G-code queue: Happy Hare needs
+        the result during a command already running, so a queued reply would deadlock
+        behind it. klippy_apis._send_klippy_request() is private because Moonraker offers
+        no public equivalent for a custom endpoint; switch if one appears.
+
+        Needs machine.td1.data / machine.td1.reboot and the internal API transport. Any
+        of that missing comes back as an error string rather than raising, so Happy Hare
+        sees "bridge unavailable" instead of the component failing to load.
+        request_id: Klipper transaction id; serial/reset: reboot one device and await it
+        '''
+        devices = {}
+        error = None
+        try:
+            transport = self.server.lookup_component("internal_transport")
+            if reset:
+                response = await asyncio.wait_for(
+                    transport.call_method("machine.td1.reboot", {"serial": serial}), 5.)
+                if response.get("status") != "ok":
+                    raise ValueError("TD-1 reboot rejected")
+                deadline = time.monotonic() + 25.
+                while True:
+                    await asyncio.sleep(.5)
+                    response = await asyncio.wait_for(
+                        transport.call_method("machine.td1.data"), 5.)
+                    devices = response.get("devices", {})
+                    if serial in devices and not devices[serial].get("error"):
+                        break
+                    if time.monotonic() >= deadline:
+                        raise ValueError("TD-1 reboot recovery timed out")
+            else:
+                response = await asyncio.wait_for(
+                    transport.call_method("machine.td1.data"), 5.)
+                devices = response.get("devices", {})
+        except asyncio.TimeoutError:
+            error = "TD-1 request timed out"
+        except (ValueError, KeyError, AttributeError, TypeError) as exc:
+            # Missing component or endpoint, or a malformed response - "no usable bridge"
+            error = str(exc) or type(exc).__name__
+        except Exception as exc:
+            logging.exception("MMU: unexpected TD-1 bridge failure")
+            error = str(exc) or type(exc).__name__
+        try:
+            await self.klippy_apis._send_klippy_request(
+                "mmu/td1", {"request_id": request_id, "devices": devices, "error": error})
+        except Exception:
+            # Klipper went away. Happy Hare's own deadline covers the silence
+            logging.exception("MMU: could not deliver TD-1 response %s" % request_id)
+
     async def push_lane_data(self, gate_ids):
         '''
         Pushes lane data to Moonraker database for slicer integration (OrcaSlicer)
@@ -1758,6 +1831,7 @@ class MmuServer:
             gate_material = mmu.get('gate_material', [])
             gate_vendor = mmu.get('gate_vendor', [])
             gate_color = mmu.get('gate_color', [])
+            gate_td = mmu.get('gate_td', [])
             gate_temperature = mmu.get('gate_temperature', [])
             gate_status = mmu.get('gate_status', [])
             gate_filament_name = mmu.get('gate_filament_name', [])
@@ -1799,11 +1873,11 @@ class MmuServer:
                         "vendor_name": (gate_vendor[gate] if gate < len(gate_vendor) else None) or spool_attrs.get('vendor', None) or None,
                         "name": (gate_filament_name[gate] if gate < len(gate_filament_name) else None) or spool_attrs.get('name', None) or None,
                         "color": gate_color[gate] if gate < len(gate_color) else None,
-                        "td": None, # we don't currently capture transmission distance and isn't standard in spoolman
+                        "td": gate_td[gate] if gate < len(gate_td) else None,
                         "material": gate_material[gate] if gate < len(gate_material) else None,
                         "bed_temp": spool_attrs.get('bed_temp', None) or None,
                         "nozzle_temp": gate_temperature[gate] if gate < len(gate_temperature) else 200,
-                        "scan_time": None,
+                        "scan_time": None, # Happy Hare does not record when a gate was measured
                         "lane": str(lane), # currently orca reads this as a string, but it is actually an int representing the gate number
                         "spool_id": spool_id if spool_id > 0 else None,
                         "filament_id": spool_attrs.get('filament_id', None) or None
@@ -1880,10 +1954,11 @@ def load_component(config):
 # ══════════════════════════════════════════════════════════════════════════
 
 AUTHORZIED_SLICERS = ['PrusaSlicer', 'SuperSlicer', 'OrcaSlicer', 'BambuStudio']
+SLICER_ALIASES = {'Creality_Print': 'OrcaSlicer'} # Orca forks that share Orca's comment keys
 
 HAPPY_HARE_FINGERPRINT = "; processed by HappyHare"
 MMU_REGEX = r"^" + HAPPY_HARE_FINGERPRINT
-SLICER_REGEX = r"^;.*generated by ([a-z]*) .*$|^; (BambuStudio) .*$"
+SLICER_REGEX = r"^;.*generated by ([a-z_]*) .*$|^; (BambuStudio) .*$"
 ORCASLICER_VERSION_REGEX = r"^;\s*generated by OrcaSlicer\s+(\d+(?:\.\d+){0,3})"
 
 TOOL_DISCOVERY_REGEX = r"((^MMU_CHANGE_TOOL(_STANDALONE)? .*?TOOL=)|(^T))(?P<tool>\d{1,2})"
@@ -1988,6 +2063,7 @@ def parse_gcode_file(file_path):
                 match = slicer_regex.match(line)
                 if match:
                     slicer = match.group(1) or match.group(2)
+                    slicer = SLICER_ALIASES.get(slicer, slicer)
 
             # Capture OrcaSlicer version (numeric prefix only, e.g. 2.3.2 from 2.3.2-dev)
             if orca_version is None:
@@ -2224,14 +2300,16 @@ def main(path, filename, insert_placeholders=False, insert_nextpos=False):
     file_path = os.path.join(path, filename)
     if not os.path.isfile(file_path):
         metadata.logger.info(f"File Not Found: {file_path}")
-        sys.exit(-1)
+        return
     try:
         metadata.logger.info(f"mmu_server: Pre-processing file: {file_path}")
         fname = os.path.basename(file_path)
         if fname.endswith(".gcode") and not gcode_processed_already(file_path):
-            with tempfile.TemporaryDirectory() as tmp_dir_name:
-                tmp_file = os.path.join(tmp_dir_name, fname)
-
+            # Write next to the gcode and os.replace() it so an interrupted run (e.g. Moonraker's
+            # metadata timeout) can't leave a truncated file. /tmp is often a different filesystem
+            real_path = os.path.realpath(file_path)
+            tmp_file = os.path.join(os.path.dirname(real_path), ".%s.mmu_tmp" % os.path.basename(real_path))
+            try:
                 if insert_placeholders:
                     start = time.time()
                     has_placeholder, tools_used, total_toolchanges, colors, temps, materials, purge_volumes, filament_names, slicer = parse_gcode_file(file_path)
@@ -2251,14 +2329,15 @@ def main(path, filename, insert_placeholders=False, insert_nextpos=False):
                     metadata.logger.info("mmu_server: %s took %.2fs" % (",".join(msg), time.time() - start))
 
                     # Move temporary file back in place
-                    if os.path.islink(file_path):
-                        file_path = os.path.realpath(file_path)
-                    if not filecmp.cmp(tmp_file, file_path):
-                        shutil.move(tmp_file, file_path)
+                    if not filecmp.cmp(tmp_file, real_path):
+                        os.replace(tmp_file, real_path)
                     else:
-                        metadata.logger.info(f"Files are the same, skipping replacement of: {file_path} by {tmp_file}")
+                        metadata.logger.info(f"Files are the same, skipping replacement of: {real_path} by {tmp_file}")
                 else:
                     metadata.logger.info(f"No MMU metadata placeholders found in file: {file_path}")
+            finally:
+                if os.path.exists(tmp_file):
+                    os.remove(tmp_file)
 
     except Exception:
         metadata.logger.info(traceback.format_exc())
@@ -2317,6 +2396,14 @@ if __name__ == "__main__":
         config["gcode_dir"] = os.path.abspath(os.path.dirname(__file__))
     enabled_msg = "enabled" if config["check_objects"] else "disabled"
     metadata.logger.info(f"Object Processing is {enabled_msg}")
+
+    # Moonraker cancels with SIGTERM on timeout, exit normally so the temp file is removed
+    signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(-1))
+
+    # A .ufp upload only contains the gcode, so it must be extracted before pre-processing
+    if config.get("ufp_path") is not None:
+        metadata.extract_ufp(config["ufp_path"], os.path.join(config["gcode_dir"], config["filename"]))
+        config["ufp_path"] = None
 
     # Parsing for mmu placeholders and next pos insertion. We do this first so we can add additional metadata
     main(config["gcode_dir"], config["filename"], args.placeholders, args.nextpos)

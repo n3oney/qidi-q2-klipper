@@ -3,7 +3,7 @@
 # Copyright (C) 2022-2026  moggieuk#6538 (discord)
 #                          moggieuk@hotmail.com
 #
-# Implements MMU_SELECT and MMU_SELECTO_BYPASS commands
+# Implements the MMU_SELECT command (including BYPASS=1)
 #
 #
 # (\_/)
@@ -80,4 +80,4 @@ class MmuSelectCommand(BaseCommand):
                 # Ensure correct tool/gate mapping and display visual to user
                 mmu.refresh_tool_gate(quiet=quiet)
         except MmuError as ee:
-            mmu.handle_mmu_error(str(ee))
+            mmu.handle_mmu_error(ee)

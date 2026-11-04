@@ -35,7 +35,9 @@ class MmuPrintStateMachine:
     def reinit(self):
         self.last_print_stats = None
         self.paused_extruder_temp = None
+        self.paused_extruder = None
         self.reason_for_pause = None
+        self.pause_hint = None
         self.print_state = "ready"
         self.resume_to_state = "ready"
 
@@ -163,13 +165,20 @@ class MmuPrintStateMachine:
             self.mmu.log_trace("on_print_start(->started)")
             self.mmu._clear_saved_toolhead_position()
             self.mmu.num_toolchanges = 0
+            self.mmu._next_tool = TOOL_GATE_UNKNOWN # Discard any marker left by a failed toolchange outside a print
+            self.mmu._residual_restore = None
+            self.mmu._print_toolchange_done = False
             self.paused_extruder_temp = None
             self.mmu._reset_job_statistics() # Reset job stats but leave persisted totals alone
+            for unit in self.mmu.mmu_machine.units:
+                unit.calibrator.reset_autotune_changes()
             self.mmu.reactor.update_timer(self.mmu.hotend_off_timer, self.mmu.reactor.NEVER) # Don't automatically turn off extruder heaters
             self.mmu.is_handling_runout = False
             self.mmu.gate_maps.clear_slicer_tool_map()
             self.mmu._enable_filament_monitoring() # Enable filament monitoring while printing
             self.mmu.initialize_encoder(dwell=None) # Encoder 0000
+            self.mmu.safe_g1.reset_print_state()
+            self.mmu.error_dialog.reset()
             self.set_print_state("started", call_macro=False)
 
         if not pre_start_only and self.print_state not in ["printing"]:
@@ -207,10 +216,21 @@ class MmuPrintStateMachine:
             # safety timer and leave the hotend (and bed) hot — explicitly turn
             # heaters off before we tear down state.
             was_paused = self.is_mmu_paused()
+            was_printing = self.is_in_print()
+
+            # Record what the print left in the nozzle. Missed if PRINT_END has already turned the heater off
+            if was_printing:
+                heater = self.printer.lookup_object(self.mmu.mmu_unit().extruder_name()).get_heater()
+                wrapper = self.mmu.mmu_unit().extruder_wrapper
+                # Not after a failed load, because the previous filament is still in the nozzle
+                if heater.target_temp >= heater.min_extrude_temp and not wrapper.residual_heating_failed:
+                    wrapper.set_filament_temp(heater.target_temp)
+
             self.mmu.movequeue_wait()
             self.mmu._clear_saved_toolhead_position()
             self.resume_to_state = "ready"
             self.paused_extruder_temp = None
+            self.mmu._residual_restore = None
             if was_paused and state in ("complete", "cancelled", "error"):
                 self.mmu.log_info("Turning off heaters (slicer PRINT_END was bypassed by MMU pause)")
                 self.mmu.gcode.run_script_from_command("TURN_OFF_HEATERS")
@@ -229,9 +249,18 @@ class MmuPrintStateMachine:
             # (must call after print_state is set)
             self.mmu.reset_sync_gear_to_extruder()
 
+            if was_printing:
+                # Always-gripped machines can remain synced after print end.
+                for unit in self.mmu.mmu_machine.units:
+                    unit.sync_feedback.save_autotuned_rd()
+                lines = [line for unit in self.mmu.mmu_machine.units for line in unit.calibrator.get_autotune_summary()]
+                if lines:
+                    self.mmu.log_info("Autotune summary:\n  " + "\n  ".join(lines))
+
         if state == "standby" and not self.is_in_standby():
             self.set_print_state(state)
 
+        self.mmu.error_dialog.reset()
         self.mmu._clear_macro_state(reset=True)
 
 

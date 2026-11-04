@@ -68,7 +68,7 @@ class BaseSelector:
 
     # Prevent overriding of methods with physical gate number as parameter
     # It is important and all selector logic works with local gates
-    _final_methods = {"select_gate, restore_gate"}
+    _final_methods = {"select_gate", "restore_gate"}
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -267,8 +267,8 @@ class PhysicalSelector(BaseSelector, object):
         settled by the time mmu_gate_maps.load_persisted_state() decides whether to keep the
         persisted gate.
 
-        NOTE: a bare M84 / TURN_OFF_MOTORS de-energises the selector through klipper's
-        stepper_enable without Happy Hare seeing it, so last_pos survives a de-energising we
+        NOTE: a bare M84 / TURN_OFF_MOTORS de-energizes the selector through klipper's
+        stepper_enable without Happy Hare seeing it, so last_pos survives a de-energizing we
         never observed. Trusting it is a pre-existing assumption of this scheme, not something
         the gate fallback adds.
         """
@@ -514,7 +514,7 @@ class MmuSoaktestSelectorCommand(BaseCommand):
                     if grip:
                         mmu_unit.selector.filament_drive()
         except MmuError as ee:
-            mmu.handle_mmu_error("Soaktest abandoned because of error: %s" % str(ee))
+            mmu.handle_mmu_error(ee.with_message("Soaktest abandoned because of error: %s" % str(ee)))
 
 
 
@@ -601,6 +601,8 @@ class MmuReleaseCommand(BaseCommand):
 
         if gate >= 0:
             if not mmu_unit.filament_always_gripped:
-                mmu_unit.selector.filament_release()
+                if not mmu.is_in_print():
+                    mmu._standalone_sync = False
+                mmu.reset_sync_gear_to_extruder(False, force_grip=True)
             else:
                 mmu.log_error("Selector doesn't allow or not configured to allow filament release")

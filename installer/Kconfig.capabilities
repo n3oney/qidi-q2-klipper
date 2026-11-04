@@ -15,6 +15,7 @@
 #   MMU_HAS_HEATER
 #   MMU_HAS_HEATER_FANS
 #   MMU_HAS_EJECT_BUTTONS
+#   MMU_HAS_VENT_SERVO
 #   MMU_HAS_BUFFER_MCU
 #
 # Per-gate capabilities/topology:
@@ -43,7 +44,9 @@
 #   CUSTOM_HEATER_SETUP
 #   CUSTOM_FAN_SETUP
 #   CUSTOM_HEATER_FAN_SETUP
+#   CUSTOM_CONTROLLER_FAN_SETUP
 #   CUSTOM_NFC_READER_SETUP
+#   CUSTOM_MISC_SETUP
 #
 
 config MMU_HAS_SELECTOR_STEPPER
@@ -61,6 +64,11 @@ config MMU_HAS_SYNC_FEEDBACK_BUFFER
 config MMU_HAS_ESPOOLER
   def_bool n
   select UNSELECT_MMU_HAS_FILAMENT_BUFFER
+
+# Type-B designs without an eSpooler can still turn the spool with the gate's
+# own gear motor, so spool rotation is not tied to having an eSpooler.
+config MMU_GEAR_ROTATES_SPOOL
+  def_bool n
 
 config MMU_HAS_LEDS
   def_bool n
@@ -81,6 +89,10 @@ config MMU_HAS_HEATER_FANS
 config MMU_HAS_EJECT_BUTTONS
   def_bool n
 
+config MMU_HAS_VENT_SERVO
+  def_bool n
+  depends on MMU_HAS_HEATER
+
 # Some new designs have mcu integrated in sync-feedback buffer mcu
 config MMU_HAS_BUFFER_MCU
   def_bool n
@@ -94,24 +106,33 @@ config MMU_HAS_BUFFER_MCU
 config PARAM_MISC_HARDWARE
   string
 
-# If custom hardware includes any of these, disable generic setup to prevent duplication
+# If custom hardware includes any of these, disable generic setup to prevent duplication.
+# No default here (so n) - a board or type file sets "def_bool y" next to the
+# misc hardware that provides it
 config CUSTOM_LED_SETUP
-  def_bool n
+  bool
 
 config CUSTOM_ENVIRONMENT_SENSOR_SETUP
-  def_bool n
+  bool
 
 config CUSTOM_HEATER_SETUP
-  def_bool n
+  bool
 
 config CUSTOM_FAN_SETUP
-  def_bool n
+  bool
 
 config CUSTOM_HEATER_FAN_SETUP
-  def_bool n
+  bool
+
+config CUSTOM_CONTROLLER_FAN_SETUP
+  bool
 
 config CUSTOM_NFC_READER_SETUP
-  def_bool n
+  bool
+
+# No generic setup: this only chooses a board's other misc hardware
+config CUSTOM_MISC_SETUP
+  bool
 
 
 # ------------------------------------
@@ -125,6 +146,15 @@ menu "Design attributes"
     specific setup.
 
     It is unlikely that you want to change anything here so be careful.
+
+  # Each machine type sets the default
+  config PARAM_NUM_GATES
+    int
+    prompt "Number of gates/lanes?"
+    help
+      The number of gates is set based on MMU type but some
+      designs allow for a configurable number. Ensure this
+      matches the number in your specific build.
 
   source "Kconfig.selector_type" 
 
@@ -175,18 +205,24 @@ menu "Design attributes"
   # Per-gate capabilities
   # ------------------------------------
 
-  comment "_" if SHOW_HIDDEN
+  comment "_" if SHOW_HIDDEN || SHOW_PER_GATE_MCU
 
   config MMU_HAS_PER_GATE_MCU
     def_bool n
-    prompt "Per-gate MCUs?" if SHOW_HIDDEN
+    prompt "Per-gate MCUs?" if SHOW_HIDDEN || SHOW_PER_GATE_MCU
+    help
+      Each gate has its own MCU board, e.g. an SLB or EBB per gate.
+      Turn off when a single board drives the whole unit. Happy Hare
+      then defines one [mcu] and one CPU temperature sensor, and the
+      board list offers the regular MMU boards.
 
   config MMU_HAS_PER_GATE_CONFIG
     def_bool n
     prompt "Per-gate configuration?" if SHOW_HIDDEN
     help
-      Present environment sensor, heater and fan hardware configuration in a
-      separate menu for each gate. This is independent of the MCU topology.
+      Configure environment sensor, heater, fan and vent servo hardware for
+      each gate, in each feature's h/w config menu. This is independent of
+      the MCU topology.
 
   config MMU_HAS_PER_GATE_NFC_READERS
     def_bool n

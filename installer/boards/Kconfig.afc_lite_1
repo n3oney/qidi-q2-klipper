@@ -1,5 +1,5 @@
 config BOARD_TYPE_AFC_LITE_1_0
-  bool "AFC Lite v1.0 / designed for Box Turtle"
+  bool "AFC Lite v1.0 [[DIM]]/ designed for Box Turtle[[/DIM]]"
   help
     This board was custom designed for the Box Turtle v1
 
@@ -122,7 +122,7 @@ if BOARD_TYPE_AFC_LITE_1_0
 
 
   # Aka "Buffer" - when filament is under tension (neck compressed) or compression (neck advances)
-  if !OPTION_TURTLE_NECK_V2_BUFFER
+  if !MMU_HAS_BUFFER_MCU
     config PIN_BUFFER_TENSION
       default "^$(MCU_NAME):PE13"
     config PIN_BUFFER_COMPRESSION
@@ -138,7 +138,7 @@ if BOARD_TYPE_AFC_LITE_1_0
 # Separate Buffer
 # -------------------------------------
 
-  if OPTION_TURTLE_NECK_V2_BUFFER
+  if MMU_HAS_BUFFER_MCU
 
     config PIN_BUFFER_SENSOR_0
       default "$(MCU_NAME)_buffer:PB5"
@@ -159,4 +159,5 @@ if BOARD_TYPE_AFC_LITE_1_0
 
   endif
 
+# Fan header: +5V always on, no MCU control (no fan pin to configure)
 endif

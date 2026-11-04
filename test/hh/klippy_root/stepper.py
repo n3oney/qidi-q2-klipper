@@ -131,7 +131,7 @@ class MCU_stepper:
         `forcepos` before each homing move and then measures travel as
         (trig_mcu_pos - init_mcu_pos) * step_dist (extras/mmu_stepper.py:414-459). If the
         teleports counted as movement, every measurement would come back as the homing
-        SEARCH distance instead of the distance actually travelled - which is exactly what
+        SEARCH distance instead of the distance actually traveled - which is exactly what
         MMU_CALIBRATE_SELECTOR used to report.
         """
         self._mcu_position_offset += self._commanded_pos - pos
@@ -158,7 +158,10 @@ class MCU_stepper:
     def get_mcu_position(self, cmd_pos=None):
         if cmd_pos is None:
             cmd_pos = self._commanded_pos
-        return int((cmd_pos + self._mcu_position_offset) / self._step_dist + 0.5)
+        mcu_pos = (cmd_pos + self._mcu_position_offset) / self._step_dist
+        if mcu_pos >= 0.:
+            return int(mcu_pos + 0.5)
+        return int(mcu_pos - 0.5)
 
     def get_past_mcu_position(self, print_time):
         return self.get_mcu_position()

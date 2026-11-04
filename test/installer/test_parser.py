@@ -118,6 +118,17 @@ class TestCommentedOutValueLines(unittest.TestCase):
         self.assertEqual(builder.sections(), ["gcode_macro FOO", "stepper_x"])
         self.assertEqual(builder.write(), buf)
 
+    def test_an_option_named_like_gcode_is_a_plain_value(self):
+        # [mmu_parameters] gcode_load_sequence swallowed every option after it
+        buf = ("[mmu_parameters]\ngcode_load_sequence: 0\ngcode_unload_sequence: 1\n\n"
+               "# Macros\npause_macro: MY_PAUSE\ndefault_ttg_map: 3, 2, 1, 0\n")
+        builder = build(buf)
+        self.assertEqual(builder.get("mmu_parameters", "gcode_load_sequence"), "0")
+        self.assertEqual(builder.get("mmu_parameters", "gcode_unload_sequence"), "1")
+        self.assertEqual(builder.get("mmu_parameters", "pause_macro"), "MY_PAUSE")
+        self.assertEqual(builder.get("mmu_parameters", "default_ttg_map"), "3, 2, 1, 0")
+        self.assertEqual(builder.write(), buf)
+
 
 # Genuinely broken: '50, 10' at column 0 is neither a section nor an option, so nothing can
 # make sense of it - Klipper rejects this file too. All HH has to do is survive and say so
@@ -435,5 +446,91 @@ class TestSetPreservesLayout(unittest.TestCase):
         self.assertEqual(klipper_value(builder.write(), "s", "extra_endstops").split(), ["c=3,", "d=4"])
 
 
+class TestSemicolonComments(unittest.TestCase):
+
+    def test_inline_semicolons_match_configparser(self):
+        for value in (
+            "abc;def", "abc;def ; comment", "abc ; comment",
+            "abc\t; comment", "; comment", '"abc;def"',
+            '"abc ; def"', "abc;{PIN_EXAMPLE}",
+            "abc ; comment {PIN_EXAMPLE}",
+        ):
+            with self.subTest(value=value):
+                buf = "[s]\nvalue: " + value + "\n"
+                builder = build(buf)
+                self.assertEqual(builder.parse_errors(), [])
+                self.assertEqual(builder.get("s", "value"), klipper_value(buf, "s", "value"))
+                self.assertEqual(builder.write(), buf)
+
+    def test_full_line_comments_preserve_layout_and_continuation(self):
+        buf = "; first line\n[s]\nvalue:\n; comment\n  first;literal\n\t; comment\n  second\nnext: 1\n"
+        builder = build(buf)
+        self.assertEqual(builder.parse_errors(), [])
+        self.assertEqual(builder.get("s", "value").split(), ["first;literal", "second"])
+        self.assertEqual(builder.get("s", "next"), "1")
+        self.assertEqual(builder.write(), buf)
+
+    def test_hash_comment_behavior_is_unchanged(self):
+        buf = "[s]\nvalue: abc#comment\n"
+        builder = build(buf)
+        self.assertEqual(builder.get("s", "value"), "abc")
+        self.assertEqual(builder.write(), buf)
+
+    def test_button_gcode_messages_keep_their_closing_quotes(self):
+        for option in ("press_gcode", "release_gcode"):
+            for message in (
+                "Bucket switch released (bucket removed); resetting count",
+                "Bucket switch released during startup; reset ignored",
+            ):
+                with self.subTest(option=option, message=message):
+                    command = 'RESPOND PREFIX="BLOBIFIER" MSG="' + message + '"'
+                    buf = "[gcode_button bucket]\n" + option + ":\n  " + command + "\nnext: 1\n"
+                    builder = build(buf)
+                    self.assertEqual(builder.parse_errors(), [])
+                    self.assertEqual(builder.get("gcode_button bucket", option), command)
+                    self.assertEqual(builder.get("gcode_button bucket", "next"), "1")
+                    self.assertEqual(builder.write(), buf)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestValues(unittest.TestCase):
+    """values() must answer exactly as options() and get() do for each section"""
+
+    CFG = (
+        "[a]\n"
+        "x: 1\n"
+        "y:\n"
+        "x: 2  # last one wins\n"
+        "\n"
+        "[b]\n"
+        "z: multi\n"
+        "  line\n"
+        "\n"
+        "[a]\n"
+        "w: from the second [a]\n"
+        "\n"
+        "# EXCLUDE FROM CONFIG BUILDER\n"
+        "[c]\n"
+        "v: excluded\n"
+    )
+
+    def expected(self, builder, scope):
+        return [(section, [(option, builder.get(section, option)) for option in builder.options(section)])
+                for section in builder.sections(scope=scope)]
+
+    def test_matches_options_and_get(self):
+        builder = build(self.CFG)
+        for scope in ("all", "included", "excluded"):
+            with self.subTest(scope=scope):
+                expected = self.expected(builder, scope)
+                self.assertEqual([(s, dict(o)) for s, o in builder.values(scope=scope)],
+                                 [(s, dict(o)) for s, o in expected])
+
+    def test_shape(self):
+        self.assertEqual(build(self.CFG).values(scope="included"),
+                         [("a", [("w", "from the second [a]")]),
+                          ("b", [("z", "multi\n  line")]),
+                          ("a", [("w", "from the second [a]")])])

@@ -10,7 +10,7 @@
 #  - Indented multi-line values: indentation signals continuation; a bare newline without leading space ends the value
 #  - Full-line comments inside a multi-line value are transparent (like Klipper's configparser): the value
 #    resumes on the next indented line. E.g. commenting out one of a [quad_gantry_level] "points:" lines
-#  - Special-case gcode* options: parses their values literally to avoid misinterpreting gcode content
+#  - Special-case gcode options: parses their values literally to avoid misinterpreting gcode content
 #  - Error recovery: an unparsable construct doesn't abort the parse. The offending text is kept verbatim in
 #    an UnparsedNode (so round trips stay byte-exact), a marker comment is added and parsing resumes at the
 #    next [section] or option. Callers can list the damage with ConfigBuilder.parse_errors()
@@ -188,6 +188,15 @@ class Tokenizer(object):
             match = regex.match(self.slice)
             if match:
                 value = match.group(0)
+
+                # Regexes match the remaining slice, not the original line. A
+                # semicolon is only a config comment at line start or after
+                # whitespace, which may already have been consumed as a token.
+                # Check both comment rules here; keep '#' handling unchanged.
+                if token_type == "comment" and value.lstrip(" \t").startswith(";"):
+                    marker_pos = start_pos + len(value) - len(value.lstrip(" \t"))
+                    if marker_pos and not self.buf[marker_pos - 1].isspace():
+                        continue
 
                 # Advance absolute position counters
                 self.pos += len(value)
@@ -664,7 +673,9 @@ class Parser(object):
                 tokenizer, "Expected ':' or '=' after '{}'".format(token.value), peek, include_token=False
             )
         assign_op = tokenizer.take("assign_op").value
-        if token.value.startswith("gcode"):  # parse gcode options as-is, so we don't parse gcode as structure'
+        # Parse gcode as-is so it isn't read as structure. Only 'gcode' holds G-code, while
+        # e.g. HH's gcode_load_sequence is a plain value
+        if token.value == "gcode":
             value = self.parse_value(tokenizer, as_is=True)
         else:
             value = self.parse_value(tokenizer)
@@ -1148,38 +1159,42 @@ class ConfigBuilder(object):
         except KeyError:
             return False
 
-    def copy_option(self, src_config, section_name, option_name):
+    def copy_option(self, src_config, section_name, option_name, before_section_tail=False):
         option = src_config._get_option(section_name, option_name)
         section = self._get_section(section_name)
 
         cloned = OptionNode(option.name, copy.deepcopy(option.body), option.assign_op, option.trailing_ws)
-        # Pull document-level tail (comments/whitespace after this section) back into the section (your existing behavior)
-
-        doc_body = self.document.body
-        try:
-            sec_doc_idx = doc_body.index(section)
-        except ValueError:
-            sec_doc_idx = -1
-
-        if sec_doc_idx != -1:
-            j = sec_doc_idx + 1
-            while j < len(doc_body) and isinstance(doc_body[j], (CommentNode, WhitespaceNode, HiddenOptionCommentNode)):
-                j += 1
-            if j > sec_doc_idx + 1:
-                section.body.extend(doc_body[sec_doc_idx + 1 : j])
-                del doc_body[sec_doc_idx + 1 : j]
-
-        # Decide insertion point: after marker if present, else end
-        insert_at = len(section.body)
-        marker_idx = None
-        for idx, node in enumerate(section.body):
-            if isinstance(node, HiddenOptionCommentNode):
-                marker_idx = idx
-
-        if marker_idx is not None:
-            insert_at = marker_idx + 1
+        if before_section_tail:
+            # Keep generated spacing and comments between this section and the next
+            # section in place. The copied option belongs after the last generated
+            # option, but before that tail.
+            insert_at = max([i + 1 for i, node in enumerate(section.body)
+                             if isinstance(node, OptionNode)] or [0])
         else:
+            # Pull document-level tail (comments/whitespace after this section) back into the section.
+            doc_body = self.document.body
+            try:
+                sec_doc_idx = doc_body.index(section)
+            except ValueError:
+                sec_doc_idx = -1
+
+            if sec_doc_idx != -1:
+                j = sec_doc_idx + 1
+                while j < len(doc_body) and isinstance(doc_body[j], (CommentNode, WhitespaceNode, HiddenOptionCommentNode)):
+                    j += 1
+                if j > sec_doc_idx + 1:
+                    section.body.extend(doc_body[sec_doc_idx + 1 : j])
+                    del doc_body[sec_doc_idx + 1 : j]
+
+            # Decide insertion point: after marker if present, else end
             insert_at = len(section.body)
+            marker_idx = None
+            for idx, node in enumerate(section.body):
+                if isinstance(node, HiddenOptionCommentNode):
+                    marker_idx = idx
+
+            if marker_idx is not None:
+                insert_at = marker_idx + 1
 
         # Ensure we don't tack onto previous line: add newline BEFORE cloned if needed, else AFTER
         nodes_to_insert = []
@@ -1204,22 +1219,42 @@ class ConfigBuilder(object):
     def rename_option(self, section_name, option_name, new_option_name):
         self._for_option(section_name, option_name, rename, new_option_name)
 
-    def get(self, section_name, option_name, default=None, with_comments=False):
+    @staticmethod
+    def _value(option, default=None, with_comments=False):
         def serialize(node, buf, _):
             if not with_comments and isinstance(node, CommentNode):
                 return False, buf
             return True, buf + node.serialize()
 
+        if len(option.body) == 0:
+            return default
+        value = ""
+        for value_line in option.body:
+            value = value_line.walk(serialize, value)
+        return value.strip()
+
+    def get(self, section_name, option_name, default=None, with_comments=False):
         try:
-            option = self._get_option(section_name, option_name)
-            if len(option.body) == 0:
-                return default
-            value = ""
-            for value_line in option.body:
-                value = value_line.walk(serialize, value)
-            return value.strip()
+            return self._value(self._get_option(section_name, option_name), default, with_comments)
         except KeyError:
             return default
+
+    def values(self, scope="all"):
+        """[(section, [(option, value), ...]), ...] in sections(scope) order: what options() and
+        get() give for every section, in one pass rather than a document walk per lookup"""
+        def collect_option(node, ctx, _):
+            if isinstance(node, OptionNode):
+                ctx.append(node)
+            return isinstance(node, SectionNode), ctx
+
+        last = {sec.name: sec for sec in self._for_section(None, collect, [])}
+        result = []
+        for name in self.sections(scope=scope):
+            options = {}
+            for option in last[name].walk(collect_option, []):
+                options[option.name] = self._value(option)
+            result.append((name, list(options.items())))
+        return result
 
     def getint(self, section_name, option_name, default=None):
         value = self.get(section_name, option_name)

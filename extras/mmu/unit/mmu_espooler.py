@@ -69,14 +69,36 @@ class MmuESpooler:
         self.hardware_pwm = config.getboolean("hardware_pwm", False)
         self.scale = config.getfloat('scale', 1., above=0.)
         self.cycle_time = config.getfloat("cycle_time", 0.100, above=0., maxval=MAX_SCHEDULE_TIME)
-        self.shutdown_value = config.getfloat('shutdown_value', 0., minval=0., maxval=self.scale) / self.scale
-        start_value = config.getfloat('value', 0., minval=0., maxval=self.scale) / self.scale
+        if self.is_pwm:
+            self.shutdown_value = config.getfloat('shutdown_value', 0., minval=0., maxval=self.scale) / self.scale
+            if not self.hardware_pwm and self.shutdown_value not in (0., 1.):
+                raise config.error("Option 'shutdown_value' in section '%s' must be 0 or scale (%s) with software PWM. Use hardware_pwm for values in between" % (config.get_name(), self.scale))
+            start_value = config.getfloat('value', 0., minval=0., maxval=self.scale) / self.scale
+        else:
+            # A digital pin is on/off, so scale doesn't apply
+            self.shutdown_value = float(config.getfloat('shutdown_value', 0., minval=0.) > 0.)
+            start_value = float(config.getfloat('value', 0., minval=0.) > 0.)
 
-        for gate in range(self.first_gate, self.first_gate + self.num_gates):
-            self.respool_motor_pin = config.get('respool_motor_pin_%d' % gate, None)
-            self.assist_motor_pin = config.get('assist_motor_pin_%d' % gate, None)
-            self.enable_motor_pin = config.get('enable_motor_pin_%d' % gate, None)
-            self.assist_trigger_pin = config.get('assist_trigger_pin_%d' % gate, None)
+        # Pin options are numbered from 0 within the unit, but hand-written configs may use global gate
+        # numbers. Read them as local only when global numbering can't fit
+        pin_options = ('respool_motor_pin_', 'assist_motor_pin_', 'enable_motor_pin_', 'assist_trigger_pin_')
+        suffixes = [o.rsplit('_', 1)[1] for o in config.get_prefix_options('') if o.startswith(pin_options)]
+        indices = [int(s) for s in suffixes if s.isdigit()]
+        fits_local = all(i < self.num_gates for i in indices)
+        fits_global = all(self.first_gate <= i < self.first_gate + self.num_gates for i in indices)
+        global_numbering = fits_global or not fits_local
+        if indices and fits_local and fits_global and self.first_gate > 0:
+            logging.warning(
+                "MMU: Pin numbering in [%s] fits both per-unit and global gate numbers; reading it as global "
+                "(gates %d-%d). For per-unit numbering list every gate's pins from _0 to _%d, leaving unused ones blank"
+                % (config.get_name(), self.first_gate, self.first_gate + self.num_gates - 1, self.num_gates - 1))
+
+        for lgate, gate in enumerate(range(self.first_gate, self.first_gate + self.num_gates)):
+            index = gate if global_numbering else lgate
+            self.respool_motor_pin = config.get('respool_motor_pin_%d' % index, None)
+            self.assist_motor_pin = config.get('assist_motor_pin_%d' % index, None)
+            self.enable_motor_pin = config.get('enable_motor_pin_%d' % index, None)
+            self.assist_trigger_pin = config.get('assist_trigger_pin_%d' % index, None)
 
             # Setup pins
             if self.respool_motor_pin and not self._is_empty_pin(self.respool_motor_pin):
@@ -112,7 +134,7 @@ class MmuESpooler:
 
                 name = "enable_%d" % gate
                 mcu_pin.setup_max_duration(0.)
-                mcu_pin.setup_start_value(self.last_value, self.shutdown_value)
+                mcu_pin.setup_start_value(start_value, self.shutdown_value)
                 self.motor_mcu_pins[name] = mcu_pin
                 self.last_value[name] = start_value
 

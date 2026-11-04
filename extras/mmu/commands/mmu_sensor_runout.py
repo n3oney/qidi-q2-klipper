@@ -83,7 +83,7 @@ class MmuSensorRunoutCommand(BaseCommand):
 
                 # Events may be delivered after another gate or unit was selected. Read
                 # the exact sensor named by the event, not a generic sensor in the active map.
-                sensor_state = mmu.sensor_manager.check_event_sensor(raw_sensor, gate)
+                sensor_state = mmu.sensor_manager.check_event_sensor(raw_sensor, gate, eventtime=eventtime)
 
                 if sensor and sensor_state is not False:
                     state = "still detects filament" if sensor_state is True else "cannot be read"
@@ -135,7 +135,11 @@ class MmuSensorRunoutCommand(BaseCommand):
                         process_runout = True
 
                     elif sensor.startswith(SENSOR_EXTRUDER_ENTRY):
-                        raise MmuError("Filament runout occurred at extruder. Manual intervention is required")
+                        raise MmuError(
+                            "Filament runout occurred at the extruder entry on %s (%s). Manual intervention is required"
+                            % (mmu.selected_tool_string(), mmu.gate_name()),
+                            hint="Find where the filament ended or broke before the extruder, clear it, " + HINT_RELOAD
+                        )
 
                     # An idle lane emptying is normal (the user pulled the spool). The gate map
                     # was updated above if it was an entry sensor; there is nothing else to do
@@ -157,5 +161,5 @@ class MmuSensorRunoutCommand(BaseCommand):
                     # Undo what runout sensor handling did
                     mmu.pause_resume.send_resume_command()
 
-        except MmuError as ee:
-            mmu.handle_mmu_error(str(ee))
+        except (MmuError, mmu.printer.command_error) as ee:
+            mmu.handle_mmu_error(mmu.mmu_error_from(ee))

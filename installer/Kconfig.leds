@@ -11,6 +11,14 @@
 #   PARAM_EXIT_EFFECT
 #   PARAM_ENTRY_EFFECT
 #   PARAM_STATUS_EFFECT
+#   PARAM_LOGO_EFFECT
+#   PARAM_{EXIT,ENTRY,STATUS,LOGO}_EFFECT_CUSTOM (only when that choice is custom)
+#   PARAM_WHITE_LIGHT
+#   PARAM_BLACK_LIGHT
+#   PARAM_EMPTY_LIGHT
+#   PARAM_FILAMENT_COLOR_INTENSITY
+#   PARAM_EFFECT_* (one per effect_* option in [mmu_leds])
+#   PARAM_MISC_LED_EFFECTS
 #   PARAM_CHAIN_COUNT
 #   PARAM_COLOR_ORDER
 #   PARAM_EXIT_LEDS
@@ -24,7 +32,12 @@
 # Can be disabled and forced off with:
 #   select UNSELECT_MMU_HAS_LEDS
 
-#comment "_"
+# Validators for the customized colors and effects: (r,g,b) with each value
+# 0.0 to 1.0, and "effect_name [, (r,g,b) [, duration]]" or empty for no effect
+led_num    := (0?[.][0-9]+|0([.][0-9]*)?|1([.]0*)?)
+led_rgb    := [(] *$(led_num) *, *$(led_num) *, *$(led_num) *[)]
+led_effect := ([A-Za-z0-9_-]+( *, *$(led_rgb)( *, *([0-9]+([.][0-9]*)?|[.][0-9]+))?)?)?
+
 comment "_Leds"
 
 config UNSELECT_MMU_HAS_LEDS
@@ -76,119 +89,15 @@ if MMU_HAS_LEDS
       default "True" if BOOL_ENABLE_LEDS_ANIMATION
       default "False"
 
-    choice CHOICE_EXIT_EFFECT
-      prompt "Exit effect     "
-      default CHOICE_EXIT_EFFECT_GATE_STATUS
-      help
-        off turns the segment off. gate_status shows gate availability and state.
-        filament_color shows the filament color stored in the gate map.
-        slicer_color shows the color assigned by the slicer.
 
-      config CHOICE_EXIT_EFFECT_OFF
-        bool "off"
-        help
-          Keep the exit LEDs off when no temporary or action effect is active.
-
-      config CHOICE_EXIT_EFFECT_GATE_STATUS
-        bool "gate_status"
-        help
-          Show the availability and status of each gate on its exit LEDs.
-
-      config CHOICE_EXIT_EFFECT_FILAMENT_COLOR
-        bool "filament_color"
-        help
-          Show each gate's filament color from the Happy Hare gate map.
-
-      config CHOICE_EXIT_EFFECT_SLICER_COLOR
-        bool "slicer_color"
-        help
-          Show the color assigned to each gate by the slicer.
-    endchoice
-
-    config PARAM_EXIT_EFFECT
-      string
-      default "off"            if CHOICE_EXIT_EFFECT_OFF
-      default "gate_status"    if CHOICE_EXIT_EFFECT_GATE_STATUS
-      default "filament_color" if CHOICE_EXIT_EFFECT_FILAMENT_COLOR
-      default "slicer_color"   if CHOICE_EXIT_EFFECT_SLICER_COLOR
-      default "gate_status"
-
-    choice CHOICE_ENTRY_EFFECT
-      prompt "Entry effect    "
-      default CHOICE_ENTRY_EFFECT_FILAMENT_COLOR
-      help
-        off turns the segment off. gate_status shows gate availability and state.
-        filament_color shows the filament color stored in the gate map.
-        slicer_color shows the color assigned by the slicer.
-
-      config CHOICE_ENTRY_EFFECT_OFF
-        bool "off"
-        help
-          Keep the entry LEDs off when no temporary or action effect is active.
-
-      config CHOICE_ENTRY_EFFECT_GATE_STATUS
-        bool "gate_status"
-        help
-          Show the availability and status of each gate on its entry LEDs.
-
-      config CHOICE_ENTRY_EFFECT_FILAMENT_COLOR
-        bool "filament_color"
-        help
-          Show each gate's filament color from the Happy Hare gate map.
-
-      config CHOICE_ENTRY_EFFECT_SLICER_COLOR
-        bool "slicer_color"
-        help
-          Show the color assigned to each gate by the slicer.
-    endchoice
-
-    config PARAM_ENTRY_EFFECT
-      string
-      default "off"            if CHOICE_ENTRY_EFFECT_OFF
-      default "gate_status"    if CHOICE_ENTRY_EFFECT_GATE_STATUS
-      default "filament_color" if CHOICE_ENTRY_EFFECT_FILAMENT_COLOR
-      default "slicer_color"   if CHOICE_ENTRY_EFFECT_SLICER_COLOR
-      default "filament_color"
-
-    choice CHOICE_STATUS_EFFECT
-      prompt "Status effect   "
-      default CHOICE_STATUS_EFFECT_FILAMENT_COLOR
-      help
-        off turns the segment off. gate_status shows gate availability and state.
-        filament_color shows the selected filament color from the gate map.
-        slicer_color shows the selected color assigned by the slicer.
-
-      config CHOICE_STATUS_EFFECT_OFF
-        bool "off"
-        help
-          Keep the status LEDs off when no temporary or action effect is active.
-
-      config CHOICE_STATUS_EFFECT_GATE_STATUS
-        bool "gate_status"
-        help
-          Show the status of the selected gate on the status LEDs.
-
-      config CHOICE_STATUS_EFFECT_FILAMENT_COLOR
-        bool "filament_color"
-        help
-          Show the selected gate's filament color from the Happy Hare gate map.
-
-      config CHOICE_STATUS_EFFECT_SLICER_COLOR
-        bool "slicer_color"
-        help
-          Show the selected gate's color assigned by the slicer.
-    endchoice
-
-    config PARAM_STATUS_EFFECT
-      string
-      default "off"            if CHOICE_STATUS_EFFECT_OFF
-      default "gate_status"    if CHOICE_STATUS_EFFECT_GATE_STATUS
-      default "filament_color" if CHOICE_STATUS_EFFECT_FILAMENT_COLOR
-      default "slicer_color"   if CHOICE_STATUS_EFFECT_SLICER_COLOR
-      default "filament_color"
+    # -------------------------------------
+    # Hardware setup
+    # -------------------------------------
 
     comment "_"
-
+    comment "_Hardware"
+    comment "$(misc_hardware_hint)" if CUSTOM_LED_SETUP
+      dim
 
     config PARAM_FRAME_RATE
       int "Frame rate      "
@@ -229,6 +138,7 @@ if MMU_HAS_LEDS
       array_editor ";"
       default "" if CUSTOM_LED_SETUP
 
+
     if !CUSTOM_LED_SETUP
 
       config BOOL_EMU_SLB_HACK
@@ -246,10 +156,14 @@ if MMU_HAS_LEDS
 
       config PARAM_COLOR_ORDER
         string "Color order     "
+        validator "[GRBWgrbw]+(( *, *| +)[GRBWgrbw]+)*"
         default "GRBW"
         help
           Set the channel order expected by the LEDs, for example RGB, GRB, RGBW
-          or GRBW. This must match the physical LED type and wiring.
+          or GRBW. This must match the physical LED type and wiring. For a chain
+          of mixed LEDs, list one order per LED separated by commas or spaces,
+          e.g. "GRBW, GRBW, GRB".
+
 
       config PARAM_EXIT_LEDS
         prompt "Exit leds       "
@@ -272,6 +186,7 @@ if MMU_HAS_LEDS
           of LEDs specified by exit_leds. Counts consume the virtual chain in
           gate order. Example for 10 LEDs over 4 gates: "1, 1, 2, 6".
 
+
       config PARAM_ENTRY_LEDS
         prompt "Entry leds      "
         help
@@ -290,12 +205,14 @@ if MMU_HAS_LEDS
           of LEDs specified by entry_leds. Counts consume the virtual chain in
           gate order. Example for 8 LEDs over 4 gates: "1, 1, 2, 4".
 
+
       config PARAM_STATUS_LEDS
         prompt "Status leds     "
         help
           Assign one or more LEDs used to show the overall MMU and selected
           filament status. Use a virtual-chain specification such as
           "neopixel:my_leds (9)". Leave this empty when no status LEDs are fitted.
+
 
       config PARAM_LOGO_LEDS
         prompt "Logo leds       "
@@ -304,8 +221,10 @@ if MMU_HAS_LEDS
           virtual-chain specification such as "neopixel:my_leds (10-12)". Leave
           this empty when no logo LEDs are fitted.
 
+
       config PIN_NEOPIXEL
         prompt "Neopixel pin    " if !MMU_HAS_PER_GATE_MCU
+        validator "$(pin_validator)"
         help
           Set the MCU pin connected to the data input of the generated Neopixel
           chain for this unit.
@@ -316,10 +235,11 @@ if MMU_HAS_LEDS
           Set the Neopixel data pin on each gate MCU. Each configured gate gets
           its own generated LED chain.
 
-        @repeat var=i min=0 max=11@
+        @repeat var=i min=0 max=$(max_gate)@
           config PIN_NEOPIXEL_$(i)
             string
             prompt "Neopixel gate $(i) pin" if PARAM_NUM_GATES > $(i)
+            validator "$(pin_validator)"
             help
               Set the data pin for the Neopixel chain connected to gate $(i)'s MCU.
         @endrepeat@
@@ -332,10 +252,11 @@ if MMU_HAS_LEDS
           Set the additional box-side Neopixel data pin for each EMU gate using
           an SLB v1 board.
 
-        @repeat var=i min=0 max=11@
+        @repeat var=i min=0 max=$(max_gate)@
           config PIN_NEOPIXEL_BOX_$(i)
             string
             prompt "Neopixel box gate $(i) pin" if PARAM_NUM_GATES > $(i)
+            validator "$(pin_validator)"
             help
               Set the box-side Neopixel data pin associated with gate $(i).
         @endrepeat@
@@ -348,7 +269,525 @@ if MMU_HAS_LEDS
 
       endmenu
 
-    endif
+    endif # CUSTOM_LED_SETUP
+
+
+    comment "_"
+    comment "_Effects"
+
+    # -------------------------------------
+    # Exit LED effects
+    # -------------------------------------
+
+    choice CHOICE_EXIT_EFFECT
+      prompt "Exit effect mode  "
+      default CHOICE_EXIT_EFFECT_GATE_STATUS
+      depends on PARAM_EXIT_LEDS != ""
+      help
+        off turns the segment off. gate_status shows gate availability and state.
+        filament_color shows the filament color stored in the gate map.
+        slicer_color shows the color assigned by the slicer.
+        r,g,b or custom effect name takes an (r,g,b) color or an [mmu_led_effect] name.
+
+      config CHOICE_EXIT_EFFECT_OFF
+        bool "off"
+        help
+          Keep the exit LEDs off when no temporary or action effect is active.
+
+      config CHOICE_EXIT_EFFECT_GATE_STATUS
+        bool "gate_status"
+        help
+          Show the availability and status of each gate on its exit LEDs.
+
+      config CHOICE_EXIT_EFFECT_FILAMENT_COLOR
+        bool "filament_color"
+        help
+          Show each gate's filament color from the Happy Hare gate map.
+
+      config CHOICE_EXIT_EFFECT_SLICER_COLOR
+        bool "slicer_color"
+        help
+          Show the color assigned to each gate by the slicer.
+
+      config CHOICE_EXIT_EFFECT_CUSTOM
+        bool "r,g,b or custom effect name"
+        help
+          Use a fixed (r,g,b) color or a named [mmu_led_effect], entered below.
+
+      config PARAM_EXIT_EFFECT_CUSTOM
+        string "Custom value"
+        depends on CHOICE_EXIT_EFFECT_CUSTOM
+        default "(1, 1, 1)"
+        help
+          An (r,g,b) color, each value 0.0 to 1.0, or the name of an [mmu_led_effect]
+          (see mmu.cfg).
+          Format:
+            [[REV]](r,g,b) | effect_name[[/REV]]
+    endchoice
+
+    config PARAM_EXIT_EFFECT
+      string
+      default "off"            if CHOICE_EXIT_EFFECT_OFF
+      default "gate_status"    if CHOICE_EXIT_EFFECT_GATE_STATUS
+      default "filament_color" if CHOICE_EXIT_EFFECT_FILAMENT_COLOR
+      default "slicer_color"   if CHOICE_EXIT_EFFECT_SLICER_COLOR
+      default PARAM_EXIT_EFFECT_CUSTOM if CHOICE_EXIT_EFFECT_CUSTOM
+      default "gate_status"
+
+
+    # -------------------------------------
+    # Entry LED effects
+    # -------------------------------------
+
+    choice CHOICE_ENTRY_EFFECT
+      prompt "Entry effect mode "
+      default CHOICE_ENTRY_EFFECT_FILAMENT_COLOR
+      depends on PARAM_ENTRY_LEDS != ""
+      help
+        off turns the segment off. gate_status shows gate availability and state.
+        filament_color shows the filament color stored in the gate map.
+        slicer_color shows the color assigned by the slicer.
+        r,g,b or custom effect name takes an (r,g,b) color or an [mmu_led_effect] name.
+
+      config CHOICE_ENTRY_EFFECT_OFF
+        bool "off"
+        help
+          Keep the entry LEDs off when no temporary or action effect is active.
+
+      config CHOICE_ENTRY_EFFECT_GATE_STATUS
+        bool "gate_status"
+        help
+          Show the availability and status of each gate on its entry LEDs.
+
+      config CHOICE_ENTRY_EFFECT_FILAMENT_COLOR
+        bool "filament_color"
+        help
+          Show each gate's filament color from the Happy Hare gate map.
+
+      config CHOICE_ENTRY_EFFECT_SLICER_COLOR
+        bool "slicer_color"
+        help
+          Show the color assigned to each gate by the slicer.
+
+      config CHOICE_ENTRY_EFFECT_CUSTOM
+        bool "r,g,b or custom effect name"
+        help
+          Use a fixed (r,g,b) color or a named [mmu_led_effect], entered below.
+
+      config PARAM_ENTRY_EFFECT_CUSTOM
+        string "Custom value"
+        depends on CHOICE_ENTRY_EFFECT_CUSTOM
+        default "(1, 1, 1)"
+        help
+          An (r,g,b) color, each value 0.0 to 1.0, or the name of an [mmu_led_effect]
+          (see mmu.cfg).
+          Format:
+            [[REV]](r,g,b) | effect_name[[/REV]]
+    endchoice
+
+    config PARAM_ENTRY_EFFECT
+      string
+      default "off"            if CHOICE_ENTRY_EFFECT_OFF
+      default "gate_status"    if CHOICE_ENTRY_EFFECT_GATE_STATUS
+      default "filament_color" if CHOICE_ENTRY_EFFECT_FILAMENT_COLOR
+      default "slicer_color"   if CHOICE_ENTRY_EFFECT_SLICER_COLOR
+      default PARAM_ENTRY_EFFECT_CUSTOM if CHOICE_ENTRY_EFFECT_CUSTOM
+      default "filament_color"
+
+
+    # -------------------------------------
+    # Status LED effects
+    # -------------------------------------
+
+    choice CHOICE_STATUS_EFFECT
+      prompt "Status effect mode"
+      default CHOICE_STATUS_EFFECT_FILAMENT_COLOR
+      depends on PARAM_STATUS_LEDS != ""
+      help
+        off turns the segment off. on shows white light while filament is loaded.
+        filament_color shows the selected filament color from the gate map.
+        slicer_color shows the selected color assigned by the slicer.
+        r,g,b or custom effect name takes an (r,g,b) color or an [mmu_led_effect] name.
+
+      config CHOICE_STATUS_EFFECT_OFF
+        bool "off"
+        help
+          Keep the status LEDs off when no temporary or action effect is active.
+
+      config CHOICE_STATUS_EFFECT_ON
+        bool "on"
+        help
+          Show white light while filament is loaded, otherwise black light.
+
+      config CHOICE_STATUS_EFFECT_FILAMENT_COLOR
+        bool "filament_color"
+        help
+          Show the selected gate's filament color from the Happy Hare gate map.
+
+      config CHOICE_STATUS_EFFECT_SLICER_COLOR
+        bool "slicer_color"
+        help
+          Show the selected gate's color assigned by the slicer.
+
+      config CHOICE_STATUS_EFFECT_CUSTOM
+        bool "r,g,b or custom effect name"
+        help
+          Use a fixed (r,g,b) color or a named [mmu_led_effect], entered below.
+
+      config PARAM_STATUS_EFFECT_CUSTOM
+        string "Custom value"
+        depends on CHOICE_STATUS_EFFECT_CUSTOM
+        default "(1, 1, 1)"
+        help
+          An (r,g,b) color, each value 0.0 to 1.0, or the name of an [mmu_led_effect]
+          (see mmu.cfg).
+          Format:
+            [[REV]](r,g,b) | effect_name[[/REV]]
+    endchoice
+
+    config PARAM_STATUS_EFFECT
+      string
+      default "off"            if CHOICE_STATUS_EFFECT_OFF
+      default "on"             if CHOICE_STATUS_EFFECT_ON
+      default "filament_color" if CHOICE_STATUS_EFFECT_FILAMENT_COLOR
+      default "slicer_color"   if CHOICE_STATUS_EFFECT_SLICER_COLOR
+      default PARAM_STATUS_EFFECT_CUSTOM if CHOICE_STATUS_EFFECT_CUSTOM
+      default "filament_color"
+
+
+    # -------------------------------------
+    # Logo LED effects
+    # -------------------------------------
+
+    choice CHOICE_LOGO_EFFECT
+      prompt "Logo effect mode  "
+      default CHOICE_LOGO_EFFECT_CUSTOM
+      depends on PARAM_LOGO_LEDS != ""
+      help
+        off turns the segment off.
+        r,g,b or custom effect name takes an (r,g,b) color or an [mmu_led_effect] name.
+
+      config CHOICE_LOGO_EFFECT_OFF
+        bool "off"
+        help
+          Keep the logo LEDs off when no temporary or action effect is active.
+
+      config CHOICE_LOGO_EFFECT_CUSTOM
+        bool "r,g,b or custom effect name"
+        help
+          Use a fixed (r,g,b) color or a named [mmu_led_effect], entered below.
+
+      config PARAM_LOGO_EFFECT_CUSTOM
+        string "Custom value"
+        depends on CHOICE_LOGO_EFFECT_CUSTOM
+        default "(0, 0, 0.3)"
+        help
+          An (r,g,b) color, each value 0.0 to 1.0, or the name of an [mmu_led_effect]
+          (see mmu.cfg).
+          Format:
+            [[REV]](r,g,b) | effect_name[[/REV]]
+    endchoice
+
+    config PARAM_LOGO_EFFECT
+      string
+      default "off"            if CHOICE_LOGO_EFFECT_OFF
+      default PARAM_LOGO_EFFECT_CUSTOM if CHOICE_LOGO_EFFECT_CUSTOM
+      default "(0, 0, 0.3)"
+
+
+    # -------------------------------------
+    # Advanced effect customization
+    # Note: The if BOOL_CUSTOMIZE_LED_EFFECTS on every item must
+    # exist and ensures defaults defined even if menu is not enabled
+    # -------------------------------------
+
+    menuconfig BOOL_CUSTOMIZE_LED_EFFECTS
+      bool "Customize LED colors and effects?"
+      default n
+      default_when_hidden
+      help
+        ADVANCED: Edit the base colors and the effect for each action (else this MMU type's defaults).
+        Format:  [[B]]effect_name [, (r,g,b) [, duration]][[/B]]
+
+        The effect must be an [mmu_led_effect] (see mmu.cfg). The optional (r,g,b) is the static
+        color used when animation is off; without it the empty light color is used.
+        The optional duration (seconds) is how long a timed effect shows before reverting.
+        Leave an action empty for no effect.
+
+    config PARAM_WHITE_LIGHT
+      string
+      prompt "White light          " if BOOL_CUSTOMIZE_LED_EFFECTS
+      validator "$(led_rgb)"
+      default "(1, 1, 1)"
+      help
+        Color used for white light, e.g. when a gate's filament color is not known.
+        Each value 0.0 to 1.0.
+        Format:
+          [[REV]](r,g,b)[[/REV]]
+
+    config PARAM_BLACK_LIGHT
+      string
+      prompt "Black light          " if BOOL_CUSTOMIZE_LED_EFFECTS
+      validator "$(led_rgb)"
+      default "(.01, 0, .02)"
+      help
+        Color used to represent black filament (LEDs can't show black), and the status
+        segment when nothing is loaded. Each value 0.0 to 1.0.
+        Format:
+          [[REV]](r,g,b)[[/REV]]
+
+    config PARAM_EMPTY_LIGHT
+      string
+      prompt "Empty light          " if BOOL_CUSTOMIZE_LED_EFFECTS
+      validator "$(led_rgb)"
+      default "(0, 0, 0)"
+      help
+        Color used to represent an empty gate. Each value 0.0 to 1.0.
+        Format:
+          [[REV]](r,g,b)[[/REV]]
+
+    config PARAM_FILAMENT_COLOR_INTENSITY
+      float
+      prompt "Color intensity      " if BOOL_CUSTOMIZE_LED_EFFECTS
+      range 0.0 1.0
+      default 0.5
+      help
+        Brightness multiplier (0.0 to 1.0) applied when displaying filament or slicer colors.
+        Lower values dim the colors. White, black and empty light are not affected.
+
+    comment "_" if BOOL_CUSTOMIZE_LED_EFFECTS
+
+    config PARAM_EFFECT_LOADING
+      string
+      prompt "Loading              " if BOOL_CUSTOMIZE_LED_EFFECTS
+      validator "$(led_effect)"
+      default "mmu_blue_clockwise_slow,   (0, 0, 0.4)"
+      help
+        Format:
+          [[REV]]effect_name [, (r,g,b)][[/REV]]
+
+    config PARAM_EFFECT_LOADING_EXTRUDER
+      string
+      prompt "Loading extruder     " if BOOL_CUSTOMIZE_LED_EFFECTS
+      validator "$(led_effect)"
+      default "mmu_blue_clockwise_fast,   (0, 0, 1)"
+      help
+        Format:
+          [[REV]]effect_name [, (r,g,b)][[/REV]]
+
+    config PARAM_EFFECT_UNLOADING
+      string
+      prompt "Unloading            " if BOOL_CUSTOMIZE_LED_EFFECTS
+      validator "$(led_effect)"
+      default "mmu_blue_anticlock_slow,   (0, 0, 0.4)"
+      help
+        Format:
+          [[REV]]effect_name [, (r,g,b)][[/REV]]
+
+    config PARAM_EFFECT_UNLOADING_EXTRUDER
+      string
+      prompt "Unloading extruder   " if BOOL_CUSTOMIZE_LED_EFFECTS
+      validator "$(led_effect)"
+      default "mmu_blue_anticlock_fast,   (0, 0, 1)"
+      help
+        Format:
+          [[REV]]effect_name [, (r,g,b)][[/REV]]
+
+    config PARAM_EFFECT_HEATING
+      string
+      prompt "Heating              " if BOOL_CUSTOMIZE_LED_EFFECTS
+      validator "$(led_effect)"
+      default "mmu_breathing_red_slow,    (0.3, 0, 0)"
+      help
+        Format:
+          [[REV]]effect_name [, (r,g,b)][[/REV]]
+
+    config PARAM_EFFECT_SELECTING
+      string
+      prompt "Selecting            " if BOOL_CUSTOMIZE_LED_EFFECTS
+      validator "$(led_effect)"
+      default "mmu_breathing_white_fast,  (0.2, 0.2, 0.2)"
+      help
+        Format:
+          [[REV]]effect_name [, (r,g,b)][[/REV]]
+
+    config PARAM_EFFECT_CHECKING
+      string
+      prompt "Checking             " if BOOL_CUSTOMIZE_LED_EFFECTS
+      validator "$(led_effect)"
+      default "mmu_breathing_cyan_fast,   (0, 0.4, 0.5)"
+      help
+        Format:
+          [[REV]]effect_name [, (r,g,b)][[/REV]]
+
+    config PARAM_EFFECT_PRELOADING
+      string
+      prompt "Preloading           " if BOOL_CUSTOMIZE_LED_EFFECTS
+      validator "$(led_effect)"
+      default "mmu_breathing_cyan_fast,   (0, 0.4, 0.5)"
+      help
+        Format:
+          [[REV]]effect_name [, (r,g,b)][[/REV]]
+
+    config PARAM_EFFECT_INITIALIZED
+      string
+      prompt "Initialized          " if BOOL_CUSTOMIZE_LED_EFFECTS
+      validator "$(led_effect)"
+      default "mmu_rainbow,               (0.5, 0.2, 0),   8"
+      help
+        Format:
+          [[REV]]effect_name [, (r,g,b) [, duration]][[/REV]]
+
+    config PARAM_EFFECT_ERROR
+      string
+      prompt "Error                " if BOOL_CUSTOMIZE_LED_EFFECTS
+      validator "$(led_effect)"
+      default "mmu_red_strobe,            (1, 0, 0),       10"
+      help
+        Format:
+          [[REV]]effect_name [, (r,g,b) [, duration]][[/REV]]
+
+    config PARAM_EFFECT_COMPLETE
+      string
+      prompt "Complete             " if BOOL_CUSTOMIZE_LED_EFFECTS
+      validator "$(led_effect)"
+      default "mmu_sparkle,               (0.3, 0.3, 0.3), 10"
+      help
+        Format:
+          [[REV]]effect_name [, (r,g,b) [, duration]][[/REV]]
+
+    config PARAM_EFFECT_GATE_SELECTED
+      string
+      prompt "Gate selected        " if BOOL_CUSTOMIZE_LED_EFFECTS
+      validator "$(led_effect)"
+      default "mmu_static_blue,           (0, 0, 1)"
+      help
+        Format:
+          [[REV]]effect_name [, (r,g,b)][[/REV]]
+
+    config PARAM_EFFECT_GATE_AVAILABLE
+      string
+      prompt "Gate available       " if BOOL_CUSTOMIZE_LED_EFFECTS
+      validator "$(led_effect)"
+      default "mmu_static_green,          (0, 0.5, 0)"
+      help
+        Format:
+          [[REV]]effect_name [, (r,g,b)][[/REV]]
+
+    config PARAM_EFFECT_GATE_AVAILABLE_SEL
+      string
+      prompt "Gate available (sel) " if BOOL_CUSTOMIZE_LED_EFFECTS
+      validator "$(led_effect)"
+      default "mmu_ready_green,           (0, 0.75, 0)"
+      help
+        Format:
+          [[REV]]effect_name [, (r,g,b)][[/REV]]
+
+    config PARAM_EFFECT_GATE_UNKNOWN
+      string
+      prompt "Gate unknown         " if BOOL_CUSTOMIZE_LED_EFFECTS
+      validator "$(led_effect)"
+      default "mmu_static_orange,         (0.5, 0.2, 0)"
+      help
+        Format:
+          [[REV]]effect_name [, (r,g,b)][[/REV]]
+
+    config PARAM_EFFECT_GATE_UNKNOWN_SEL
+      string
+      prompt "Gate unknown (sel)   " if BOOL_CUSTOMIZE_LED_EFFECTS
+      validator "$(led_effect)"
+      default "mmu_ready_orange,          (0.75, 0.3, 0)"
+      help
+        Format:
+          [[REV]]effect_name [, (r,g,b)][[/REV]]
+
+    config PARAM_EFFECT_GATE_EMPTY
+      string
+      prompt "Gate empty           " if BOOL_CUSTOMIZE_LED_EFFECTS
+      validator "$(led_effect)"
+      default "mmu_static_black,          (0, 0, 0)"
+      help
+        Format:
+          [[REV]]effect_name [, (r,g,b)][[/REV]]
+
+    config PARAM_EFFECT_GATE_EMPTY_SEL
+      string
+      prompt "Gate empty (sel)     " if BOOL_CUSTOMIZE_LED_EFFECTS
+      validator "$(led_effect)"
+      default "mmu_ready_orange2,         (0.1, 0.04, 0)"
+      help
+        Format:
+          [[REV]]effect_name [, (r,g,b)][[/REV]]
+
+    config PARAM_EFFECT_PENDING_SPOOLID
+      string
+      prompt "Pending spool ID     " if BOOL_CUSTOMIZE_LED_EFFECTS
+      validator "$(led_effect)"
+      default "mmu_breathing_purple_slow, (0.4, 0, 0.5)"
+      help
+        Format:
+          [[REV]]effect_name [, (r,g,b)][[/REV]]
+
+    config PARAM_EFFECT_PENDING_SPOOLID_EXPIRING
+      string
+      prompt "Spool ID expiring    " if BOOL_CUSTOMIZE_LED_EFFECTS
+      validator "$(led_effect)"
+      default "mmu_breathing_purple_fast, (0.4, 0, 0.5)"
+      help
+        Format:
+          [[REV]]effect_name [, (r,g,b)][[/REV]]
+
+    config PARAM_EFFECT_NFC_READ
+      string
+      prompt "NFC read             " if BOOL_CUSTOMIZE_LED_EFFECTS
+      validator "$(led_effect)"
+      default "mmu_green_strobe_fast,     (0, 1, 0),       0.8"
+      help
+        Format:
+          [[REV]]effect_name [, (r,g,b) [, duration]][[/REV]]
+
+    config PARAM_EFFECT_NFC_DEEP_READ
+      string
+      prompt "NFC deep read        " if BOOL_CUSTOMIZE_LED_EFFECTS
+      validator "$(led_effect)"
+      default "mmu_green_strobe_fast,     (0, 1, 0),       1.6"
+      help
+        Format:
+          [[REV]]effect_name [, (r,g,b) [, duration]][[/REV]]
+
+    config PARAM_EFFECT_NFC_FAIL
+      string
+      prompt "NFC fail             " if BOOL_CUSTOMIZE_LED_EFFECTS
+      validator "$(led_effect)"
+      default "mmu_red_strobe,            (1, 0, 0),       3"
+      help
+        Format:
+          [[REV]]effect_name [, (r,g,b) [, duration]][[/REV]]
+
+    config PARAM_EFFECT_TD1_READ
+      string
+      prompt "TD-1 read            " if BOOL_CUSTOMIZE_LED_EFFECTS
+      validator "$(led_effect)"
+      default "mmu_green_strobe_fast,     (0, 1, 0),       0.8"
+      help
+        Format:
+          [[REV]]effect_name [, (r,g,b) [, duration]][[/REV]]
+
+    config PARAM_EFFECT_TD1_FAIL
+      string
+      prompt "TD-1 fail            " if BOOL_CUSTOMIZE_LED_EFFECTS
+      validator "$(led_effect)"
+      default "mmu_red_strobe,            (1, 0, 0),       3"
+      help
+        Format:
+          [[REV]]effect_name [, (r,g,b) [, duration]][[/REV]]
+
+    # Unit-specific [mmu_led_effect] sections for the effects above (set by vendor types)
+    config PARAM_MISC_LED_EFFECTS
+      string
+      default ""
+
+    comment "_"
 
   endmenu
 endif

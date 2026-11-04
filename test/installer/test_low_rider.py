@@ -79,6 +79,7 @@ class TestLowRiderProfile(unittest.TestCase):
 
     def test_extruder_gate_keeps_bowden_and_toolhead_defaults_hidden(self):
         hidden_defaults = {
+            "PARAM_BOWDEN_HOMING_MAX": "2000",
             "PARAM_BOWDEN_LOAD_HOMING_BUFFER": "20",
             "PARAM_BOWDEN_UNLOAD_HOMING_BUFFER": "40",
             "PARAM_EXTRUDER_FORCE_HOMING": "0",
@@ -142,7 +143,8 @@ class TestLowRiderProfile(unittest.TestCase):
         choice = "CHOICE_EXTRUDER_HOMING_ENDSTOP"
         self.assertGreater(normal.syms["PARAM_EXTRUDER_FORCE_HOMING"].visibility, 0)
         self.assertGreater(normal.syms["PARAM_TOOLHEAD_HOMING_MAX"].visibility, 0)
-        self.assertEqual(normal.named_choices[choice].visibility, 0)
+        self.assertGreater(normal.named_choices[choice].visibility, 0)
+        self.assertEqual(normal.get("PARAM_EXTRUDER_HOMING_ENDSTOP"), "extruder")
         self.assertEqual(normal.syms["PARAM_EXTRUDER_HOMING_MAX"].visibility, 0)
 
         self.assertGreater(forced.named_choices[choice].visibility, 0)

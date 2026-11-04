@@ -151,6 +151,13 @@ Worker output is captured per file. Passing files get one progress line; a faili
 labelled block containing its complete standard `unittest` traceback and failure summary. Output
 from another worker cannot appear inside that block.
 
+The run order is not the picker's order. Files start **slowest first**, by the same times the
+picker shows, so no long file is left running alone after the other workers go idle. A file's
+line is printed when it **finishes**, so lines arrive in finishing order and `[n/N]` counts
+finished files — it is not the file's number in the picker. The cost is a quiet start: nothing
+prints until the quickest of the first four (slowest) files is done, ~40 s on an M1 laptop and
+much longer on a Pi. Starting in picker order would print sooner but finish later.
+
 Typing `n` then `+nfc` then Enter runs just the NFC files. `p` recalls the last selection you
 narrowed to — a full run doesn't overwrite it, so you can alternate between a focused loop
 and a full check without retyping. `q` quits without running anything, and exits non-zero on
@@ -187,6 +194,13 @@ path**, so `test/test_mmu_leds.py` becomes `test.test_mmu_leds`:
 # -v prints each test name and its docstring as it runs
 ./venv/bin/python -m unittest -v test.test_mmu_motion
 ```
+
+Keep *suite* runs on `make` too: it is what puts the vendored kconfiglib fork
+(`installer/lib/kconfiglib`) on `PYTHONPATH`, and a bare
+`./venv/bin/python -m test.select` run fails to import the installer-half
+modules (`test_menuconfig`, anything importing `installer.build`) - import
+errors that read like test failures. The direct calls above are fine as long
+as the file stays out of that half.
 
 Your selection and the timings live in `.mmu_test_state` at the repo root. It's gitignored,
 and deleting it just means the picker falls all the way back to `test/benchmark.json` — the
@@ -249,15 +263,27 @@ the log away instead of repainting it. Useful meta-commands beyond `/help`:
 | `/scroll [N]`, `/s` | scroll back through the log (see below) |
 | `/sensor NAME on\|off\|enable\|disable` | `on/off` drives the switch through its real button callback; `enable/disable` flips `sensor_enabled` so Happy Hare treats it as **not fitted** |
 | `/place`, `/insert`, `/remove`, `/preload`, `/exhaust` | quietly place filament, actively insert it, remove it, preload it, or run it out |
+| `/tag [UID [GATE\|UNIT]]` | present an NFC tag, addressed as `MMU_NFC` addresses one. A **gate** puts it on that gate's filament; a **unit** holds it on that unit's shared reader (`off` takes it away). Bare `/tag` lists the readers and the UIDs the fake Spoolman knows |
+| `/td1 [TD [RRGGBB]] [GATE\|SERIAL]` | hold filament measuring TD in front of a TD-1 scanner; `off` takes it away, no argument reports what each one sees |
 | `/reset` | rebuild the selected profile in the same state as a fresh simulator start |
 | `/log [N]`, `/trace 0-4` | the log file, and how much detail goes into it |
 | `/timestamp [on\|off]` | stamp MMU output with the virtual clock; **on by default** at a terminal |
+| `/print [start\|end]` | act as a print in progress (or finished), so an MMU error pauses it |
+| `/print job [FILE]` | play a whole G-code print job — the built-in test job, or FILE — see below |
+| `/print resume`, `/print cancel` | continue a job held by a pause, or abandon it |
 
 ### Multi-unit
 
 Multi-unit configs work, and `ercf_vvd` — **the console default** — is one: a real two-unit
 machine, ERCF 1.1sb (9 gates, `LinearServoSelector`, encoder) plus ViViD 1.0 (4 gates,
-`IndexedSelector`), 13 gates in total. You can also point `--profile` at a multi-unit install
+`IndexedSelector`), 13 gates in total. Its `unit0` also carries a shared NFC reader and an
+off-path TD-1, so the bench gesture works out of the box on both: `/tag <uid> unit0`
+or `/td1 <td>`, then `/preload` a gate and the pending data lands on it. Only unit1's
+gates have per-gate NFC readers, so `/tag <uid> <gate>` is for gates 9-12.
+The two optional scanners are split across the units on purpose, one topology each —
+unit0 has the off-path TD-1 and the common NFC reader, unit1 a single in-path TD-1 in its
+shared bowden (`td1_devices` is one serial repeated, so all four of its gates see it) and
+per-gate NFC readers in pairs. You can also point `--profile` at a multi-unit install
 directory. Either way the harness builds every unit, with gates numbered contiguously across
 them (here `unit0` 0-8, `unit1` 9-12). Sensors
 are qualified per unit (`unit0:mmu_shared_exit`), so the header keeps the prefix and `/sensor`
@@ -294,12 +320,16 @@ reassembling a line. Output produced by a tick is printed above the prompt and t
 then rebuilt from `readline.get_line_buffer()`, so a tick landing while you are mid-command
 cannot eat what you have typed.
 
-The tick fires every `LIVE_INTERVAL` = **0.5 s** and advances by the *real* time measured
+The tick fires every `LIVE_INTERVAL` = **0.125 s** and advances by the *real* time measured
 since the last one, not by that constant — so the interval sets how often the header is
-repainted, not how fast the clock runs. Halving it (it was 1.0 s) therefore costs a second
-repaint per second, not twice the reactor work, and it is what makes an `led_effect`
-animation legible: at `frame_rate: 24` a one-second sample showed every 24th frame, which
-reads as a jump rather than a fade.
+repainted, not how fast the clock runs. Reducing it from 0.5 s increases display refreshes
+from two to eight per second without increasing LED frame calculations: at `frame_rate: 24`
+the display now samples every third frame instead of every twelfth.
+
+`make test` does not run this console timer or repaint the display. LED effects still
+calculate frames at their configured rate, but only as tests advance virtual time; there
+is no wall-clock wait between frames. The faster console refresh adds no test overhead.
+Keeping the configured effect rate in tests preserves animation and timer behavior.
 
 The clock itself costs under **1% of one core**: measured on `ercf_vvd`, `advance(60)` is
 8.6 ms of CPU per virtual second, and live mode spends that over a real second. (It was
@@ -343,7 +373,7 @@ Useful flags — `make console ARGS='...'`:
 --scrollback 5000              # lines kept for /scroll; 0 disables it
 --no-live                      # freeze the clock (default: live at a terminal)
 --no-timestamp                 # no clock in the output (default: on at a terminal)
---color 256|truecolor|16|auto  # colour depth (see below)
+--color 256|truecolor|16|auto  # color depth (see below)
 --log-dir /tmp                 # where mmu.log goes; --no-log to discard it
 --trace 4                      # full Happy Hare narration
 --no-preload                   # leave every gate empty
@@ -351,6 +381,8 @@ Useful flags — `make console ARGS='...'`:
 --no-prime                     # leave the gate map blank instead of filling it in
 --seed N                       # seed for the primed gate map (default 0, reproducible)
 --no-moonraker                 # don't attach the fake Moonraker/Spoolman
+--serve [PORT]                 # choose the web API's port (default 7125); on by default at a terminal
+--no-serve                     # don't serve the web API for Mainsail/Fluidd
 --pace FACTOR                  # 0=instant, 0.5=twice as fast as real (default), 1=real time
 --wall / --no-wall             # with --pace, whether to sleep in real time (default: interactive only)
 --script FILE                  # run non-interactively (this is how it is tested)
@@ -363,7 +395,7 @@ boots the machine cold and the calibration warnings then appear for real.
 
 Two more things happen at startup that a printer does for itself and a frozen clock does not:
 
-- **The gate map is primed** — every gate gets a vendor, material, colour and temperature, so
+- **The gate map is primed** — every gate gets a vendor, material, color and temperature, so
   the gate table and the LED `filament_color` effect have something to show instead of
   `Unknown | 200C | Unknown`. Seeded, so a session is reproducible; `--seed N` for a different
   spread, `--no-prime` for none.
@@ -470,6 +502,118 @@ Unit : ------------- unit0 -------------
 `#` and not `!`: `!! …` is already a command that raised and `?? …` one that does not
 exist, so a lone `!` would read as a quieter error rather than as a note.
 
+### Playing a print job — `/print job`
+
+`/print job` plays a print from start to finish: Happy Hare's standard start sequence, the
+toolchanges, and its standard end. It is the quickest way to see what a whole print does to
+the console and to `mmu.log`:
+
+```text
+> /print job
+# Print job print_job.gcode: 118 lines, molded to 13 gates, then processed by the Happy Hare preprocessor (PrusaSlicer)
+Happy Hare initialized ready for print (no filament preloaded)
+--------- Slicer MMU Tool Summary ---------
+...
+# Print job print_job.gcode complete: 86 lines, 43.0mm extruded, 3 toolchanges, 36s
+# Ignored (not simulated): G28 x1, M140 x2, M190 x1
+```
+
+With no FILE it plays the **built-in job**, [support/print_job.gcode](support/print_job.gcode):
+three short layers and three toolchanges, T0 → T1 → T2 → T0, between
+`MMU_START_SETUP`/`MMU_START_CHECK`/`MMU_START_LOAD_INITIAL_TOOL` and `MMU_END`. It is
+**molded to the loaded profile** before it plays — its tool numbers are folded onto the gates
+that exist and its slicer metadata comes from the gate map, exactly `num_gates` long — so it
+is an end-to-end test that should run clean on any profile. When it doesn't, the profile or
+the harness has a problem worth looking at.
+
+**Any other file plays as written.** It is prepared the way Moonraker prepares an upload:
+- a file carrying `; processed by HappyHare` plays unchanged;
+- anything else goes through Happy Hare's real preprocessor (`components/mmu_server.py`), which
+  fills the `!placeholders!` and turns `T<n>` into `MMU_CHANGE_TOOL … NEXT_POS`. Metadata the
+  slicer footer doesn't provide is filled from the gates the file's tools map to;
+- a file with no recognised slicer header is played unprocessed, as Moonraker would leave it.
+
+A file is never molded, so one that needs five tools on a four-gate MMU fails inside Happy
+Hare, as it would on a printer.
+
+What is simulated:
+
+- **The print lifecycle.** `print_stats` and `idle_timeout` move as `virtual_sdcard` would
+  move them, so Happy Hare's automatic job start/end detection runs for real.
+- **Macro bodies, for the duration of the job only.** `T<n>`, `MMU_START_SETUP`,
+  `MMU_START_CHECK`, `MMU_START_LOAD_INITIAL_TOOL` and `MMU_END` run their real Jinja. The
+  park, cut and purge macros stay recorded no-ops (§"Three things that will look like bugs"),
+  and at the prompt `T1` is silent again.
+- **Extrusion.** `G0`–`G3` E, in absolute (`M82`) or relative (`M83`, or anything after `G91`)
+  mode, with `G92` re-basing, go through the fake `gcode_move` to the toolhead and so into the
+  filament model and the encoder while the gate is synced. XYZ only costs time.
+- **The extruder heater.** `M104`/`M109` (and `SET_HEATER_TEMPERATURE`/`TEMPERATURE_WAIT`) set
+  the target, and a wait arrives at it. The `machine` header shows `nozzle=temp/target`.
+  Other heaters are ignored.
+- **Time.** Each move costs distance ÷ feedrate, `G4` costs its dwell, and the clock advances
+  in half-second slices as the job plays, so timers fire across the print. Nothing sleeps, so
+  even a long real print plays in seconds.
+
+Anything else the harness doesn't know — bed and chamber heaters, `G28`, `EXCLUDE_OBJECT_*`,
+`M73`, your own `PRINT_START` — is ignored and counted in the closing summary. If your slicer
+start G-code calls Happy Hare's start macros from inside your own `PRINT_START`, that macro
+doesn't exist here: call the `MMU_START_*` lines directly, as the built-in job does.
+
+**A pause holds the job.** When the machine pauses, the job stops at that line and says so. Fix
+what went wrong, `RESUME` (or `MMU_UNLOCK` then `RESUME`), and `/print resume` carries on from
+the next line; `/print cancel` abandons it. Ctrl-C holds a job the same way. As in a real SD
+print, a command that fails ends the job in `error`, and a `CANCEL_PRINT` in the file ends it
+`cancelled`; neither can be resumed. A `T<n>` for a tool the MMU doesn't have also ends it in
+`error`, where Klipper would only reply "Unknown command" and print on. `/print job` works in `--script` too, which makes a
+reproducible run:
+
+```bash
+echo '/print job' > /tmp/job.txt
+make console ARGS='--profile boxturtle --script /tmp/job.txt'
+```
+
+### Driving a real Mainsail or Fluidd — the web API
+
+At a terminal, the console also serves a Moonraker-compatible API on `http://127.0.0.1:7125`
+(the next free port if that is taken, so it can sit beside a real Moonraker), so an
+unmodified Mainsail (or Fluidd) can connect to the simulator: the MMU panel shows live state,
+the console shows everything Happy Hare says, and `RESUME`, `UNLOCK` and anything else typed
+or clicked in the UI runs in the session as if typed at the prompt. The banner says where it
+is, and `/web` repeats it with the commands to connect:
+
+```text
+Web API (for Mainsail/Fluidd): host 127.0.0.1  port 7125  (http://127.0.0.1:7125)
+```
+
+It is a development and documentation aid for seeing what the web UIs really do with Happy
+Hare, such as the pause dialog; it is not a Moonraker clone. A method the UI asks for that is
+not served gets a JSON-RPC error, and `http://127.0.0.1:7125/sim/unsupported` lists them.
+`--no-serve` turns it off, and `--serve PORT` picks the port. Scripts and tests never start
+it unless `--serve` is given, so they cannot fight over the port.
+
+Point Mainsail at it by running its dev server with that address, from a Mainsail checkout:
+
+```bash
+VUE_APP_HOSTNAME=127.0.0.1 VUE_APP_PORT=7125 npx vite serve
+```
+
+or, for a built Mainsail or Fluidd, add a printer at `127.0.0.1:7125` in its connection
+dialog.
+
+To see the pause dialog, pretend a print is running and make something fail:
+
+```text
+/print start
+/exhaust 1
+MMU_CHANGE_TOOL TOOL=1
+```
+
+Happy Hare sends the dialog as `// action:prompt_*` host command lines, which reach the UI
+as Klipper would send them and are kept out of the console text.
+
+Requests are only served between keystrokes, from the same idle tick as `/live`, so it needs a
+terminal. Everything lives in `test/hh/webui_bridge.py`, which is standard library only.
+
 ### The log
 
 Happy Hare writes its own `mmu.log`, and the console keeps it at **`/tmp/mmu.log`**, replaced
@@ -491,14 +635,14 @@ how the console runs.
 
 ### If a warning shows up on a pink background
 
-Run `make console ARGS='--color 16'`. Happy Hare's console messages carry HTML colours which
+Run `make console ARGS='--color 16'`. Happy Hare's console messages carry HTML colors which
 the console translates to ANSI, and 24-bit `ESC[38;2;R;G;Bm` is **not** safely ignored by a
 terminal that lacks truecolor — the channels get read as separate SGR codes. HH's warning
-colour is `#FF69B4`, whose green channel is `0x69` = 105, and SGR 105 means *bright magenta
+color is `#FF69B4`, whose green channel is `0x69` = 105, and SGR 105 means *bright magenta
 background*. So the warning arrives on a pink background.
 
 `--color` defaults to `auto`, which only uses truecolor when `$COLORTERM` says `truecolor`
-or `24bit` and otherwise emits 256-colour (`38;5;N`). `--color 16` is the belt-and-braces
+or `24bit` and otherwise emits 256-color (`38;5;N`). `--color 16` is the belt-and-braces
 option: it emits nothing but plain `30-37`/`90-97`, which no terminal can misread.
 
 The header is **pinned to the top of the terminal** while output scrolls beneath it, and it
@@ -519,7 +663,7 @@ it falls back to reprinting above each prompt.
   led unit1 exit     ██████████████ ██████████████ ██████████████ ██████████████  [gate_status]
 ```
 
-One block per **physical** LED, in that LED's own colour: `██` lit, `▓▓` lit but too dim to
+One block per **physical** LED, in that LED's own color: `██` lit, `▓▓` lit but too dim to
 show honestly, `··` off (grey). The LEDs of one gate run together and the gates are separated
 by a space, so ViViD's seven-per-gate strip reads as four groups rather than 28
 undifferentiated cells — and fits in 100 columns, which the ungrouped 117-column version did
@@ -533,10 +677,10 @@ below 25% is therefore painted at 25% with its hue kept, and the lighter glyph i
 you the brightness on screen is a floor rather than a reading.
 
 A lit LED used to be `##`, which was a problem rather than a shorthand: the glyph was painted
-in the LED's colour, and a white or grey LED — `mmu_breathing_white_fast` on `selecting`,
-`mmu_sparkle` on `complete`, `white_light` for an uncoloured gate under `filament_color` — came
+in the LED's color, and a white or grey LED — `mmu_breathing_white_fast` on `selecting`,
+`mmu_sparkle` on `complete`, `white_light` for an uncolored gate under `filament_color` — came
 out indistinguishable from ordinary text, because the terminal's default foreground *is* white.
-A block in the same colour still reads as a block.
+A block in the same color still reads as a block.
 
 All four segments are shown. `ercf_vvd`'s unit0 configures every one of them (9 exit, 9 entry,
 4 status, 3 logo) precisely so every effect path has somewhere to land. Note `define_on` in
@@ -628,7 +772,8 @@ leaves the gate-0 gear pins empty and fails with `Invalid pin description ''`.
    renders the body, so `T1`, the print start/end and the park/cut/purge sequences produce
    **silence**. Use `MMU_CHANGE_TOOL TOOL=1`. The console notices a bare `T<n>` and says so.
    `MMU_COLD_PULL` is the deliberate exception: the console runs its body and simulates its
-   heater waits instantly so the complete maintenance workflow can be exercised.
+   heater waits instantly so the complete maintenance workflow can be exercised. `/print job`
+   is the other: while a job plays, `T<n>` and the print start/end macros run for real.
 2. **A physical selector must be calibrated and homed before it can select a gate.** The
    console does that for you at startup (`boot(calibrate=True, pre_bootup=...)`);
    in a test, call `hh.boot(calibrate=True)`, or `hh.boot()` then `hh.calibrate()`, then
@@ -706,10 +851,16 @@ The test files, grouped by what they're about:
 | `test_mmu_bootup.py` | 36 | config load → `klippy:connect` → `klippy:ready` → `mmu:bootup` |
 | `test_mmu_profiles.py` | 43 | the same checks across the bootable machine profiles |
 | `test_mmu_adc_compat.py` | 14 | the Klipper-version ADC compatibility shim |
+| `test_mmu_buttons_compat.py` | 1 | switch sensors on Klipper without `register_debounce_button` |
+| `test_mmu_hall_endstop.py` | 5 | the hall-effect `[mmu_toolhead]` endstop booting on ADC pins and following their readings |
 | **Filament handling** | | |
 | `test_mmu_motion.py` | 56 | loading, parking, preloading filament |
 | `test_mmu_toolchange.py` | 30 | `MMU_CHANGE_TOOL`, load and unload end to end |
+| `test_mmu_confirm_loaded.py` | 20 | the in-print "loaded" sensor check after a toolchange or RESUME, and where it must not fire |
+| `test_mmu_pressure_advance.py` | 7 | pressure advance zeroed and restored around tip forming and purging; the already-0 debug note |
 | `test_mmu_encoder.py` | 36 | gate homing by encoder motion instead of by switch |
+| `test_mmu_extruder_load.py` | 8 | the encoder check on the final load to the nozzle, and skipping its shortfall test once a buffer has confirmed extruder grip |
+| `test_mmu_flowguard.py` | 11 | encoder FlowGuard on an encoder shared by two units: arming, handover on toolchange, pause/resume, runout |
 | `test_mmu_endless_spool.py` | 18 | runout detection, clog-vs-runout, gate remapping |
 | **NFC and Spoolman** | | |
 | `test_mmu_nfc.py` | 29 | NFC readers are configured and instantiated |
@@ -723,7 +874,9 @@ The test files, grouped by what they're about:
 | `test_mmu_roundtrip.py` | 54 | Klipper and Moonraker talking to each other |
 | **Presentation** | | |
 | `test_mmu_leds.py` | 34 | LED effects, flashes, the pending overlay |
-| `test_mmu_console.py` | 205 | the interactive console of §1a — rendering, command dispatch |
+| `test_mmu_console.py` | 211 | the interactive console of §1a — rendering, command dispatch |
+| `test_mmu_print_job.py` | 10 | `/print job` end to end, molding the built-in job, and the fake G-code it needs: parsing, extrusion modes, the extruder heater |
+| `test_mmu_webui_bridge.py` | 8 | the Moonraker-compatible web API the console serves: handshake, status, gcode, and the pause dialog reaching a UI |
 | `test_mmu_dev_test.py` | 25 | every `_MMU_TEST` developer probe — breadth, not depth |
 
 Counts as the picker reports them.
@@ -746,7 +899,8 @@ Green is not the same as covered. Roughly where things stand:
 | Selector homing and selection | **good** | `LinearSelector`, `LinearServoSelector`, `LinearMultiGearSelector`, `RotarySelector`, `IndexedSelector`, `ServoSelector`, and `VirtualSelector` are booted or exercised — `test_mmu_selector.py`. `MacroSelector` direct-mode dispatch is covered without executing a user macro |
 | Calibration | **partial** | seeded by default for speed, but `MMU_CALIBRATE_SELECTOR` (manual and `AUTO=1`) and `MMU_CALIBRATE_BOWDEN` run for real — `test_mmu_selector.py` |
 | Developer commands (`_MMU_TEST`) | **partial** | every option is run and must not raise — `test_mmu_dev_test.py`. What the stress probes *provoke* is step-generation timing the harness does not model |
-| Espooler, FlowGuard | **none** | |
+| Espooler | **partial** | only spool-weight power scaling and its gate-map weights — `test_mmu_espooler.py` |
+| FlowGuard | **none** | |
 | Multi-unit machines | **good** | `ercf_vvd` renders, boots and loads on both units |
 | Klipper motion and timing | **none** | out of scope by design — see §9 |
 
@@ -779,7 +933,7 @@ timeout, a 5-second warning window, a 2.5-second boot delay. Real waiting would 
 suite unusable. `advance()` runs every timer that falls due, in order.
 
 **The filament model.** Two numbers per gate: where the filament's leading edge (the *tip*)
-is and where its trailing end (the *tail*) is, in millimetres, measured so that `0` is the
+is and where its trailing end (the *tail*) is, in millimeters, measured so that `0` is the
 gate's sensor. Filament occupies everything between them, so a switch reads "triggered"
 when it sits inside that span. When Happy Hare commands a move, the harness works out which
 sensor trips first and how far the filament actually gets. Default layout:
@@ -876,10 +1030,12 @@ templates** from them, so a broken template shows up as a test failure.
 | `chameleon` | 3D Chameleon: the only `RotarySelector`, and the only machine with no servo — one gear motor reversed on half the gates, and "release" means driving the carriage to the opposing gate's offset |
 | `pico_mmu` | PicoMMU's `ServoSelector`; deliberately boots uncalibrated because its gate angles depend on the physical cam build |
 | `mmx` | MMX's `ServoSelector` with its vendor gate-angle order; also used for a full load/unload selector test |
-| `emu` | 5 gates and the only shipped profile with an analog buffer sensor |
+| `quattrobox_v2` | QuattroBox v2 on its Chameleon X5 board: eject buttons, Binky encoder, PSF-style proportional buffer, heater on two 3950 thermistors, two BME280s, and a shared PN532 reader and bowden TD-1 |
+| `emu` | 5 gates; with `quattrobox_v2`, the shipped profiles with an analog buffer sensor |
 | `encoder` | BoxTurtle plus an encoder, homing to it instead of to the gate switch |
 | `nfc_single` | one common NFC reader |
 | `nfc_per_gate` | one reader per gate |
+| `nfc_per_gate_sparse` | per-gate readers with gate 2 switched off at the menuconfig toggle, its reader name deliberately left behind — the sparse per-gate list on a single unit |
 | `nfc_pn532_uart` | one common PN532 over HSU/UART — the only host-serial reader |
 | `nfc_spoolman` | per-gate NFC + Spoolman enabled + auto-create |
 
@@ -970,7 +1126,7 @@ involved. `RoundTrip` pumps messages between the two sides until everything sett
 
 ## 5. Six things that will bite you
 
-These are all real behaviours, learned by getting them wrong.
+These are all real behaviors, learned by getting them wrong.
 
 **1. Placing filament is an event.** Covering the entry switch is an *insert*, and Happy
 Hare responds by preloading that gate. `place_filament()` suppresses that by default so
@@ -1043,7 +1199,7 @@ log file at `hh.tmpdir + '/mmu.log'`.
 ```python
 print(hh.filament().history)
 # [(0, 100.0, 'homing -> mmu_exit_0'), (0, -100.0, 'move')]
-#  gate, millimetres, why
+#  gate, millimeters, why
 print(hh.filament().describe(0))
 # gate 0 tip=-100.0 mmu_entry_0=0 mmu_exit_0=0 mmu_shared_exit=0 filament_compression=0
 ```
@@ -1075,7 +1231,7 @@ A reasonable loop:
    fix and pass after — check that, or you don't know it's testing anything.
 
 **When you find a bug you're not fixing now**, write it as an `@unittest.expectedFailure`
-describing the correct behaviour, with a comment explaining the cause. It documents the
+describing the correct behavior, with a comment explaining the cause. It documents the
 problem, proves it's real, and cleans itself up when fixed.
 
 **Prefer driving real commands** (`hh.run_gcode('MMU_PRELOAD GATE=1')`) over calling
@@ -1095,15 +1251,15 @@ per-area picture; these are the structural limits behind it.
 - **No real hardware protocol.** The RC522 init sequence is exercised, but tag *reads* are
   faked at the driver level. The PN532 and PN7160 I²C drivers aren't covered at all.
 - **Proprietary tag formats are untested.** Bambu, Creality, QIDI and Anycubic parsing
-  needs captured dumps from real spools — synthesising them would only prove the test
+  needs captured dumps from real spools — synthesizing them would only prove the test
   agrees with itself.
 - **Encoder and gear calibration are seeded, never measured.** `MMU_CALIBRATE_ENCODER` and
   `MMU_CALIBRATE_GEAR` would only re-derive the numbers the harness generates its moves
   from, so they would confirm arithmetic rather than test anything.
 - **Macros load but mostly don't run.** The shipped `config/macros/*.cfg` are read
-  verbatim so sequences can find them, but a test that asserts on macro *behaviour* would
+  verbatim so sequences can find them, but a test that asserts on macro *behavior* would
   be testing Klipper's Jinja, not Happy Hare.
-- **The fakes could be wrong.** They're written against real Klipper's behaviour, but
+- **The fakes could be wrong.** They're written against real Klipper's behavior, but
   where they diverge, a test can pass while the real thing fails.
 
 Green means "Happy Hare's logic does what we think" — not "this will work on a printer".

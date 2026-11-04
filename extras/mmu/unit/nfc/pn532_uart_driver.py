@@ -1,7 +1,18 @@
-# klippy/extras/mmu/unit/nfc/pn532_uart_driver.py
+# Happy Hare MMU Software
+# PN532 HSU (High Speed UART) transport
 #
-# PN532 HSU (High Speed UART) transport, over a host serial port.
-# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2022-2026  moggieuk#6538 (discord)
+#                          moggieuk@hotmail.com
+#
+# Goal: Drive a PN532 over a host serial port - the one reader transport that is
+#       not mediated by an MCU
+#
+# (\_/)
+# ( *,*)
+# (")_(") Happy Hare Ready
+#
+# This file may be distributed under the terms of the GNU GPLv3 license, or
+# (at your option) any later version.
 #
 # PN532 HSU protocol overview
 # ───────────────────────────
@@ -83,7 +94,7 @@ class _HSUFrameReader:
     This class is the whole difference between UART and the query-then-read
     transports. It owns an accumulator, discards leading padding and any garbage
     before a start code, holds partial frames across reactor ticks, verifies both
-    checksums, and hands out only COMPLETE frames — normalised into the
+    checksums, and hands out only COMPLETE frames — normalized into the
     preamble-first shape so check_preambled_frame()'s fixed offsets apply.
 
     It never blocks, never sleeps and never consults a clock. pump() is the ONLY
@@ -324,7 +335,7 @@ class PN532UARTDriver(_PN532Base):
         construction happens at config time, where no driver does I/O, and a
         missing USB adapter must not stop klippy from starting. The first real
         open therefore happens inside init(), whose RuntimeError the NFC manager
-        already handles (it initialises readers a couple of seconds after MMU
+        already handles (it initializes readers a couple of seconds after MMU
         bootup, not at klippy:connect).
         """
         if self._serial is not None:
@@ -491,7 +502,7 @@ class PN532UARTDriver(_PN532Base):
         looking"; anything else ends the wait.
 
         Frames match_fn rejects are DISCARDED rather than left in place, and that
-        is the one deliberate behavioural difference from the I2C and SPI
+        is the one deliberate behavioral difference from the I2C and SPI
         transports. There, a stale response sits in the chip and _recv() can fail
         fast the moment _check_frame() rejects a read. Here the OS buffer can
         legitimately hold a late frame from an abandoned exchange, so skipping it
@@ -627,7 +638,7 @@ class PN532UARTDriver(_PN532Base):
         It can afford to be cheap because correctness rests on FRAME-KIND
         FILTERING, not on the drain: anything that survives is classified and
         discarded for free by _probe_fetch_response and _await. The drain is an
-        optimisation, not the guarantee.
+        optimization, not the guarantee.
         """
         self._probe_stage = None
         try:
@@ -722,7 +733,7 @@ class PN532UARTDriver(_PN532Base):
 
     def low_level_ready_read(self):
         """
-        Synthesised ready/busy byte: [0x01] ready, [0x00] busy.
+        Synthesized ready/busy byte: [0x01] ready, [0x00] busy.
 
         UART has no status byte at all. This reports whether a COMPLETE frame is
         buffered, so the console's "ready?" step reads the same as on I2C/SPI.

@@ -238,6 +238,87 @@ class TestUnload(ToolchangeTestCase):
         """
         self.assertIn('gcode_macro _MMU_FORM_TIP', self.hh.printer.objects)
 
+    def test_empty_tip_forming_macro_skips_tip_forming(self):
+        """
+        menuconfig's slicer-only tip forming choice renders form_tip_macro empty. Out of a
+        print HH still owns the tip, and with no macro an unload must just go ahead without
+        one - as an empty purge_macro skips purging - not fail looking up macro ''.
+        """
+        self.hh.mmu.p.form_tip_macro = ''
+        at = len(self.hh.console)
+        self.hh.run_gcode('MMU_UNLOAD')
+        self.assertEqual(self.hh.errors, [])
+        self.assertEqual(self.hh.mmu.filament_pos, FILAMENT_POS_UNLOADED)
+        self.assertNotIn('Forming tip...', self.hh.console[at:])
+
+
+class TestUnloadSequenceMacro(ToolchangeTestCase):
+    """gcode_unload_sequence: 1 runs the shipped _MMU_UNLOAD_SEQUENCE and its step commands"""
+    PROFILE = '3ms'
+
+    def test_full_unload_through_the_sequence_macro(self):
+        self.hh.mmu.select_gate(0)
+        self.hh.run_gcode('MMU_LOAD')
+        self.assertEqual(self.hh.mmu.filament_pos, FILAMENT_POS_LOADED)
+        self.hh.mmu.p.gcode_unload_sequence = 1
+        self.hh.printer.harness_macro_effects['_MMU_UNLOAD_SEQUENCE'] = lambda m, g: m.run_body(g)
+        self.hh.run_gcode('MMU_UNLOAD')
+        self.assertEqual(self.hh.errors, [])
+        self.assertEqual(self.hh.mmu.filament_pos, FILAMENT_POS_UNLOADED)
+
+
+class TestUnloadSequenceMacroParking(ToolchangeTestCase):
+    """The sequence macro must park where the built-in unload does, bowden included"""
+
+    def setUp(self):
+        self.hh = session(self.PROFILE)
+        self.hh.boot(calibrate=True)
+        self.fil = self.hh.filament()
+        self.hh.place_filament(0, position=TIP_AT_GATE)
+        self.hh.run_gcode('MMU_PRELOAD GATE=0')
+        self.hh.heat_extruder(220)
+        self.hh.mmu.select_gate(0)
+
+    def _unload_moves(self):
+        start = len(self.fil.history)
+        self.hh.run_gcode('MMU_UNLOAD')
+        self.assertEqual(self.hh.errors, [])
+        return [(round(delta, 1), reason) for _, delta, reason in self.fil.history[start:]]
+
+    def test_macro_unloads_like_the_built_in_sequence(self):
+        self.hh.run_gcode('MMU_LOAD')
+        built_in = self._unload_moves()
+        built_in_park = self.fil.tip[0]
+
+        self.hh.run_gcode('MMU_LOAD')
+        self.hh.mmu.p.gcode_unload_sequence = 1
+        self.hh.printer.harness_macro_effects['_MMU_UNLOAD_SEQUENCE'] = lambda m, g: m.run_body(g)
+        self.assertEqual(self._unload_moves(), built_in)
+        self.assertAlmostEqual(self.fil.tip[0], built_in_park, places=1)
+
+    def test_an_aborted_macro_leaves_no_offset_for_a_later_step(self):
+        self.hh.run_gcode('MMU_LOAD')
+        self.hh.mmu.p.gcode_unload_sequence = 1
+        gcode = self.hh.printer.lookup_object('gcode')
+
+        def abort_after_toolhead(macro, gcmd):
+            gcode.run_script_from_command('_MMU_STEP_UNLOAD_TOOLHEAD')
+            self.assertGreater(self.hh.mmu.step_unload_overshoot, 0.)
+            raise gcmd.error("simulated macro failure")
+
+        self.hh.printer.harness_macro_effects['_MMU_UNLOAD_SEQUENCE'] = abort_after_toolhead
+        self.hh.run_gcode('MMU_UNLOAD')
+        self.assertNotEqual(self.hh.errors, [])
+
+        self.hh.mmu.p.gcode_unload_sequence = 0
+        del self.hh.gcode.errors[:]
+        self.hh.run_gcode('MMU_RECOVER')
+        self.hh.run_gcode('MMU_UNLOAD')
+        self.hh.run_gcode('MMU_LOAD')
+        self.assertEqual(self.hh.errors, [])
+        self.assertEqual(self.hh.mmu.step_unload_overshoot, 0.)
+        self.assertEqual(self.hh.mmu.step_unload_homing_buffer, 0.)
+
 
 class TestToolChange(ToolchangeTestCase):
     PRELOAD_GATES = (0, 1, 2)
@@ -293,7 +374,7 @@ class TestToolChange(ToolchangeTestCase):
 
         Consequence: anything driven purely by a macro body - Tx, the print start/end
         sequences, park/cut/purge - is NOT covered. Address the underlying command
-        (MMU_CHANGE_TOOL) to test the real behaviour.
+        (MMU_CHANGE_TOOL) to test the real behavior.
         """
         self.assertIn('gcode_macro T1', self.hh.printer.objects)
         before = self.hh.mmu.tool_selected
@@ -413,6 +494,20 @@ class TestPreloadWhilePaused(ToolchangeTestCase):
         self.hh.run_gcode('MMU_PRELOAD GATE=2')
         self.assertIn('printing', ' '.join(self.hh.errors).lower())
         self.assertEqual(self.hh.mmu.gate_selected, 0)
+
+
+class TestWaitForTemp(ToolchangeTestCase):
+    PRELOAD_GATES = ()
+
+    def test_missing_fan_warning_names_the_user_setting(self):
+        # The stub printer has no [fan]
+        self.hh.printer.harness_macro_effects['_WAIT_FOR_TEMP'] = (
+            lambda macro, gcmd: macro.run_body(gcmd))
+        tip_vars = self.hh.printer.lookup_object('gcode_macro _MMU_FORM_TIP_VARS')
+        tip_vars.variables = dict(tip_vars.variables, toolchange_fan_assist=True, toolchange_temp=200)
+        self.hh.run_gcode('_WAIT_FOR_TEMP')
+        self.assertTrue(any("Ignoring 'variable_toolchange_fan_assist' option" in e.replace('\xa0', ' ')
+                            for e in self.hh.errors), self.hh.errors)
 
 
 if __name__ == '__main__':

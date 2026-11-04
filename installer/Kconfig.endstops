@@ -10,6 +10,9 @@
 #   PARAM_GATE_PARKING_DISTANCE
 #   PARAM_GATE_HOMING_MAX
 #   PARAM_GATE_LOAD_ATTEMPTS
+#   PARAM_BOWDEN_HOMING_MAX
+#   PARAM_BOWDEN_LOAD_HOMING_BUFFER
+#   PARAM_BOWDEN_UNLOAD_HOMING_BUFFER
 #   PARAM_EXTRUDER_HOMING_ENDSTOP
 #   PARAM_EXTRUDER_HOMING_MAX
 
@@ -174,10 +177,20 @@ menu "Endstops and Bowden movement"
   comment "No bowden move required - gate homing to extruder"
     depends on !PARAM_REQUIRE_BOWDEN_MOVE
 
+  config PARAM_BOWDEN_HOMING_MAX
+    float
+    prompt "Maximum bowden move         " if PARAM_REQUIRE_BOWDEN_MOVE
+    default 2000
+    keep_when_hidden
+    help
+      Maximum attempted bowden move (mm) used during calibration.
+      Set this larger than the actual Bowden length.
+
   config PARAM_BOWDEN_LOAD_HOMING_BUFFER
     float
     prompt "Bowden load homing buffer   " if PARAM_REQUIRE_BOWDEN_MOVE
     default 20
+    keep_when_hidden
     help
       Distance to reduce fast bowden load to prevent collisions
       and allow for accurate extruder homing
@@ -186,6 +199,7 @@ menu "Endstops and Bowden movement"
     float
     prompt "Bowden unload homing buffer " if PARAM_REQUIRE_BOWDEN_MOVE
     default 40
+    keep_when_hidden
     help
       Distance to reduce fast bowden unload to allow for accurate
       gate homing and no gate overshoot when filament is being unloaded
@@ -218,11 +232,11 @@ menu "Endstops and Bowden movement"
     def_bool y if MMU_HAS_SENSOR_TOOLHEAD && PARAM_EXTRUDER_FORCE_HOMING
 
   choice CHOICE_EXTRUDER_HOMING_ENDSTOP
-    prompt "Extruder endstop method     " if SHOW_ACTIVE_EXTRUDER_HOMING
+    prompt "Extruder endstop method     "
     help
       Select how Happy Hare establishes the extruder gear reference before
-      loading toward the nozzle. This can be "none" when a toolhead sensor
-      provides the next precise reference point.
+      loading toward the nozzle. With a toolhead sensor it is only used if
+      homing is forced, but bowden calibration still needs it, so avoid "none".
 
     # mmu_type preferences (first true wins)
     default CHOICE_EXTRUDER_HOMING_ENDSTOP_EXTRUDER    if PREFERS_CHOICE_EXTRUDER_HOMING_ENDSTOP_EXTRUDER
@@ -234,7 +248,7 @@ menu "Endstops and Bowden movement"
     # Heuristic fallbacks
     default CHOICE_EXTRUDER_HOMING_ENDSTOP_COMPRESSION if \
         (MMU_HAS_SENSOR_BUFFER_COMPRESSION || MMU_HAS_SENSOR_BUFFER_PROPORTIONAL) && \
-        (CHOICE_BUFFER_SPRING_STATE_TENSION || CHOICE_BUFFER_SPRING_STATE_NEUTRAL)
+        (PARAM_BUFFER_SPRING_STATE = "tension" || PARAM_BUFFER_SPRING_STATE = "neutral")
     default CHOICE_EXTRUDER_HOMING_ENDSTOP_EXTRUDER    if MMU_HAS_SENSOR_EXTRUDER
     default CHOICE_EXTRUDER_HOMING_ENDSTOP_ENCODER     if MMU_HAS_ENCODER
     default CHOICE_EXTRUDER_HOMING_ENDSTOP_TOUCH       if MMU_HAS_SENSOR_GEAR_TOUCH
@@ -304,7 +318,8 @@ menu "Endstops and Bowden movement"
 
   config PARAM_EXTRUDER_HOMING_MAX
     float
-    prompt "Extruder homing max         " if SHOW_ACTIVE_EXTRUDER_HOMING && !(CHOICE_EXTRUDER_HOMING_ENDSTOP_NONE || CHOICE_EXTRUDER_HOMING_ENDSTOP_ADVANCE_ONLY)
+    prompt "Extruder homing max         " if (SHOW_ACTIVE_EXTRUDER_HOMING && !(CHOICE_EXTRUDER_HOMING_ENDSTOP_NONE || CHOICE_EXTRUDER_HOMING_ENDSTOP_ADVANCE_ONLY)) || \
+        CHOICE_EXTRUDER_HOMING_ENDSTOP_ENCODER || CHOICE_EXTRUDER_HOMING_ENDSTOP_TOUCH
     default 100
     help
       The maximum distance filament will travel attempting to home
@@ -312,7 +327,7 @@ menu "Endstops and Bowden movement"
 
   config PARAM_EXTRUDER_COLLISION_HOMING_CURRENT
     int
-    prompt "Collision % homing current  " if SHOW_ACTIVE_EXTRUDER_HOMING && (CHOICE_EXTRUDER_HOMING_ENDSTOP_ENCODER || CHOICE_EXTRUDER_HOMING_ENDSTOP_TOUCH)
+    prompt "Collision % homing current  " if CHOICE_EXTRUDER_HOMING_ENDSTOP_ENCODER || CHOICE_EXTRUDER_HOMING_ENDSTOP_TOUCH
     range 10 100
     default 30
     help
@@ -336,5 +351,17 @@ menu "Endstops and Bowden movement"
     default 40
     help
       Additional distance to advance in order to attempt to home to toolhead sensor
+
+  # A unit setting: a single unit shows it with the toolhead dimensions instead
+  comment "_" if MULTI_UNIT
+  comment "_Toolhead unloading" if MULTI_UNIT
+
+  config PARAM_TOOLHEAD_UNLOAD_SAFETY_MARGIN
+    float
+    prompt "Unload safety margin        " if MULTI_UNIT
+    default 10
+    help
+      Extra movement (mm) added to the extruder unload movement to ensure filament is free of the extruder.
+      This provides tolerance for slightly incorrect configuration or extruder slippage.
 
 endmenu

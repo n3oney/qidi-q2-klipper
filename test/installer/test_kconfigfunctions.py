@@ -45,14 +45,30 @@ class TestBasicFunctions(unittest.TestCase):
         self.assertEqual(funcs.word_at(None, None, 'can0:a can1:b', '2'), 'can1:b')
         self.assertEqual(funcs.word_at(None, None, 'can0:a', '2'), '')
 
+    def test_last_index_of_a_count(self):
+        self.assertEqual(funcs.last_index(None, None, '12'), '11')
+        self.assertEqual(funcs.last_index(None, None, '1'), '0')
+
     def test_padding_never_truncates(self):
         self.assertEqual(funcs.pad(None, None, '5', 'x'), 'x    ')
         self.assertEqual(funcs.pad(None, None, '2', 'long'), 'long')
+
+    def test_padding_counts_only_displayed_characters(self):
+        # Markup is zero width; a [[VALUE:SYM:w]] shows as w characters
+        self.assertEqual(funcs.pad(None, None, '6', '[[B]]ab[[/B]]'), '[[B]]ab[[/B]]    ')
+        self.assertEqual(funcs.pad(None, None, '8', 'a[[VALUE:X:5]]'), 'a[[VALUE:X:5]]  ')
+        self.assertEqual(funcs.pad(None, None, '3', 'a[[VALUE:X]]'), 'a[[VALUE:X]]  ')
+        self.assertEqual(funcs.display_width('[[C:2]]x[[/C]] [[RESET]]'), 2)
+        self.assertEqual(funcs.display_width('[[NOT_A_TAG]]'), 13)
 
     def test_multiline_uses_literal_newline_escapes(self):
         self.assertEqual(funcs.multiline(None, None, 'one\ntwo'), r'one\ntwo\n')
         self.assertEqual(funcs.multiline(None, None, r'one\ntwo'), r'one\ntwo\n')
         self.assertEqual(funcs.multiline(None, None, ''), '')
+
+    def test_newline_is_a_real_newline(self):
+        self.assertEqual(funcs.newline(None, None), '\n')
+        self.assertEqual(funcs.functions['hh-newline'][1:], (0, 0))
 
 
 class TestConnectionFunctions(unittest.TestCase):
@@ -100,10 +116,18 @@ class TestConnectionFunctions(unittest.TestCase):
 
 class TestMenuTextFunctions(unittest.TestCase):
 
+    def test_pin_example_uses_the_live_unit_name(self):
+        self.assertEqual(funcs.pin_example(None, None, ''),
+                         'Eg:      ^[[VALUE:UNIT_NAME]]:gpio4, ![[VALUE:UNIT_NAME]]:PA4')
+        self.assertEqual(funcs.pin_example(None, None, 'y'), 'Eg:      ^unit0:gpio4, !unit0:PA4')
+
     def test_single_and_multi_unit_text(self):
         message = 'Happy Hare v4.0.0'
         suffix = funcs.unit_suffix(None, None, 'unit0')
-        self.assertEqual(suffix, 'Unit: [[B]]unit0[[/B]]')
+        self.assertEqual(suffix, 'Unit: [[B]][[VALUE:UNIT_NAME]][[/B]]')
+        self.assertEqual(funcs.unit_suffix(None, None, 'unit0', '20'),
+                         'Unit: [[B]][[VALUE:UNIT_NAME:20]][[/B]]')
+        self.assertEqual(funcs.unit_suffix(None, None, ''), '')
         self.assertEqual(funcs.menu_title(None, None, '', message, suffix),
                          message + ' Configuration - ' + suffix)
         self.assertEqual(funcs.menu_caption(None, None, '', message, suffix),

@@ -1,8 +1,23 @@
+# Happy Hare MMU Software
+# Kconfig preprocessor functions
+#
+# Copyright (C) 2022-2026  moggieuk#6538 (discord)
+#                          moggieuk@hotmail.com
+#
+# (\_/)
+# ( *,*)
+# (")_(") Happy Hare Ready
+#
+# This file may be distributed under the terms of the GNU GPLv3 license.
+#
+
 """Happy Hare Kconfig preprocessor functions."""
 
 import io
 import os
 import re
+
+import shared_components
 
 
 HH_DEFAULT_TOKEN = " #~DEFAULT~#"
@@ -14,6 +29,11 @@ _config_cache = {}
 def env_default(_kconf, _name, variable, default=""):
     """Return an environment variable, falling back only when it is unset."""
     return os.environ.get(variable, default)
+
+
+def last_index(_kconf, _name, count):
+    """The last index of COUNT items, for an @repeat over them."""
+    return str(int(count) - 1)
 
 
 def nonempty(_kconf, _name, value):
@@ -130,9 +150,22 @@ def buffer_canbus_choice(_kconf, _name, connection):
                           "CHOICE_BUFFER_CANBUS_UUID_")
 
 
+# menuconfig's inline markup: zero width, except [[VALUE:SYM:w]] which shows as w
+# characters (a [[VALUE:SYM]] without a width can't be measured at parse time)
+_MARKUP_RE = re.compile(r"\[\[(?:/?(?:BOLD|B|UNDERLINE|U|REVERSE|REV|DIM)|(?:COLOR|C):[0-9]+|/(?:COLOR|C)|RESET"
+                        r"|VALUE:[A-Za-z0-9_]+(?::([0-9]+))?)\]\]")
+
+
+def display_width(value):
+    width = len(value)
+    for m in _MARKUP_RE.finditer(value):
+        width -= len(m.group(0)) - int(m.group(1) or 0)
+    return width
+
+
 def pad(_kconf, _name, width, value):
     try:
-        return value.ljust(int(width))
+        return value + " " * max(int(width) - display_width(value), 0)
     except ValueError:
         return value
 
@@ -144,8 +177,23 @@ def multiline(_kconf, _name, value):
     return r"\n".join(value.splitlines()) + r"\n"
 
 
-def unit_suffix(_kconf, _name, unit):
-    return "Unit: [[B]]{}[[/B]]".format(unit) if unit else ""
+def newline(_kconf, _name):
+    """A real newline, for building multi-line help text from variables."""
+    return "\n"
+
+
+def pin_example(_kconf, _name, entry_point):
+    # The live unit name, except on the multi-unit entry screen which has no unit
+    chip = "unit0" if entry_point == "y" else "[[VALUE:UNIT_NAME]]"
+    return "Eg:      ^{0}:gpio4, !{0}:PA4".format(chip)
+
+
+def unit_suffix(_kconf, _name, unit, width=""):
+    # Live, so a single unit renamed in menuconfig shows its new name straight away
+    if not unit:
+        return ""
+    value = "[[VALUE:UNIT_NAME:{}]]".format(width) if width else "[[VALUE:UNIT_NAME]]"
+    return "Unit: [[B]]{}[[/B]]".format(value)
 
 
 def menu_title(_kconf, _name, multi_unit, message, suffix):
@@ -226,6 +274,8 @@ functions = {
     "mmu-serial-choice": (mmu_serial_choice, 1, 1),
     "mmu-serial-gate-choice": (mmu_serial_gate_choice, 2, 2),
     "hh-multiline": (multiline, 1, 1),
+    "hh-newline": (newline, 0, 0),
+    "last-index": (last_index, 1, 1),
     "nonempty": (nonempty, 1, 1),
     "hh-pad": (pad, 2, 2),
     "path-exists": (path_exists, 1, 1),
@@ -234,7 +284,9 @@ functions = {
     "saved-config-value": (saved_config_value, 1, 1),
     "saved-interface": (saved_interface, 1, 1),
     "serial-device": (serial_device, 2, 3),
-    "unit-suffix": (unit_suffix, 1, 1),
+    "unit-suffix": (unit_suffix, 1, 2),
+    "hh-pin-example": (pin_example, 1, 1),
     "word-at": (word_at, 2, 2),
     "word-count": (word_count, 1, 1),
 }
+functions.update(shared_components.FUNCTIONS)

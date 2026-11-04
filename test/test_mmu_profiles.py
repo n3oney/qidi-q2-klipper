@@ -22,8 +22,10 @@
 #   kms        4 gates,  VirtualSelector       - default KMS buffer with per-gate exit sensors
 #   qidi       4 gates,  VirtualSelector       - fixed QIDI v2 board, shared hub sensor,
 #                                                THR-hosted extruder sensor and stock dryer
-#   emu        5 gates,  VirtualSelector       - the only shipped profile with a
-#                                                PROPORTIONAL (analog) buffer sensor
+#   quattrobox_v2 4 gates, VirtualSelector     - Chameleon X5 board defaults: heater, BME280s,
+#                                                proportional buffer, shared NFC and TD-1
+#   emu        5 gates,  VirtualSelector       - with quattrobox_v2, the shipped profiles
+#                                                with a PROPORTIONAL (analog) buffer sensor
 #   emu_ebb    5 gates,  VirtualSelector       - EMU on per-gate EBB36/42 gen1 boards,
 #                                                with one shared exit LED chain
 #   ercf 1.1   9 gates,  LinearServoSelector   - unit0 of ercf_vvd; encoder gate homing
@@ -68,12 +70,15 @@ BOOTABLE = {
     'mmx': (4, 'ServoSelector'),
     'kms': (4, 'VirtualSelector'),
     'qidi': (4, 'VirtualSelector'),
+    'quattrobox_v2': (4, 'VirtualSelector'),
     'emu': (5, 'VirtualSelector'),
     'emu_ebb': (5, 'VirtualSelector'),
     # The only multi-unit entry. 13 is a CROSS-UNIT SUM (unit0 9 + unit1 4), not one unit's
     # count, and the selector named here is unit0's - unit1 is an IndexedSelector and gets
     # its own assertions in TestMultiUnitMachine below.
     'ercf_vvd': (13, 'LinearServoSelector'),
+    'tradrack_max_gates': (24, 'LinearServoSelector'),
+    'boxturtle_max_gates': (24, 'VirtualSelector'),
 }
 
 # Selector classes reached only through a non-first unit, so the BOOTABLE table above cannot
@@ -153,6 +158,12 @@ class TestEveryBootableProfile(unittest.TestCase):
         """
         hh = self._check('tradrack')
         self.assertTrue(hasattr(hh.mmu.mmu_unit(0).selector, 'selector_stepper'))
+
+    def test_tradrack_max_gates(self):
+        self._check('tradrack_max_gates')
+
+    def test_boxturtle_max_gates(self):
+        self._check('boxturtle_max_gates')
 
     def test_3ms_load_unload_round_trip(self):
         hh = self._check('3ms')
@@ -366,6 +377,29 @@ class TestEveryBootableProfile(unittest.TestCase):
         self.assertIn("requires require_bowden_move to be 0", str(cm.exception))
         self.assertEqual(unit.p.gate_homing_endstop, 'encoder')
 
+    def test_no_bowden_mode_rejects_shared_exit_preload_endstop(self):
+        """
+        MmuSensorManager aliases mmu_shared_exit to the extruder sensor on a no-bowden unit,
+        but only inside the per-gate map. _shared_gate_path_occupied resolves against the
+        global registry, where that alias does not exist - so a unit configured to preload
+        against the alias would run with the shared-path occupancy guard silently dead.
+        They are the same switch; the name that resolves is the one to use.
+        """
+        hh = self._check('3ms')
+        unit = hh.mmu.mmu_unit(0)
+
+        with self.assertRaises(Exception) as cm:
+            hh.run_gcode('MMU_TEST_CONFIG UNIT=0 gate_preload_endstop=mmu_shared_exit')
+        self.assertIn("gate_preload_endstop must be 'extruder'", str(cm.exception))
+        self.assertEqual(unit.p.gate_preload_endstop, 'extruder')
+
+        # Every other choice is still free, and the restriction is tied to no-bowden only.
+        hh.run_gcode('MMU_TEST_CONFIG UNIT=0 gate_preload_endstop=extruder')
+        self.assertEqual(unit.p.gate_preload_endstop, 'extruder')
+        unit.require_bowden_move = True
+        hh.run_gcode('MMU_TEST_CONFIG UNIT=0 gate_preload_endstop=mmu_shared_exit')
+        self.assertEqual(unit.p.gate_preload_endstop, 'mmu_shared_exit')
+
     def test_bowden_homing_buffers_reject_negative_config(self):
         from test.hh import profiles
 
@@ -421,6 +455,21 @@ class TestEveryBootableProfile(unittest.TestCase):
         self.assertEqual(unit.p.gate_preload_endstop, 'none')
         self.assertEqual(hh.errors, [])
 
+    def test_qidi_toolchange_after_seeded_calibration(self):
+        """The seeded bowden length runs from the shared-exit gate endstop, not the gate."""
+        hh = session('qidi')
+        self.addCleanup(hh.close)
+        hh.boot(calibrate=True)
+        self.assertEqual(hh.mmu.mmu_unit(0).calibrator._bowden_lengths[0], 750.)
+        hh.heat_extruder(220)
+        for gate in (0, 1):
+            hh.place_filament(gate, position=-40)
+            hh.run_gcode('MMU_PRELOAD GATE=%d' % gate)
+        hh.run_gcode('MMU_CHANGE_TOOL TOOL=0')
+        hh.run_gcode('MMU_CHANGE_TOOL TOOL=1')
+        self.assertEqual(hh.errors, [])
+        self.assertEqual(hh.mmu.tool_selected, 1)
+
     def test_qidi(self):
         """QIDI boots with its fixed board, THR sensor and normal dryer setup."""
         with self.assertNoLogs(level='WARNING'):
@@ -458,6 +507,60 @@ class TestEveryBootableProfile(unittest.TestCase):
         status = re.sub(r'<[^>]+>', '', '\n'.join(hh.console[at:]))
         self.assertIn('■◉■■■■■◯', status)
 
+    def test_quattrobox_v2(self):
+        """QuattroBox v2 boots with every Chameleon X5 component and preloads clear of the hub."""
+        hh = session('quattrobox_v2', virtual_nfc=True)
+        self.addCleanup(hh.close)
+        with self.assertNoLogs(level='WARNING'):
+            hh.boot()
+        self.assertTrue(hh.fired('mmu:bootup'))
+        self.assertEqual(hh.errors, [])
+        self.assertEqual(hh.mmu.num_gates, 4)
+        unit = hh.mmu.mmu_unit(0)
+        self.assertEqual(type(unit.selector).__name__, 'VirtualSelector')
+        self.assertEqual(unit.p.gate_homing_endstop, 'mmu_shared_exit')
+        self.assertEqual(unit.p.gate_preload_endstop, 'mmu_exit')
+
+        self.assertEqual(unit.encoder.resolution, 0.979)
+        self.assertEqual(unit.buffer.buffer_spring_state, 'tension')
+        self.assertEqual(unit.buffer.buffer_range, 16)
+        self.assertEqual(unit.buffer.buffer_maxrange, 16)
+        self.assertEqual(unit.filament_heater, 'heater_generic unit0_heater')
+        self.assertEqual(unit.environment_sensor, 'temperature_sensor unit0_Chamber')
+        self.assertEqual(unit.td1_devices, ['TD1-QB2'] * 4)
+        self.assertEqual(sorted(hh.nfc_chips), ['unit0_nfc'])
+
+        fileconfig = hh.fileconfig
+        self.assertEqual(fileconfig.get('mmu_buffer unit0', 'analog_pin'), 'unit0:PC2')
+        for name in ('Chamber', 'Outside'):
+            self.assertEqual(fileconfig.get('temperature_sensor unit0_%s' % name,
+                                            'sensor_type'), 'BME280')
+        for name in ('Heater_A', 'Heater_B'):
+            self.assertEqual(fileconfig.get('temperature_sensor unit0_%s' % name,
+                                            'sensor_type'), 'Generic 3950')
+        self.assertEqual(fileconfig.get('heater_generic unit0_heater', 'sensor_type'),
+                         'temperature_combined')
+        self.assertEqual(fileconfig.get('mmu_nfc_reader unit0_nfc', 'reader_type'), 'pn532')
+        for gate in range(4):
+            self.assertTrue(fileconfig.has_section('gcode_button unit0_eject%d' % gate))
+
+        model = hh.filament()
+        self.assertEqual(model.layout['mmu_shared_exit'], 150)
+        from extras.mmu.mmu_constants import GATE_AVAILABLE
+        for gate in range(4):
+            hh.place_filament(gate, position=-40)
+            hh.run_gcode('MMU_PRELOAD GATE=%d' % gate)
+            self.assertEqual(hh.mmu.gate_status[gate], GATE_AVAILABLE)
+            self.assertAlmostEqual(model.tip[gate], 10)
+            self.assertFalse(model.triggered('unit0:mmu_shared_exit'))
+
+        hh.run_gcode('MMU_SELECT GATE=0')
+        hh.run_gcode('MMU_EJECT')
+        hh.run_gcode('MMU_PRELOAD')
+        self.assertEqual(hh.mmu.gate_status[0], GATE_AVAILABLE)
+        self.assertFalse(model.triggered('unit0:mmu_shared_exit'))
+        self.assertEqual(hh.errors, [])
+
     def test_non_qidi_hardware_controlled_driver_warns_and_boots(self):
         from test.hh import profiles
         profile = profiles.BOXTURTLE.derive(
@@ -490,6 +593,13 @@ class TestEveryBootableProfile(unittest.TestCase):
                 dict(parser.items('neopixel _unit0_gate%d_leds' % gate))['pin'],
                 'unit0_gate%d:PA4' % gate)
 
+        # The SLB routes exactly one hardware i2c bus (i2c2) to every gate MCU, and
+        # the board file offers it to the per-gate sensor by chipdef name.
+        for gate in range(5):
+            sensor = dict(parser.items('temperature_sensor unit0_Env%d' % gate))
+            self.assertEqual(sensor['i2c_mcu'], 'unit0_gate%d' % gate)
+            self.assertEqual(sensor['i2c_bus'], 'i2c2_PB10_PB11')
+
     def test_emu_ebb(self):
         hh = self._check('emu_ebb')
 
@@ -521,6 +631,10 @@ class TestEveryBootableProfile(unittest.TestCase):
             chain = dict(parser.items('neopixel _unit0_gate%d_leds' % gate))
             self.assertEqual(chain['pin'], 'unit0_gate%d:PD3' % gate)
             self.assertEqual(chain['chain_count'], '5')
+            # Same single-bus fact on the EBB: i2c3 carries the per-gate sensor.
+            sensor = dict(parser.items('temperature_sensor unit0_Env%d' % gate))
+            self.assertEqual(sensor['i2c_mcu'], 'unit0_gate%d' % gate)
+            self.assertEqual(sensor['i2c_bus'], 'i2c3_PB3_PB4')
         leds = dict(parser.items('mmu_leds unit0'))
         self.assertEqual(leds['entry_leds'], '')
         self.assertEqual(leds['exit_leds'], 'neopixel:_unit0_gate0_leds (1-5)')
@@ -554,6 +668,86 @@ class TestEveryBootableProfile(unittest.TestCase):
                                for section in parser.sections()
                                if section.startswith('mmu_unit '))
                 self.assertEqual(rendered, gates)
+
+
+class TestMaxGatesPerUnit(unittest.TestCase):
+    """Every per-gate option exists up to the most gates one unit can configure."""
+
+    @staticmethod
+    def _kconfig(name, syms, max_gates=None):
+        from test.hh import cfg
+        env = dict(cfg._SINGLE_UNIT_ENV)
+        if max_gates:
+            env['F_MAX_GATES'] = str(max_gates)
+        with cfg._env(env):
+            return cfg._kconfig(name, syms)
+
+    def test_the_limit_defaults_to_12_and_is_saved(self):
+        from test.hh import profiles
+        tradrack = profiles.get('tradrack').syms
+        for max_gates, expected in ((None, profiles.DEFAULT_MAX_GATES),
+                                    (profiles.MAX_GATES, profiles.MAX_GATES)):
+            with self.subTest(max_gates=max_gates):
+                kc = self._kconfig('max_gates', tradrack, max_gates)
+                self.assertEqual(int(kc.variables['max_gates'].expanded_value), expected)
+                self.assertEqual(int(kc.variables['max_gate'].expanded_value), expected - 1)
+                self.assertEqual(kc.syms['MAX_GATES'].str_value, str(expected))
+                self.assertIn('PIN_ENTRY_SENSOR_%d' % (expected - 1), kc.syms)
+                self.assertNotIn('PIN_ENTRY_SENSOR_%d' % expected, kc.syms)
+
+    def test_a_saved_limit_is_kept_without_install_sh(self):
+        import os
+        import tempfile
+        from test.hh import cfg, profiles
+        with tempfile.TemporaryDirectory() as tmp:
+            saved = os.path.join(tmp, '.mmu_config')
+            with open(saved, 'w') as f:
+                f.write('CONFIG_MAX_GATES=%d\n' % profiles.MAX_GATES)
+            with cfg._env(dict(cfg._SINGLE_UNIT_ENV, KCONFIG_CONFIG=saved)):
+                kc = cfg._kconfig('saved_max_gates', profiles.get('tradrack').syms)
+        self.assertEqual(kc.syms['MAX_GATES'].str_value, str(profiles.MAX_GATES))
+
+    def test_a_gate_count_above_the_limit_is_kept_and_warned(self):
+        from test.hh import profiles
+        tradrack = profiles.get('tradrack').syms
+        self.assertFalse(self._kconfig('at_max_gates', dict(
+            tradrack, PARAM_NUM_GATES=profiles.DEFAULT_MAX_GATES)).is_enabled('W35'))
+        kc = self._kconfig('above_max_gates', dict(tradrack, PARAM_NUM_GATES=14))
+        self.assertEqual(kc.syms['PARAM_NUM_GATES'].str_value, '14')
+        self.assertTrue(kc.is_enabled('W35'))
+        self.assertTrue(kc.is_enabled('SHOW_PER_UNIT_WARNINGS'))
+        self.assertFalse(self._kconfig('raised_max_gates', dict(tradrack, PARAM_NUM_GATES=14),
+                                       profiles.MAX_GATES).is_enabled('W35'))
+
+    def test_every_entry_and_exit_sensor_pin_renders(self):
+        from test.hh import cfg, profiles
+        profile = profiles.get('tradrack_max_gates')
+        sensors = dict(cfg.assemble(cfg.render(profile)).items('mmu_sensors unit0'))
+        for gate in range(profiles.MAX_GATES):
+            with self.subTest(gate=gate):
+                self.assertEqual(sensors['mmu_entry_switch_pin_%d' % gate],
+                                 profile.syms['PIN_ENTRY_SENSOR_%d' % gate])
+                self.assertEqual(sensors['mmu_exit_switch_pin_%d' % gate],
+                                 profile.syms['PIN_EXIT_SENSOR_%d' % gate])
+
+    def test_every_sensor_boots(self):
+        from test.hh import profiles
+        hh = session('tradrack_max_gates')
+        self.addCleanup(hh.close)
+        hh.boot()
+        self.assertEqual(hh.errors, [])
+        last = profiles.MAX_GATES - 1
+        self.assertFalse(hh.sensor('mmu_entry_%d' % last).present)
+        self.assertFalse(hh.sensor('mmu_exit_%d' % last).present)
+
+    def test_every_gear_stepper_renders(self):
+        from test.hh import cfg, profiles
+        profile = profiles.get('boxturtle_max_gates')
+        parser = cfg.assemble(cfg.render(profile))
+        last = profiles.MAX_GATES - 1
+        gear = dict(parser.items('mmu_stepper unit0_gear_%d' % last))
+        self.assertEqual(gear['step_pin'], profile.syms['PIN_GEAR_STEP_%d' % last])
+        self.assertIn('tmc2209 mmu_stepper unit0_gear_%d' % last, parser.sections())
 
 
 class TestMachineNfcDefaults(unittest.TestCase):
@@ -599,6 +793,115 @@ class TestMachineNfcDefaults(unittest.TestCase):
             'PARAM_NFC_PRELOAD_CLEAR_DISTANCE': '-70',
             'PARAM_NFC_NEIGHBOR_CHECK': '1',
         })
+
+
+class TestMachinePerGateI2cBus(unittest.TestCase):
+    """
+    Board files offer the per-gate i2c buses the board actually routes, by chipdef name,
+    to both per-gate i2c consumers (environment sensor and NFC reader). The feature
+    files carry no chipdef knowledge of their own.
+    """
+
+    def _nfc_profile(self, profile_name):
+        from test.hh import cfg, profiles
+        base = profiles.get(profile_name)
+        syms = dict(base.syms)
+        syms['MMU_HAS_NFC_READER'] = True
+        syms['MMU_HAS_PER_GATE_NFC_READERS'] = True
+        for gate in range(5):
+            syms['CHOICE_NFC_READER_TYPE_PN532_%d' % gate] = True
+        return base.derive('%s_per_gate_nfc_i2c' % profile_name, syms=syms)
+
+    def _check_gates(self, profile, expected_bus):
+        from test.hh import cfg, profiles
+        parser = cfg.assemble(cfg.render(profile))
+        for gate in range(5):
+            with self.subTest(gate=gate):
+                sensor = dict(parser.items('temperature_sensor unit0_Env%d' % gate))
+                self.assertEqual(sensor['i2c_mcu'], 'unit0_gate%d' % gate)
+                self.assertEqual(sensor['i2c_bus'], expected_bus)
+                reader = dict(parser.items('mmu_nfc_reader unit0_nfc%d' % gate))
+                self.assertEqual(reader['i2c_mcu'], 'unit0_gate%d' % gate)
+                self.assertEqual(reader['i2c_bus'], expected_bus)
+
+    def test_emu(self):
+        self._check_gates(self._nfc_profile('emu'), 'i2c2_PB10_PB11')
+
+    def test_emu_ebb(self):
+        self._check_gates(self._nfc_profile('emu_ebb'), 'i2c3_PB3_PB4')
+
+    def test_env_sensor_custom_bus_name(self):
+        from test.hh import cfg, profiles
+        base = profiles.get('emu')
+        syms = dict(base.syms)
+        syms['CHOICE_ENVIRONMENT_SENSOR_I2C_BUS_OTHER_0'] = True
+        syms['PARAM_ENVIRONMENT_SENSOR_I2C_BUS_0'] = 'i2c1_PB6_PB7'
+        parser = cfg.assemble(cfg.render(
+            base.derive('emu_env_custom_bus', syms=syms)))
+        self.assertEqual(
+            dict(parser.items('temperature_sensor unit0_Env0'))['i2c_bus'],
+            'i2c1_PB6_PB7')
+        self.assertEqual(
+            dict(parser.items('temperature_sensor unit0_Env1'))['i2c_bus'],
+            'i2c2_PB10_PB11')
+
+    def test_empty_custom_environment_bus_uses_hardware_default(self):
+        from test.hh import cfg, profiles
+        base = profiles.get('emu')
+        syms = dict(base.syms)
+        syms['CHOICE_ENVIRONMENT_SENSOR_I2C_BUS_OTHER_0'] = True
+        syms['PARAM_ENVIRONMENT_SENSOR_I2C_BUS_0'] = ''
+        parser = cfg.assemble(cfg.render(
+            base.derive('emu_env_default_bus', syms=syms)))
+        sensor = dict(parser.items('temperature_sensor unit0_Env0'))
+        self.assertNotIn('i2c_bus', sensor)
+        self.assertNotIn('i2c_software_scl_pin', sensor)
+        self.assertNotIn('i2c_software_sda_pin', sensor)
+
+    def test_software_environment_pins_still_render(self):
+        from test.hh import cfg, profiles
+        base = profiles.get('emu')
+        syms = dict(base.syms)
+        syms['CHOICE_ENVIRONMENT_SENSOR_I2C_SOFTWARE_0'] = True
+        syms['PIN_ENVIRONMENT_SENSOR_I2C_SCL_0'] = 'unit0_gate0:PB6'
+        syms['PIN_ENVIRONMENT_SENSOR_I2C_SDA_0'] = 'unit0_gate0:PB7'
+        parser = cfg.assemble(cfg.render(
+            base.derive('emu_env_software_bus', syms=syms)))
+        sensor = dict(parser.items('temperature_sensor unit0_Env0'))
+        self.assertNotIn('i2c_bus', sensor)
+        self.assertEqual(sensor['i2c_software_scl_pin'], 'unit0_gate0:PB6')
+        self.assertEqual(sensor['i2c_software_sda_pin'], 'unit0_gate0:PB7')
+
+    def test_nfc_reader_custom_bus_name(self):
+        from test.hh import cfg, profiles
+        base = self._nfc_profile('emu')
+        syms = dict(base.syms)
+        syms['CHOICE_NFC_READER_I2C_BUS_OTHER_0'] = True
+        syms['PARAM_NFC_READER_I2C_BUS_0'] = 'i2c1_PB6_PB7'
+        parser = cfg.assemble(cfg.render(
+            base.derive('emu_nfc_custom_bus', syms=syms)))
+        self.assertEqual(
+            dict(parser.items('mmu_nfc_reader unit0_nfc0'))['i2c_bus'],
+            'i2c1_PB6_PB7')
+        self.assertEqual(
+            dict(parser.items('mmu_nfc_reader unit0_nfc1'))['i2c_bus'],
+            'i2c2_PB10_PB11')
+
+    def test_bus_members_are_only_offered_by_the_selected_board(self):
+        """Members are declared in board files and depend on the board type."""
+        from test.hh import cfg, profiles
+        ebb = 'CHOICE_ENVIRONMENT_SENSOR_I2C_BUS_EBB_I2C3_PB3_PB4_0'
+        slb = 'CHOICE_ENVIRONMENT_SENSOR_I2C_BUS_SLB_I2C2_PB10_PB11_0'
+        for label, (offered, withheld) in {
+            'emu': (slb, ebb),
+            'emu_ebb': (ebb, slb),
+        }.items():
+            with self.subTest(machine=label):
+                with cfg._env(cfg._SINGLE_UNIT_ENV):
+                    kc = cfg._kconfig('%s_i2c_bus_members' % label,
+                                      profiles.get(label).syms)
+                self.assertGreater(kc.syms[offered].visibility, 0)
+                self.assertEqual(kc.syms[withheld].visibility, 0)
 
 
 class TestMultiUnitMachine(unittest.TestCase):
@@ -650,7 +953,7 @@ class TestMultiUnitMachine(unittest.TestCase):
         """
         IndexedSelector marks itself homed and calibrated at handle_ready
         (mmu_indexed_selector.py:137-140) - "design doesn't need homing or calibration".
-        Its LinearServoSelector neighbour does NOT, so this asserts the two coexist.
+        Its LinearServoSelector neighbor does NOT, so this asserts the two coexist.
         """
         by_name = {u.name: u for u in self.hh.mmu.mmu_machine.units}
         self.assertTrue(by_name['unit1'].selector.is_homed)
@@ -745,7 +1048,7 @@ class TestProportionalBufferSensor(unittest.TestCase):
     """
     EMU's analog buffer sensor - the only place a shipped profile exercises the ADC path.
 
-    A proportional sensor reports a normalised value in [-1.0, +1.0] and DERIVES the
+    A proportional sensor reports a normalized value in [-1.0, +1.0] and DERIVES the
     virtual filament_compression / filament_tension sensors from it by threshold, rather
     than reading switches. Those derived sensors have no switch_pin at all, which is what
     made this profile fail to load before the harness learned to dispatch by sensor kind.
@@ -824,7 +1127,7 @@ class TestProportionalVirtualSensorThresholds(unittest.TestCase):
         self.hh.close()
 
     def feed_normalised(self, value):
-        """Feed a raw reading that normalises to `value` in [-1, +1]."""
+        """Feed a raw reading that normalizes to `value` in [-1, +1]."""
         span = self.sensor._d_pos if value >= 0 else self.sensor._d_neg
         self.prop.feed(self.sensor._neutral_point + value * span)
         return self.sensor.value
@@ -895,6 +1198,177 @@ class TestAdcCompatMatrixOnRealMachine(unittest.TestCase):
                         self.assertAlmostEqual(prop.value, 1.0, places=2)
                     finally:
                         hh.close()
+
+
+class TestLedEffectParams(unittest.TestCase):
+    """The [mmu_leds] effect_* options come from PARAM_EFFECT_* Kconfig tokens; EMU
+    overrides some of them and defines unit-scoped effects in PARAM_MISC_LED_EFFECTS."""
+
+    EMU_EFFECTS = ('mmu_static_white', 'mmu_static_white_dim', 'mmu_static_red')
+    COLORS = {'logo_effect': '(0, 0, 0.3)', 'white_light': '(1, 1, 1)',
+              'black_light': '(.01, 0, .02)', 'empty_light': '(0, 0, 0)',
+              'filament_color_intensity': '0.5'}
+    COLOR_PARAMS = ('PARAM_WHITE_LIGHT', 'PARAM_BLACK_LIGHT', 'PARAM_EMPTY_LIGHT',
+                    'PARAM_FILAMENT_COLOR_INTENSITY')
+
+    def _leds(self, profile, unit='unit0'):
+        from test.hh import cfg, profiles
+        if isinstance(profile, str):
+            profile = profiles.get(profile)
+        parser = cfg.assemble(cfg.render(profile))
+        return parser, dict(parser.items('mmu_leds %s' % unit))
+
+    @staticmethod
+    def _canonical(value):
+        return re.sub(r'\s+', ' ', value).strip()
+
+    def test_stock_defaults_match_the_previous_template(self):
+        _, leds = self._leds('boxturtle')
+        effects = {o: self._canonical(v) for o, v in leds.items() if o.startswith('effect_')}
+        self.assertEqual(len(effects), 25)
+        self.assertEqual(effects['effect_gate_available'], 'mmu_static_green, (0, 0.5, 0)')
+        self.assertEqual(effects['effect_error'], 'mmu_red_strobe, (1, 0, 0), 10')
+        self.assertEqual(effects['effect_td1_fail'], 'mmu_red_strobe, (1, 0, 0), 3')
+
+    def test_stock_colors_match_the_previous_template(self):
+        for name in ('boxturtle', 'emu'):
+            with self.subTest(profile=name):
+                _, leds = self._leds(name)
+                self.assertEqual({o: leds[o] for o in self.COLORS}, self.COLORS)
+
+    def test_menuconfig_colors_render(self):
+        from test.hh import profiles
+        profile = profiles.get('boxturtle').derive(
+            'boxturtle_led_color_param',
+            syms={'BOOL_CUSTOMIZE_LED_EFFECTS': True,
+                  'PARAM_WHITE_LIGHT': '(0.8, 0.8, 0.8)',
+                  'PARAM_FILAMENT_COLOR_INTENSITY': '0.25'})
+        _, leds = self._leds(profile)
+        self.assertEqual(leds['white_light'], '(0.8, 0.8, 0.8)')
+        self.assertEqual(leds['filament_color_intensity'], '0.25')
+        self.assertEqual(leds['black_light'], '(.01, 0, .02)')
+
+    def test_logo_effect_accepts_off_rgb_and_effect_names(self):
+        from test.hh import profiles
+        for value, expected in (('off', 'off'), ('(0, 0.5, 1)', (0.0, 0.5, 1.0)),
+                                ('mmu_rainbow', 'mmu_rainbow')):
+            with self.subTest(value=value):
+                syms = ({'CHOICE_LOGO_EFFECT_OFF': True} if value == 'off' else
+                        {'CHOICE_LOGO_EFFECT_CUSTOM': True, 'PARAM_LOGO_EFFECT_CUSTOM': value})
+                syms.update(PARAM_CHAIN_COUNT=5, PARAM_LOGO_LEDS='neopixel:_unit0_leds (5)')
+                profile = profiles.get('boxturtle').derive(
+                    'boxturtle_logo_effect_%s' % re.sub(r'\W', '', value), syms=syms)
+                _, leds = self._leds(profile)
+                self.assertEqual(leds['logo_effect'], value)
+                hh = session(profile)
+                try:
+                    hh.boot()
+                    self.assertEqual(hh.errors, [])
+                    self.assertEqual(hh.mmu.mmu_unit(0).leds.logo_effect, expected)
+                finally:
+                    hh.close()
+
+    def test_emu_overrides_only_its_effects(self):
+        _, stock = self._leds('boxturtle')
+        parser, emu = self._leds('emu')
+        differing = {o for o in stock if o.startswith('effect_')
+                     and self._canonical(stock[o]) != self._canonical(emu[o])}
+        self.assertEqual(differing, {'effect_gate_available', 'effect_gate_available_sel',
+                                     'effect_gate_empty_sel', 'effect_loading',
+                                     'effect_loading_extruder', 'effect_unloading',
+                                     'effect_unloading_extruder', 'effect_checking'})
+        self.assertEqual(emu['effect_gate_available'].split(',')[0], 'mmu_static_white_dim_unit0')
+        for name in self.EMU_EFFECTS:
+            self.assertEqual(parser.get('mmu_led_effect %s_unit0' % name, 'unit'), 'unit0')
+
+    def test_stock_machines_define_no_extra_effects(self):
+        parser, _ = self._leds('boxturtle')
+        self.assertFalse([s for s in parser.sections() if s.startswith('mmu_led_effect')
+                          and s.endswith('_unit0')])
+
+    def test_menuconfig_value_renders(self):
+        from test.hh import profiles
+        profile = profiles.get('boxturtle').derive(
+            'boxturtle_led_effect_param',
+            syms={'BOOL_CUSTOMIZE_LED_EFFECTS': True,
+                  'PARAM_EFFECT_ERROR': 'mmu_sparkle, (1, 0, 0), 5'})
+        _, leds = self._leds(profile)
+        self.assertEqual(self._canonical(leds['effect_error']), 'mmu_sparkle, (1, 0, 0), 5')
+
+    def test_menu_is_shown_by_the_flag_and_defaults_apply_while_hidden(self):
+        from test.hh import cfg, profiles
+        for name, flag, value in (('boxturtle', False, 'mmu_static_green, (0, 0.5, 0)'),
+                                  ('emu', False, 'mmu_static_white_dim_unit0, (0.1, 0.1, 0.1)'),
+                                  ('boxturtle', True, 'mmu_static_green, (0, 0.5, 0)')):
+            with self.subTest(profile=name, flag=flag):
+                with cfg._env(cfg._SINGLE_UNIT_ENV):
+                    kc = cfg._kconfig('led_effect_flag_%s_%s' % (name, flag), dict(
+                        profiles.get(name).syms, BOOL_CUSTOMIZE_LED_EFFECTS=flag))
+                self.assertEqual(kc.syms['PARAM_EFFECT_GATE_AVAILABLE'].visibility > 0, flag)
+                self.assertEqual(self._canonical(kc.get('PARAM_EFFECT_GATE_AVAILABLE')), value)
+                # Every effect prompt sits in the menuconfig's submenu (separator comments aside)
+                node, children = kc.syms['BOOL_CUSTOMIZE_LED_EFFECTS'].nodes[0], []
+                self.assertTrue(node.is_menuconfig)
+                child = node.list
+                while child:
+                    if hasattr(child.item, 'name'):
+                        children.append(child.item.name)
+                    child = child.next
+                self.assertEqual(tuple(children[:4]), self.COLOR_PARAMS)
+                self.assertEqual(len(children), 29)
+                self.assertTrue(all(c.startswith('PARAM_EFFECT_') for c in children[4:]), children)
+
+    def test_two_emus_define_their_own_effects_on_their_own_unit(self):
+        from test.hh import profiles
+        two = profiles.clone_across_units('two_emus', profiles.get('emu'), ('unit0', 'unit1'),
+                                          description='two EMUs')
+        for unit in ('unit0', 'unit1'):
+            parser, leds = self._leds(two, unit)
+            self.assertEqual(leds['effect_gate_available'].split(',')[0],
+                             'mmu_static_white_dim_%s' % unit)
+            for name in self.EMU_EFFECTS:
+                self.assertEqual(parser.get('mmu_led_effect %s_%s' % (name, unit), 'unit'), unit)
+        hh = session(two)
+        try:
+            hh.boot()
+            self.assertEqual(hh.errors, [])
+            effects = hh.printer.lookup_object('mmu_led_effect').effects
+            for unit in ('unit0', 'unit1'):
+                scoped = [e for e in effects if 'mmu_static_white_%s' % unit in e.name]
+                self.assertTrue(scoped, unit)
+                self.assertTrue(all(chain.startswith('%s_mmu_' % unit)
+                                    for e in scoped for chain in e.configChains))
+        finally:
+            hh.close()
+
+    def test_unknown_effect_unit_is_rejected(self):
+        hh = session('emu')
+        try:
+            hh.boot()
+            from extras.mmu_led_effect import MmuLedEffect
+            section = 'mmu_led_effect mmu_static_white_unit0'
+            hh.fileconfig.set(section, 'unit', 'typo')
+            with self.assertRaisesRegex(Exception, "Unknown MMU unit 'typo'"):
+                MmuLedEffect(hh.config.getsection(section))
+        finally:
+            hh.close()
+
+class TestSelectorMicrosteps(unittest.TestCase):
+    """[mmu_stepper <unit>_selector] microsteps comes from PARAM_SELECTOR_MICROSTEPS."""
+
+    def _microsteps(self, profile):
+        from test.hh import cfg
+        return cfg.assemble(cfg.render(profile)).get('mmu_stepper unit0_selector', 'microsteps')
+
+    def test_default_matches_the_previous_template(self):
+        from test.hh import profiles
+        self.assertEqual(self._microsteps(profiles.get('tradrack')), '16')
+
+    def test_menuconfig_value_renders(self):
+        from test.hh import profiles
+        profile = profiles.get('tradrack').derive(
+            'tradrack_selector_microsteps', syms={'PARAM_SELECTOR_MICROSTEPS': 8})
+        self.assertEqual(self._microsteps(profile), '8')
 
 
 if __name__ == '__main__':

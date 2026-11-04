@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+
+# Happy Hare MMU Software
+# Pickle consistency test for .mmu_config files
+#
+# Copyright (C) 2022-2026  moggieuk#6538 (discord)
+#                          moggieuk@hotmail.com
+#
+# (\_/)
+# ( *,*)
+# (")_(") Happy Hare Ready
+#
+# This file may be distributed under the terms of the GNU GPLv3 license.
+#
+
 """
 Regression test: verify that every explicit CONFIG_* assignment in a raw
 .mmu_config-style file survives correctly into the pickled dict produced by
@@ -46,12 +60,11 @@ import sys
 
 import kconfiglib
 
-# Same array-grouping pattern and cutoff as KConfig.as_dict(). This is
-# intentionally duplicated (not imported) since it's simple, mechanical
-# index math -- not the type-normalization logic we're actually trying to
-# validate independently.
+# Same array-grouping pattern and cutoff (the tree's max_gate) as
+# KConfig.as_dict(). This is intentionally duplicated (not imported) since
+# it's simple, mechanical index math -- not the type-normalization logic
+# we're actually trying to validate independently.
 _ARRAY_SUFFIX_RE = re.compile(r"^(.+_)(\d+)$")
-_MAX_ARRAY_INDEX = 12
 
 
 def _expected_value(sym_obj):
@@ -93,6 +106,7 @@ def verify_pickle_matches_config(config_file, pickle_values, base_kconfig="Kconf
     """
     kc = kconfiglib.Kconfig(base_kconfig)
     kc.load_config(config_file, filter_defaults=False)
+    max_index = int(kc.variables["max_gate"].expanded_value)
 
     mismatches = []
 
@@ -123,7 +137,7 @@ def verify_pickle_matches_config(config_file, pickle_values, base_kconfig="Kconf
             continue
 
         m = _ARRAY_SUFFIX_RE.match(name)
-        if m and int(m.group(2)) <= _MAX_ARRAY_INDEX:
+        if m and int(m.group(2)) <= max_index:
             key, idx = m.group(1), int(m.group(2))
             group = pickle_values.get(key)
             if not isinstance(group, list) or idx >= len(group) or group[idx] != expected:

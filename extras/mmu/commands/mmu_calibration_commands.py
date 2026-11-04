@@ -126,8 +126,8 @@ class MmuCalibrateEncoderCommand(CalibrationMixin, BaseCommand):
         + "UNIT     = #(int)|_name_ Specify unit by name, number (optional if single unit)\n"
         + "LENGTH   = #(mm) Commanded distance (default: 400)\n"
         + "REPEATS  = #(count) Number of repetitions (default: 3, min: 1, max: 10)\n"
-        + "SPEED    = #(mm/s) Move speed\n"
-        + "ACCEL    = #(mm/s^2) Move accel\n"
+        + "SPEED    = #(mm/s) Move speed (default: gear_load_speed)\n"
+        + "ACCEL    = #(mm/s^2) Move accel (default: gear_load_accel)\n"
         + "MINSPEED = #(mm/s) Minimum speed, speed of first repeat (default: SPEED)\n"
         + "MAXSPEED = #(mm/s) Maximum speed, speed of last repeat (default: SPEED)\n"
         + "SAVE     = [0|1] Save calibration (default: 1)\n"
@@ -167,8 +167,8 @@ class MmuCalibrateEncoderCommand(CalibrationMixin, BaseCommand):
 
         length = gcmd.get_float('LENGTH', 400., above=0.)
         repeats = gcmd.get_int('REPEATS', 3, minval=1, maxval=10)
-        speed = gcmd.get_float('SPEED', mmu_unit.p.gear_from_filament_buffer_speed, minval=10.)
-        accel = gcmd.get_float('ACCEL', mmu_unit.p.gear_from_filament_buffer_accel, minval=10.)
+        speed = gcmd.get_float('SPEED', mmu_unit.p.gear_load_speed, minval=10.)
+        accel = gcmd.get_float('ACCEL', mmu_unit.p.gear_load_accel, minval=10.)
         min_speed = gcmd.get_float('MINSPEED', speed, above=0.)
         max_speed = gcmd.get_float('MAXSPEED', speed, above=0.)
         save = gcmd.get_int('SAVE', 1, minval=0, maxval=1)
@@ -188,7 +188,7 @@ class MmuCalibrateEncoderCommand(CalibrationMixin, BaseCommand):
                     _,_,_,_ = mmu.move_filament("Parking filament", -advance)
 
         except MmuError as ee:
-            mmu.handle_mmu_error(str(ee))
+            mmu.handle_mmu_error(ee)
 
         finally:
             mmu.calibrating = False
@@ -299,7 +299,7 @@ class MmuCalibrateGateCommand(CalibrationMixin, BaseCommand):
                         mmu.log_always("Phew! End of auto gate calibration")
 
         except MmuError as ee:
-            mmu.handle_mmu_error(str(ee))
+            mmu.handle_mmu_error(ee)
 
         finally:
             mmu.calibrating = False
@@ -449,7 +449,7 @@ class MmuCalibrateBowdenCommand(CalibrationMixin, BaseCommand):
                             calibrator.update_clog_detection_length(cdl, push=True)
 
         except MmuError as ee:
-            mmu.handle_mmu_error(str(ee))
+            mmu.handle_mmu_error(ee)
         finally:
             mmu.calibrating = False
 
@@ -521,6 +521,12 @@ class MmuCalibrateToolheadCommand(CalibrationMixin, BaseCommand):
             CALIBRATED_GEAR_RDS| CALIBRATED_ENCODER | CALIBRATED_SELECTOR | CALIBRATED_BOWDENS,
             check_gates=[gate]
         ): return
+
+        if gcmd.get_int('CUT', 0, minval=0, maxval=1) and mmu.cutter_before_extruder():
+            raise gcmd.error(
+                "Blade position can only be measured for a cutter inside the extruder (below the toolhead sensor). "
+                "'cutter_before_extruder' is set in _MMU_CUT_TIP_VARS, so measure blade_pos by hand from the nozzle"
+            )
 
         if not sensor_manager.has_sensor(SENSOR_TOOLHEAD):
             raise gcmd.error("Sorry this feature requires a toolhead sensor")
@@ -610,7 +616,7 @@ class MmuCalibrateToolheadCommand(CalibrationMixin, BaseCommand):
                 mmu._unload_gate()
 
         except MmuError as ee:
-            mmu.handle_mmu_error(str(ee))
+            mmu.handle_mmu_error(ee)
         finally:
             mmu.calibrating = False
 
@@ -811,7 +817,7 @@ class MmuCalibratePsensorCommand(CalibrationMixin, BaseCommand):
                 mmu.log_warning(msg)
 
         except MmuError as ee:
-            mmu.handle_mmu_error(str(ee))
+            mmu.handle_mmu_error(ee)
 
         finally:
             mmu.calibrating = False

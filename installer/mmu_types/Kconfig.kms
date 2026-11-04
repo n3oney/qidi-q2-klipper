@@ -17,7 +17,6 @@ config MMU_TYPE_KMS_1_0
   select PARAM_SYNC_TO_EXTRUDER
   select PARAM_SYNC_FORM_TIP
   select PARAM_SYNC_PURGE
-  select DISABLE_NUM_GATES_OPTION
   imply OPTION_KMS_BUFFER
 
 
@@ -35,9 +34,9 @@ if MMU_TYPE_KMS_1_0
     select MMU_HAS_BUFFER_MCU
     select MMU_HAS_SENSOR_EXIT
     select MMU_HAS_SYNC_FEEDBACK_BUFFER
-    select MMU_HAS_SENSOR_BUFFER_COMPRESSION
-    select MMU_HAS_SENSOR_BUFFER_TENSION
-    select UNSELECT_MMU_HAS_SENSOR_BUFFER_PROPORTIONAL
+    select MMU_HAS_SENSOR_BUFFER_COMPRESSION if !MMU_SHARED_SYNC_FEEDBACK_BUFFER
+    select MMU_HAS_SENSOR_BUFFER_TENSION if !MMU_SHARED_SYNC_FEEDBACK_BUFFER
+    select UNSELECT_MMU_HAS_SENSOR_BUFFER_PROPORTIONAL if !MMU_SHARED_SYNC_FEEDBACK_BUFFER
 
   if OPTION_KMS_BUFFER
     choice CHOICE_BUFFER_SPRING_STATE
@@ -58,20 +57,6 @@ endif
 
 if MMU_TYPE_KMS_1_0
 
-  # MISC_HARDWARE configures these
-  config CUSTOM_ENVIRONMENT_SENSOR_SETUP
-    def_bool y
-  config CUSTOM_HEATER_SETUP
-    def_bool y
-  config CUSTOM_FAN_SETUP
-    def_bool y
-  config CUSTOM_HEATER_FAN_SETUP
-    def_bool y
-
-  if SHOW_MMU_ADDITIONS_WITH_TYPE
-    source "Kconfig.mmu_additions"
-  endif
-
   source "Kconfig.capabilities"
 
   config PARAM_VENDOR
@@ -79,6 +64,8 @@ if MMU_TYPE_KMS_1_0
   config PARAM_VERSION
     default "1.0"  
   config PARAM_NUM_GATES
+    default 4
+  config PARAM_DESIGN_NUM_GATES
     default 4
   choice BOARD_TYPE
     default BOARD_TYPE_KMS_1_0
@@ -114,6 +101,11 @@ if MMU_TYPE_KMS_1_0
 
   config PARAM_ENVIRONMENT_SENSOR
     default "$(UNIT_NAME)_environment"
+  choice CHOICE_ENVIRONMENT_SENSOR_TYPE
+    default CHOICE_ENVIRONMENT_SENSOR_TYPE_HTU21D
+  endchoice
+  config PARAM_ENVIRONMENT_SENSOR_REPORT_TIME
+    default 10 if CHOICE_ENVIRONMENT_SENSOR_TYPE_HTU21D
 
   config PARAM_FILAMENT_HEATER
     default "$(UNIT_NAME)_heater"

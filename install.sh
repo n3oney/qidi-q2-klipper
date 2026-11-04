@@ -2,6 +2,9 @@
 #
 # Happy Hare v4 MMU Software
 #
+# Copyright (C) 2022-2026  moggieuk#6538 (discord)
+#                          moggieuk@hotmail.com
+#
 # Installer / Updater launch script with familiar options
 #
 # Carefully written to only use shell options that are widely available
@@ -39,7 +42,7 @@ usage() {
     SPACE=$(echo "${USAGE}" | tr "[:print:]" " ")
     echo "${C_INFO}"
     echo "${USAGE} [-i] [-u] [-d] [-y] [-l] [-p] [-z] [-s] [-t] [-r]"
-    echo "${SPACE} [-b <branch>]"
+    echo "${SPACE} [-b <branch>] [-g <gates>]"
     echo "${SPACE} [-k <klipper_home_dir>] [-c <klipper_config_dir>] [-m <moonraker_home_dir>]"
     echo "${SPACE} [-a <kiauh_alternate_klipper>] [config_file]"
     echo "${C_OFF}"
@@ -64,8 +67,8 @@ usage() {
     # echo "  -R specify Repetier-Server <stub> to override printer.cfg and klipper.service names"
     echo "  -a <name> to specify alternative klipper-service-name when installed with Kiauh"
     echo "  -r allow running ${SCRIPT_NAME} from a root login (not through sudo)"
-    echo "  -e, --emu Enables multi MCU support (e.g. for EMU design)"
-    echo "  -o override compatibility checks (e.g. Kalico detection)"
+    echo "  -g <gates> most gates one MMU unit can configure (12 or more, default 12, sticky; more is slower)"
+    echo "  -o override compatibility checks (e.g. unknown MIPS layout)"
     echo "  -t  activate test mode - write config to /tmp/mmu_test instead of your real install"
     echo "  (-q verbose make for debugging)"
     echo "  (-v verbose builder for debugging)"
@@ -132,6 +135,167 @@ trim() {
     echo "${name}"
 }
 
+# Run installer/unit_migration.py, which handles renamed, removed and reordered
+# multi-unit units. F_UNITS_BASELINE is the unit list before this run
+unit_migration() {
+    um_action=$1
+    shift
+    (cd "${SCRIPT_DIR}" &&
+        PYTHONPATH="${SCRIPT_DIR}:${SCRIPT_DIR}/installer/lib/kconfiglib:${PYTHONPATH:-}" \
+        "${INSTALLER_PY:-python3}" -m installer.unit_migration "${um_action}" \
+            --kconfig "${KCONFIG_CONFIG}" \
+            --config-home "${CONFIG_KLIPPER_CONFIG_HOME:-}" \
+            ${F_UNITS_BASELINE+"--baseline=${F_UNITS_BASELINE}"} "$@")
+}
+
+# Summarize any change to the multi-unit unit list and confirm a rename, removal
+# or reorder. Fails if the change isn't allowed in this upgrade mode or is declined
+review_unit_changes() {
+    um_status=0
+    unit_migration check --mode "${F_CFG_UPGRADE_MODE:-refresh}" || um_status=$?
+    case "${um_status}" in
+    0 | 10)
+        return 0
+        ;;
+    12)
+        echo "${C_ERROR}Unrecorded MMU unit changes: stopping. Run './install.sh -i' in Replace mode to record the changes.${C_OFF}"
+        return 1
+        ;;
+    11)
+        F_UNITS_RESTRUCTURED=y
+        echo
+        if prompt_yn "Apply these unit changes"; then
+            return 1
+        fi
+        echo
+        return 0
+        ;;
+    2)
+        return 1
+        ;;
+    *)
+        echo "${C_ERROR}Could not verify MMU unit changes; stopping to preserve saved state. Resolve the error above and retry.${C_OFF}"
+        return 1
+        ;;
+    esac
+}
+
+# Capture identity before menuconfig can change it; a failed read is not a fresh install.
+capture_units_baseline() {
+    F_UNITS_BASELINE=$(unit_migration baseline) || {
+        echo "${C_ERROR}Could not read the installed MMU units; stopping. Resolve the error above and retry.${C_OFF}"
+        return 1
+    }
+    set_units_restructure
+    export F_UNITS_BASELINE
+}
+
+# Renaming, deleting or reordering units needs Replace mode, unless nothing has been
+# installed or configured yet (e.g. a first './install.sh -i -n'), when there is
+# nothing to migrate
+set_units_restructure() {
+    if [ "${F_CFG_UPGRADE_MODE:-}" = replace ] || [ -z "${F_UNITS_BASELINE:-}" ]; then
+        export F_UNITS_RESTRUCTURE=y
+    fi
+}
+
+# Interactive Refresh: before menuconfig opens, import the values the .cfg files hold that
+# menuconfig doesn't show, so it opens showing what is running, and save a baseline of each
+# Kconfig file so the build applies only what menuconfig then changes. Every Kconfig file
+# reports, the reports are shown together and the user confirms once (-y answers)
+prepare_refresh() {
+    case "${F_CFG_UPGRADE_MODE:-}" in
+    refresh | merge) ;;
+    *) return 0 ;;
+    esac
+
+    run_make kconfig_baseline_clean
+    HH_IMPORT_REPORT=$(mktemp -t hh_import.XXXXXX)
+    export HH_IMPORT_REPORT HH_CONFIG_HOME="${CONFIG_KLIPPER_CONFIG_HOME:-}"
+    # Each Kconfig file is parsed in turn, which is slow on a multi-unit install
+    echo "${C_INFO}Checking your .cfg files for values to import into menuconfig...${C_OFF}"
+    run_kconfig_top kconfig_import n
+    run_kconfig_units kconfig_import n
+
+    import_status=0
+    C_NOTICE="${C_NOTICE:-}" C_INFO="${C_INFO:-}" C_OFF="${C_OFF:-}" \
+        PYTHONPATH="${SCRIPT_DIR}:${SCRIPT_DIR}/installer/lib/kconfiglib:${PYTHONPATH:-}" \
+        "${INSTALLER_PY:-python3}" -m installer.cfg_import ${V:-} --show "${HH_IMPORT_REPORT}" || import_status=$?
+
+    if [ "${import_status}" -eq 10 ]; then
+        # prompt_yn returns 0 for no
+        if prompt_yn "Import these .cfg values into menuconfig"; then
+            echo "${C_INFO}Not imported: menuconfig will show its previous values, and your .cfg files are kept as they are${C_OFF}"
+        else
+            export HH_IMPORT_APPLY=y
+            echo "${C_INFO}Importing them into menuconfig...${C_OFF}"
+            run_kconfig_top kconfig_import n
+            run_kconfig_units kconfig_import n
+            unset HH_IMPORT_APPLY
+        fi
+        echo
+    fi
+
+    rm -f "${HH_IMPORT_REPORT}"
+    unset HH_IMPORT_REPORT HH_CONFIG_HOME
+    export F_MENUCONFIG_BASELINE=y
+    echo "${C_INFO}Opening menuconfig...${C_OFF}"
+}
+
+
+# The name a single unit has before menuconfig (unit0 when there is no config
+# yet), or nothing for multi-unit
+# True if $1 is a gate limit -g accepts: a whole number, at least the default 12
+valid_max_gates() {
+    case "$1" in
+        '' | *[!0-9]* | 0*) return 1 ;;
+    esac
+    [ "$1" -ge 12 ]
+}
+
+# The per-unit gate limit (-g) config file $1 was saved with, if any
+saved_max_gates() {
+    (
+        unset CONFIG_MAX_GATES
+        [ -r "$1" ] && . "$1"
+        echo "${CONFIG_MAX_GATES:-}"
+    )
+}
+
+# True if -g asks for a different gate limit than config file $1 was saved with
+max_gates_changed() {
+    [ -n "${F_MAX_GATES:-}" ] && [ "$(saved_max_gates "$1")" != "${F_MAX_GATES}" ]
+}
+
+single_unit_name() {
+    (
+        unset CONFIG_MULTI_UNIT CONFIG_UNIT_NAME
+        [ -r "${KCONFIG_CONFIG}" ] && . "${KCONFIG_CONFIG}"
+        [ -z "${CONFIG_MULTI_UNIT:-}" ] && echo "${CONFIG_UNIT_NAME:-unit0}"
+    )
+}
+
+# True if a single unit was renamed in this run's menuconfig: its name differs
+# from the one before (F_UNIT_NAME_BEFORE) or from MCU_NAME, which keeps the old
+# name when menuconfig didn't re-parse after the rename
+single_unit_renamed() {
+    (
+        unset CONFIG_MULTI_UNIT CONFIG_UNIT_NAME CONFIG_MCU_NAME
+        [ -r "${KCONFIG_CONFIG}" ] && . "${KCONFIG_CONFIG}"
+        [ -z "${CONFIG_MULTI_UNIT:-}" ] && [ -n "${CONFIG_UNIT_NAME:-}" ] && {
+            [ "${CONFIG_UNIT_NAME}" != "${CONFIG_MCU_NAME:-}" ] ||
+                { [ -n "${F_UNIT_NAME_BEFORE:-}" ] && [ "${CONFIG_UNIT_NAME}" != "${F_UNIT_NAME_BEFORE}" ]; }
+        }
+    )
+}
+
+# Never install/restart after a failed state-migration step: intent may be missing.
+unit_migration_step() {
+    unit_migration "$@" && return 0
+    echo "${C_ERROR}MMU unit migration step '$1' failed, stopping. Resolve the error above and retry.${C_OFF}"
+    return 1
+}
+
 time_elapsed() {
     START_TIME=$("${INSTALLER_PY}" -c "import time; print(time.time())")
     "${@}"
@@ -170,6 +334,10 @@ copy_recovered_kconfigs() {
         recovery_destination=${TESTDIR}
         mkdir -p "${recovery_destination}"
     fi
+
+    # A pending unit migration belongs to the config being replaced
+    rm -f "${recovery_destination}/.mmu_config.unit_migration" \
+        "${recovery_destination}"/.mmu_config.*.changes
 
     recovered=n
     for config_file in "${restored_config}"/.mmu_config*; do
@@ -216,9 +384,10 @@ restore_mmu_config() {
     fi
 
     echo "${C_INFO}Restoring MMU config from '$(basename "${selected_config}")'${C_OFF}"
-    cp -R "${selected_config}" "${current_config}"
+    cp -Rp "${selected_config}" "${current_config}"
     copy_recovered_kconfigs "${current_config}"
-    export F_NO_MMU_BACKUP=y
+    # The restored backup is what make install's change summary compares with
+    export F_NO_MMU_BACKUP=y HH_RESTORED_FROM="${selected_config}"
 }
 
 # Format the timestamp embedded in standard mmu.old-YYYYMMDD-HHMMSS backup names.
@@ -370,7 +539,6 @@ offer_v3_v4_choice() {
     echo "   deleted), old includes are removed from printer.cfg and moonraker.conf, and"
     echo "   you're walked through a FRESH v4 setup via menuconfig. Nothing from mmu.V3"
     echo "   is carried over automatically - it's there for you to copy values back out of."
-    echo "   ${C_WARNING}NOTE: DOES NOT YET WORK ON KALICO - stay on v3 for now${C_OFF}"
     echo
     echo "More details: https://moggieuk.github.io/Happy-Hare-Doc/Upgrade-v3-v4/"
     echo "${C_WARNING}------------------------------------------------------------------------${C_OFF}"
@@ -391,6 +559,11 @@ offer_v3_v4_choice() {
         echo "${C_WARNING}Proceeding with the v4 upgrade. Your v3 'mmu' config directory will be${C_OFF}"
         echo "${C_WARNING}renamed to 'mmu.V3' for reference - nothing is deleted.${C_OFF}"
         echo
+        # '-b v3' would otherwise still switch the checkout to v3
+        if [ "${BRANCH:-}" = v3 ]; then
+            echo "${C_NOTICE}Ignoring '-b v3' to upgrade to v4${C_OFF}"
+            unset BRANCH
+        fi
         # Consulted once Kconfig has resolved real paths (see v3_upgrade_cleanup),
         # since CONFIG_KLIPPER_CONFIG_HOME etc. don't exist yet at this point in the
         # script. export, not just assignment, so it survives the self-update re-exec.
@@ -544,7 +717,6 @@ fi
 for arg in "$@"; do
     shift
     case "$arg" in
-        --emu) set -- "$@" -e ;;
         --help) set -- "$@" -h ;;
         --yes) set -- "$@" -y ;;
         --last) set -- "$@" -l ;;
@@ -553,7 +725,7 @@ for arg in "$@"; do
     esac
 done
 
-while getopts "rehfiudylpzsb:nk:c:m:a:toqv" arg; do
+while getopts "rhfiudylpzsb:nk:c:m:a:g:toqv" arg; do
     case $arg in
     f)
         FIX_LINKS=y
@@ -583,7 +755,7 @@ while getopts "rehfiudylpzsb:nk:c:m:a:toqv" arg; do
     o) export F_OVERRIDE_CHECKS=y ;;
     q) export Q= ;;   # Developer: Disable quiet mode in Makefile
     v) export V=-v ;; # Developer: Enable verbose mode in builder and debug in Makefile
-    e) export F_PER_GATE_MCU=y ;; # Allows multiple MCU selection but menuconfig startup time is increased
+    g) export F_MAX_GATES="${OPTARG}" ;;
     h) usage ;;
     *) usage ;;
     esac
@@ -593,6 +765,11 @@ done
 # sudo/root invocation needs to fail before either one runs.
 detect_platform
 enforce_root_policy
+
+if [ -n "${F_MAX_GATES:-}" ] && ! valid_max_gates "${F_MAX_GATES}"; then
+    echo "${C_ERROR}-g needs a number of gates of at least 12, not '${F_MAX_GATES}'${C_OFF}"
+    exit 1
+fi
 
 if [ "${F_RECOVER_LAST}" ] && [ "${F_RECOVER_PREVIOUS}" ]; then
     echo "${C_ERROR}Can't use --last and --prev at the same time!${C_OFF}"
@@ -653,7 +830,7 @@ flyos-fast)  echo "${C_INFO}Detected FlyOS-Fast${C_OFF}" ;;
 guppy-k1)    echo "${C_INFO}Detected Guppy K1 Mod${C_OFF}" ;;
 esac
 
-# Summarise directory overrides
+# Summarize directory overrides
 [ -n "${CONFIG_KLIPPER_HOME:-}" ]        && echo "${C_INFO}KLIPPER_HOME=${CONFIG_KLIPPER_HOME}${C_OFF}"
 [ -n "${CONFIG_KLIPPER_CONFIG_HOME:-}" ] && echo "${C_INFO}KLIPPER_CONFIG_HOME=${CONFIG_KLIPPER_CONFIG_HOME}${C_OFF}"
 [ -n "${CONFIG_MOONRAKER_HOME:-}" ]      && echo "${C_INFO}MOONRAKER_HOME=${CONFIG_MOONRAKER_HOME}${C_OFF}"
@@ -794,30 +971,6 @@ if [ -n "${CONFIG_KLIPPER_HOME+x}" ] && [ ! -d "${CONFIG_KLIPPER_HOME}" ]; then
     exit 1
 fi
 
-
-################################
-##### Compatibility checks #####
-################################
-
-# Check Kalico is installed (klippy/__init__.py contains APP_NAME = "Kalico")
-if [ -d "${CONFIG_KLIPPER_HOME}" ]; then
-  kalico="${CONFIG_KLIPPER_HOME}/klippy/__init__.py"
-else
-  kalico="${HOME}/klipper/klippy/__init__.py"
-fi
-
-if [ -f "${kalico}" ]; then
-    if grep -q '^APP_NAME[[:space:]]*=[[:space:]]*"Kalico"' \
-        "${kalico}" 2>/dev/null; then
-        if [ "${F_OVERRIDE_CHECKS}" = "y" ]; then
-            echo "${C_WARNING}WARNING: Kalico detected. Happy-Hare is not currently compatible with Kalico until Klipper motion-subsystem enhancements have been ported. Proceeding at your own risk.${C_OFF}" >&2
-        else
-            echo "${C_ERROR}ERROR: Kalico detected. Happy-Hare is not currently compatible with Kalico until Klipper motion-subsystem enhancements have been ported.${C_OFF}" >&2
-            exit 1
-        fi
-    fi
-fi
-
 if [ -n "${CONFIG_KLIPPER_CONFIG_HOME+x}" ] && [ ! -d "${CONFIG_KLIPPER_CONFIG_HOME}" ]; then
     echo "${C_ERROR}Klipper config directory not found: ${CONFIG_KLIPPER_CONFIG_HOME}${C_OFF}"
     exit 1
@@ -863,10 +1016,10 @@ fi
 ##### Menuconfig / Refresh #####
 ################################
 
-# Force F_PER_GATE_MCU if existing config already enables per-gate MCU support.
-# This preserves the expanded menuconfig behavior on later runs without needing -e.
-if [ -r "${KCONFIG_CONFIG}" ] && grep -q '^CONFIG_MMU_HAS_PER_GATE_MCU=y' "${KCONFIG_CONFIG}"; then
-    export F_PER_GATE_MCU=y
+# Keep the gate limit an earlier -g saved, for every unit's parse
+if [ -z "${F_MAX_GATES:-}" ]; then
+    F_MAX_GATES=$(saved_max_gates "${KCONFIG_CONFIG}")
+    [ -n "${F_MAX_GATES}" ] && export F_MAX_GATES
 fi
 
 # Decide whether interactive configuration is required.
@@ -889,12 +1042,14 @@ fi
 if [ -r "${KCONFIG_CONFIG}" ] && [ -n "${F_MENUCONFIG:-}" ]; then
     echo "${C_WARNING}You are running an interactive install with existing menuconfig ('${KCONFIG_CONFIG}').${C_OFF}"
     echo
-    echo "${C_WARNING}Read carefully, you have three options:${C_OFF}"
+    echo "${C_WARNING}Read carefully, you have two options:${C_OFF}"
     echo
-    echo "${C_WARNING}1) Refresh (select 1)${C_OFF} (Default upgrade path)"
-    echo "   This will NEVER CHANGE any manually edited .cfg parameter value and thus is limited"
-    echo "   to only ADDING NEW or missing config sections/options. Note that parameter values shown"
-    echo "   in menuconfig may be stale and not reflect your actual .cfg config"
+    echo "${C_WARNING}1) Merge/Refresh (select 1)${C_OFF} (Default upgrade path)"
+    echo "   This KEEPS the values you edited directly in your .cfg files (but not edited macro gcode)."
+    echo "   Before menuconfig opens, the simple settings your .cfg files hold are copied into menuconfig"
+    echo "   (you'll see the list and confirm), so menuconfig shows what you are actually running. Only"
+    echo "   the settings you then change in menuconfig are applied to your .cfg files, and new options"
+    echo "   are added."
     echo
     echo "${C_WARNING}2) Replace (select 2)${C_OFF} (Recommended)"
     echo "   This will OVERWRITE changes made directly to your .cfg files and create new default"
@@ -902,25 +1057,16 @@ if [ -r "${KCONFIG_CONFIG}" ] && [ -n "${F_MENUCONFIG:-}" ]; then
     echo "   This is RECOMMENDED if you make ALL your configuration changes via menuconfig. It is also"
     echo "   useful if you get into trouble and want to reset your starting position or change MMU."
     echo
-    echo "${C_WARNING}3) Merge (select 3)${C_OFF}"
-    echo "   This will MERGE simple parameter values set in menuconfig but will retain other changes made"
-    echo "   directly to your .cfg files. This is useful if you manage most parameters via menuconfig but"
-    echo "   don't want, for example, to accidentally overwrite your carefully tweaked hardware configuration"
-    echo
     echo "(Note that in all cases a BACKUP of your existing .cfg files will be made for reference)"
     echo
 
-    sel=$(prompt_n 3 "Choose upgrade mode")
+    sel=$(prompt_n 2 "Choose upgrade mode")
     case "$sel" in
         2) export F_CFG_UPGRADE_MODE=replace ;;
-        3) export F_CFG_UPGRADE_MODE=merge ;;
         *) export F_CFG_UPGRADE_MODE=refresh ;;
     esac
 
     echo "${C_INFO}Launching menuconfig (${F_CFG_UPGRADE_MODE} mode)...${C_OFF}"
-    if [ -n "${F_PER_GATE_MCU:-}" ]; then
-        echo "${C_INFO}Per-gate MCU support enabled. Menuconfig startup will be slower.${C_OFF}"
-    fi
     echo
 fi
 
@@ -979,11 +1125,11 @@ run_kconfig_units() {
     [ -r "${KCONFIG_CONFIG}" ] || return 0
 
     unset CONFIG_MULTI_UNIT CONFIG_MMU_UNITS
-    unset CONFIG_MMU_HAS_SENSOR_TOOLHEAD CONFIG_MMU_HAS_SENSOR_EXTRUDER CONFIG_MMU_HAS_TOOLHEAD_CUTTER
     . "${KCONFIG_CONFIG}"
 
     if [ -n "${CONFIG_MULTI_UNIT:-}" ]; then
         i=0
+        saved_ifs=$IFS
         IFS=,
         set -f
         for name in ${CONFIG_MMU_UNITS:-}; do
@@ -991,17 +1137,16 @@ run_kconfig_units() {
             [ -n "$name" ] || continue
 
             run_kconfig_one "${KCONFIG_CONFIG}_${name}" "${action}" "${only_if_stale}" \
+                KCONFIG_PARENT="${KCONFIG_CONFIG}" \
                 F_MULTI_UNIT=y \
                 UNIT_INDEX="$i" \
                 UNIT_NAME="$name" \
-                MCU_NAME="$name" \
-                HAS_SENSOR_TOOLHEAD="$CONFIG_MMU_HAS_SENSOR_TOOLHEAD" \
-                HAS_SENSOR_EXTRUDER="$CONFIG_MMU_HAS_SENSOR_EXTRUDER" \
-                HAS_SENSOR_TOOLHEAD_CUTTER="$CONFIG_MMU_HAS_TOOLHEAD_CUTTER"
+                MCU_NAME="$name"
 
             i=$((i + 1))
         done
         set +f
+        IFS=$saved_ifs
     fi
 }
 
@@ -1017,7 +1162,7 @@ run_kconfig_one() {
             "$@" \
             kconfig_needs_update)
 
-        [ "${needs}" = "y" ] || return 0
+        [ "${needs}" = "y" ] || max_gates_changed "${cfg}" || return 0
         echo "${C_INFO}Updating Kconfig defaults in '${cfg}'${C_OFF}"
     fi
 
@@ -1033,6 +1178,9 @@ run_kconfig_one() {
 ##### Menuconfig / Refresh #####
 ################################
 
+capture_units_baseline || exit 1
+export F_UNIT_NAME_BEFORE="$(single_unit_name)"
+
 if [ -n "${F_MENUCONFIG:-}" ]; then
     tmpconfig=
 
@@ -1045,6 +1193,9 @@ if [ -n "${F_MENUCONFIG:-}" ]; then
         cp -- "${KCONFIG_CONFIG}" "${tmpconfig}"
     fi
 
+    # Not while converting to multi-unit, when the saved config is still the single-unit one
+    [ -n "${tmpconfig:-}" ] || prepare_refresh
+
     run_kconfig_top menuconfig n
 
     if [ ! -e "${KCONFIG_CONFIG}" ]; then
@@ -1052,23 +1203,38 @@ if [ -n "${F_MENUCONFIG:-}" ]; then
         exit 1
     fi
 
+    # The single-unit config becomes that unit's file, which the unit migration then
+    # renames or sets aside to follow the edited unit list
     if [ -n "${tmpconfig:-}" ]; then
-        unset CONFIG_MULTI_UNIT CONFIG_MMU_UNITS
-        . "${KCONFIG_CONFIG}"
-
-        first_unit=$(trim "${CONFIG_MMU_UNITS%%,*}")
-        if [ -n "${first_unit}" ]; then
-            mv "${tmpconfig}" "${KCONFIG_CONFIG}_${first_unit}"
-        else
-            rm -f "${tmpconfig}"
-        fi
+        first_unit=${F_UNITS_BASELINE%%,*}
+        mv "${tmpconfig}" "${KCONFIG_CONFIG}_${first_unit:-unit0}"
     fi
 
+    review_unit_changes || exit 1
+    single_unit_renamed && F_UNIT_RENAMED=y
+    unit_migration_step kconfig || exit 1
+
     run_kconfig_units menuconfig n
+else
+    review_unit_changes || exit 1
+    single_unit_renamed && F_UNIT_RENAMED=y
+    unit_migration_step kconfig || exit 1
 fi
 
-# Always refresh stale configs after any optional menuconfig pass.
-run_kconfig_top olddefconfig y
+# Always refresh stale configs after any optional menuconfig pass. Renamed or moved
+# units must recompute their defaults (e.g. pin prefixes) even though not stale, and so
+# must every config compared with a menuconfig baseline, which has them recomputed
+if [ -n "${F_UNIT_RENAMED:-}" ] || [ -n "${F_MENUCONFIG_BASELINE:-}" ]; then
+    run_kconfig_top olddefconfig n
+else
+    run_kconfig_top olddefconfig y
+fi
+if [ -n "${F_UNITS_RESTRUCTURED:-}" ] || [ -n "${F_MENUCONFIG_BASELINE:-}" ]; then
+    run_kconfig_units olddefconfig n
+else
+    run_kconfig_units olddefconfig y
+fi
+# A unit sharing a component owned by a unit refreshed after it reads the owner again
 run_kconfig_units olddefconfig y
 
 # Give the v3 -> v4 upgrade a clean start now that Kconfig has resolved real paths -
@@ -1090,4 +1256,9 @@ install_and_clean() {
     fi
 }
 
+unit_migration_step prepare || exit 1
+# Hand edits the build replaced with a menuconfig change, for make install's summary
+HH_REPLACED_REPORT=$(mktemp -t hh_replaced.XXXXXX)
+export HH_REPLACED_REPORT
 time_elapsed install_and_clean
+rm -f "${HH_REPLACED_REPORT}"

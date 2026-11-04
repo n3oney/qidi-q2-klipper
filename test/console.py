@@ -28,11 +28,14 @@ from __future__ import annotations
 import argparse
 import collections
 import contextlib
+import datetime
 import logging
 import os
 import re
 import select
+import shutil
 import sys
+import tempfile
 import time
 
 # The fakes log at debug/warning through the root logger and every test file quiets it at
@@ -44,8 +47,10 @@ if __package__ in (None, ''):                       # allow `python test/console
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from test.hh import session as hh_session           # noqa: E402
+from test.hh import print_job                       # noqa: E402
+from test.hh.webui_bridge import WebUiBridge        # noqa: E402
 
-# -- optional readline, mirroring utils/simulator.py -------------------------------
+# -- optional readline, mirroring utils/sync_feedback_sim.py -------------------------
 HAVE_READLINE = False
 try:
     import readline
@@ -73,6 +78,8 @@ except Exception:                                   # pragma: no cover - Windows
 TIP_AT_GATE = -40.0
 DEFAULT_TEMP = 220
 DEFAULT_PROFILE = 'ercf_vvd'
+API_PORT = 7125                                 # Moonraker's own port, so UIs find it unprompted
+API_PORT_TRIES = 10                             # next ports to try if the default is taken
 # Gate availability values accepted by MMU_GATE_MAP. These stay local because importing
 # production `extras` before hh_session installs fake Klipper contaminates module resolution.
 GATE_EMPTY = 0
@@ -107,7 +114,7 @@ def _hex_to_rgb(digits):
 
 
 def _rgb_to_256(r, g, b):
-    """Nearest xterm-256 index: the 6x6x6 cube, or the greyscale ramp when near-grey."""
+    """Nearest xterm-256 index: the 6x6x6 cube, or the grayscale ramp when near-grey."""
     if abs(r - g) < 11 and abs(g - b) < 11:
         if r < 8:
             return 16
@@ -131,7 +138,7 @@ def truecolor_supported():
     return os.environ.get('COLORTERM', '').lower() in ('truecolor', '24bit')
 
 
-# The 16 ANSI colours, in SGR order (30-37 then 90-97). Used for nearest-match in '16'
+# The 16 ANSI colors, in SGR order (30-37 then 90-97). Used for nearest-match in '16'
 # mode; a per-channel threshold collapsed every pastel to white.
 _ANSI16 = ((0, 0, 0), (128, 0, 0), (0, 128, 0), (128, 128, 0),
            (0, 0, 128), (128, 0, 128), (0, 128, 128), (192, 192, 192),
@@ -287,7 +294,7 @@ def paint(text, code, enabled=True):
 # the comment marker in every config and G-code file the reader is already looking at, which
 # carries exactly the "not an instruction, just a remark" sense wanted here.
 INFO_PREFIX = '# '
-# Grey rather than SGR 2 (faint) on purpose: _sgr_state() tracks foreground colours and
+# Grey rather than SGR 2 (faint) on purpose: _sgr_state() tracks foreground colors and
 # bold, so a grey line re-opens its colour correctly when the pager wraps it. Faint would be
 # dropped at the wrap and the continuation rows would come back at full brightness.
 INFO_COLOUR = '90'
@@ -305,9 +312,9 @@ TIME_COLOUR = '90'
 # the header is therefore repainted. Halving this does NOT double the reactor's work: _tick
 # advances by the REAL time measured since the last one, not by this constant, so virtual
 # seconds per wall second is invariant and only the per-tick overhead (chiefly repaint)
-# scales. 0.5s because that is what makes an led_effect animation legible - at frame_rate 24
-# a one-second sample showed every 24th frame, which reads as a jump rather than a fade.
-LIVE_INTERVAL = 0.5
+# scales. 0.125s gives eight display updates per second, sampling every third frame of a
+# 24 fps LED effect. This timer is console-only; tests advance the reactor directly.
+LIVE_INTERVAL = 0.125
 # Never advance more than this in one tick. A laptop that slept, or a SIGSTOP, would
 # otherwise come back to a catch-up of hours - which is both slow and, past about seven
 # virtual minutes, over the reactor's iteration cap.
@@ -395,7 +402,7 @@ def readline_backend():
 
     readline.backend only exists on 3.13+, and `make console` picks whichever interpreter it
     finds - klippy-env's or the venv's - so the docstring probe is the working path on older
-    ones, not redundant defence.
+    ones, not redundant defense.
     """
     if not HAVE_READLINE:
         return 'readline'
@@ -488,6 +495,7 @@ class Console:
         self.clock_epoch = None                     # reactor.monotonic() at that moment
         self._ticking = False                       # re-entry guard for the live tick
         self._at_prompt = False                     # ... and the only place a tick may run
+        self._prompt_buffer = ''                    # stale readline content at prompt entry
         self._last_tick = None
         # Every line that reached the terminal, for the pager. Rendered, not raw: this is
         # what was displayed, which is not the same as self.sink (MMU responses only - no
@@ -497,11 +505,14 @@ class Console:
         self.tee = None                             # the ScrollbackTee, while interacting
         self.hh = None
         self.fil = None
+        self.bridge = None                          # the web UI's Moonraker API
+        self.bridge_error = None                    # why it did not start, if it was asked to
         self.running = True
         # Commands that raised. Counted separately from hh.errors because an exception out
         # of the dispatcher never reaches respond_raw, so a parse failure would otherwise
         # leave --script exiting 0.
         self.failures = 0
+        self.job = None                             # a /print job, while one is held
 
     # -- lifecycle ------------------------------------------------------------
     def boot(self):
@@ -584,6 +595,9 @@ class Console:
         if not a.no_moonraker:
             self.hh.attach_moonraker(spools=self.hh.spools_for_gate_map())
 
+        if self._wants_bridge():
+            self._start_bridge(API_PORT if a.serve is None else a.serve, explicit=a.serve is not None)
+
         # LAST, so startup itself stays instant no matter what pacing is asked for - preloading
         # 13 gates at --pace 1 would otherwise cost minutes of virtual time before the first
         # prompt. /pace changes it live.
@@ -606,6 +620,81 @@ class Console:
         self.wall_start = time.time()
         self.clock_epoch = self.hh.reactor.monotonic()
         return self
+
+    def _wants_bridge(self):
+        """
+        On by default at a terminal, off for scripts and tests. --serve forces it on and
+        --no-serve off. The terminal condition is not a nicety: the web UI is only served from
+        the idle tick under the prompt, and a test that built a Console would otherwise
+        fight every other one for the port.
+        """
+        a = self.args
+        if a.no_serve:
+            return False
+        if a.serve is not None:
+            return True
+        return not a.script and sys.stdin.isatty() and sys.stdout.isatty()
+
+    def _start_bridge(self, port, explicit=False):
+        """
+        Serve a Moonraker-compatible API so a real Mainsail/Fluidd can connect to this
+        simulator (see test/hh/webui_bridge.py). Happy Hare's pause dialog arrives as
+        '// action:prompt_*' output lines, which reach the UI with the rest of the output.
+
+        A port that is taken (a real Moonraker, or another console) is skipped for the next
+        free one unless the user named it, in which case that is reported and left alone.
+        """
+        printer = self.hh.printer
+        tries = 1 if explicit or port == 0 else API_PORT_TRIES
+        for candidate in range(port, port + tries):
+            try:
+                self.bridge = WebUiBridge(self.hh, self._run_for_bridge, port=candidate).start()
+                break
+            except OSError as exc:
+                self.bridge_error = 'Web API not started: port %d: %s' % (candidate, exc.strerror or exc)
+        if self.bridge is None:
+            return
+        self.bridge_error = None
+
+    def web_api_lines(self):
+        """What to tell the user about the web API: where it is and how to point a UI at it."""
+        if self.bridge is None:
+            return [self.bridge_error] if self.bridge_error else []
+        port = self.bridge.port
+        return ['Web API (for Mainsail/Fluidd): host 127.0.0.1  port %d  (http://127.0.0.1:%d)'
+                % (port, port),
+                '/web for how to connect; --no-serve turns it off.']
+
+    def _meta_web(self, args):
+        lines = self.web_api_lines()
+        if self.bridge is None:
+            print('\n'.join(lines) if lines else 'The web API is off. Start the console without --no-serve.')
+            return
+        port = self.bridge.port
+        for line in lines[:1]:
+            self.info(line)
+        self.info('Mainsail dev server, from a Mainsail checkout:\n'
+                  '  VUE_APP_HOSTNAME=127.0.0.1 VUE_APP_PORT=%d npx vite serve\n'
+                  'A built Mainsail or Fluidd: add a printer at 127.0.0.1:%d in its connection '
+                  'dialog.\n'
+                  'Then /print start, /exhaust 1 and MMU_CHANGE_TOOL TOOL=1 make a pause '
+                  'dialog appear.' % (port, port))
+
+    def _run_for_bridge(self, script):
+        """A script sent from the web UI: shown and run as if typed at the prompt."""
+        for line in script.split('\n'):
+            if line.strip():
+                self.echo(self.prompt() + line)
+                self.run_command(line)
+
+    def _service_bridge(self):
+        """Run what the web UI has asked for, from under the prompt."""
+        if self.bridge is None or not (self.bridge.inbox.qsize() or self.bridge.clients):
+            return
+        if self.bridge.inbox.qsize():
+            self._reprint(self.bridge.service)
+        else:
+            self.bridge.service()                   # nothing to print, just the status push
 
     @staticmethod
     def _run_macro_body(macro, gcmd):
@@ -645,6 +734,9 @@ class Console:
         self.startup_output = refreshed
 
     def close(self):
+        if self.bridge is not None:
+            self.bridge.close()
+            self.bridge = None
         if self.hh is not None:
             # Not optional: MmuLogger leaks an atexit handler and a QueueListener thread
             # otherwise (test/hh/bootstrap.py:111).
@@ -699,6 +791,10 @@ class Console:
             self.tee.write_capture(text + '\n')
 
     def _on_output(self, msg):
+        if self.bridge is not None:
+            self.bridge.host_output(msg)
+        if msg.startswith('// action:'):
+            return # Host commands for a UI, not console text
         self.sink.append(msg)
         # Stamp NOW, not when it is printed. _drain() runs after the command returns, so
         # stamping there gave every line of an operation the same reading - the clock as it
@@ -799,7 +895,7 @@ class Console:
         """
         self.hh.gcode.run_script(line)
 
-    def run_command(self, line):
+    def run_command(self, line, warn_unknown=True):
         mark = len(self.sink)
         unhandled_mark = len(self.hh.gcode.unhandled)
         gate_status_before = None
@@ -837,8 +933,9 @@ class Console:
         self._settle_moonraker()
         self._drain(mark)                           # anything streaming did not already print
         self.streaming = False
-        self._warn_unhandled(line, unhandled_mark)
-        self._warn_silent_macro(line, mark)
+        if warn_unknown:
+            self._warn_unhandled(line, unhandled_mark)
+            self._warn_silent_macro(line, mark)
 
     def _sync_filament_to_gate_map(self, before):
         """Make explicit MMU_GATE_MAP availability changes physical in the simulator."""
@@ -1006,6 +1103,10 @@ class Console:
         if bowden >= 0:
             extra.append('bowden=%d%%' % bowden)
         extra.append('t=%+.2fs' % (self.hh.reactor.monotonic() - 1000.))
+        extruder = self.hh.printer.lookup_object('extruder', None)
+        if extruder is not None:
+            temp, target = extruder.get_heater().get_temp()
+            extra.append('nozzle=%.0f/%.0fC' % (temp, target))
         extra.extend(self._current_cells(gate))
         # Only when pacing is ON. 0 is the default and means "moves are instant", which is
         # the absence of a mode rather than a mode - and a permanent 'realtime=0%' would just
@@ -1187,7 +1288,7 @@ class Console:
 
     # A lit LED is a SOLID BLOCK, not '##'. The old glyph was painted in the LED's own
     # colour, which made a white or grey LED - mmu_breathing_white_fast (0.2,0.2,0.2) on
-    # 'selecting', mmu_sparkle on 'complete', white_light (1,1,1) for an uncoloured gate
+    # 'selecting', mmu_sparkle on 'complete', white_light (1,1,1) for an uncolored gate
     # under filament_color - indistinguishable from ordinary text, because the terminal's
     # default foreground IS white/grey. A block in that same colour still reads as a block.
     # Foreground only: _sgr_state() tracks fg and bold, so a background colour would not
@@ -1372,13 +1473,24 @@ class Console:
         ('/selector [POS|gate N|home|end] [UNIT=n]',
          'where the selector carriage physically is - set it as you would by hand'),
         ('/heat [TEMP]', 'set the extruder temperature'),
+        ('/web', 'where the web API is and how to point Mainsail or Fluidd at it'),
+        ('/print [start|end]', 'act as a print in progress (or finished), so an error pauses it'),
+        ('/print job [FILE]', 'play a G-code print job: the built-in test job, or FILE as '
+                              'written. A pause holds it; /print resume or /print cancel'),
         ('/pace [FACTOR]', 'how much of each move\'s real duration to spend: 0=instant '
                            '(default), 0.5=twice as fast as real, 1=real time '
                            '(alias /realtime)'),
         ('/timestamp [on|off]', 'stamp MMU output with the virtual clock (no argument '
                                 'toggles)'),
         ('/trace 0-4', "Happy Hare's own log_level, 4 = full narration"),
-        ('/tag UID [GATE]', 'attach an NFC tag (needs --virtual-nfc)'),
+        ('/tag [UID [GATE|UNIT]]',
+         'present an NFC tag: a GATE puts it on that gate\'s filament, a UNIT holds it '
+         'on that unit\'s shared reader ("off" takes it away again). No argument lists '
+         'the readers and the UIDs the simulated Spoolman knows - e.g. '
+         '"/tag BADCAFE005 unit0" resolves to a real spool'),
+        ('/td1 [TD [COLOR]] [WHERE]',
+         'present filament measuring TD to a TD-1 scanner, or off|unplug|plug|fail '
+         'instead. WHERE is a gate or USB serial; bare /td1 reports every scanner'),
         ('/header [GROUPS]', 'set header groups: %s, or "all"/"off"' % ','.join(GROUPS)),
         ('/log [N]', 'path to mmu.log and its last N lines (default 20)'),
         ('/errors', 'every !! message this session'),
@@ -1386,6 +1498,10 @@ class Console:
         ('/help', 'this list'),
         ('/quit', 'exit (also Ctrl-D)'),
     )
+
+    # Beside META_HELP rather than inside meta(), so /help coverage can check both
+    META_ALIASES = {'wait': 'advance', 'q': 'quit', 'h': 'help', 's': 'scroll',
+                    'realtime': 'pace', 'td': 'td1'}
 
     def meta(self, line):
         self.meta_line = line                       # /scroll needs its arguments unsplit
@@ -1395,9 +1511,8 @@ class Console:
         name, rest = parts[0].lower(), parts[1:]
         fn = getattr(self, '_meta_' + name, None)
         if fn is None:
-            alias = {'wait': '_meta_advance', 'q': '_meta_quit', 'h': '_meta_help',
-                     's': '_meta_scroll', 'realtime': '_meta_pace'}.get(name)
-            fn = getattr(self, alias) if alias else None
+            alias = self.META_ALIASES.get(name)
+            fn = getattr(self, '_meta_' + alias) if alias else None
         if fn is None:
             print(paint('?? unknown meta-command /%s (try /help)' % name, '33', self.color))
             return
@@ -1410,14 +1525,6 @@ class Console:
         print('Meta-commands:')
         for name, desc in self.META_HELP:
             print('  %-22s %s' % (name, desc))
-        # The one part of the header that is not self-describing: a coloured block is not
-        # obviously "one LED" until someone says so, and the gate grouping is invisible on a
-        # one-LED-per-gate machine.
-        print("\nIn the 'leds' header group, one block is one physical LED painted in its "
-              'own\ncolour - %s lit, %s lit but too dim to see honestly (shown brighter), '
-              '%s off -\nwith a gate\'s LEDs run together and a space between gates. [...] '
-              "is the\nsegment's current effect."
-              % (self.LED_ON, self.LED_DIM, self.LED_OFF))
         print('\nEverything else is sent to the MMU as G-code. MMU_HELP lists Happy Hare\'s\n'
               'commands, and any of them accepts HELP=1 for its own parameters.')
 
@@ -1438,6 +1545,10 @@ class Console:
         while left > 0:
             step = min(ADVANCE_SLICE, left)
             self.hh.reactor.advance(step)
+            # Moonraker answers continuously on a real printer. Without this the live
+            # clock advances Klipper alone and every lookup the NFC poll dispatches
+            # banks up, to be delivered in one burst by the next command
+            self._settle_moonraker()
             left -= step
 
     def _meta_advance(self, args):
@@ -1461,6 +1572,7 @@ class Console:
         self.startup_output = []
         self.clock_epoch = None
         self.failures = 0
+        self.job = None                             # a /print job, while one is held
         self._clear_sink()
         if self.scrollback is not None:
             self.scrollback.clear()
@@ -1728,6 +1840,218 @@ class Console:
     def _meta_heat(self, args):
         self.hh.heat_extruder(float(args[0]) if args else self.args.temp)
 
+    def _meta_print(self, args):
+        """
+        Make the machine look like it is mid-print. Outside a print an MMU error just fails
+        the command; in one it pauses and, with a web UI attached, pops the pause dialog.
+
+        `job`, `resume` and `cancel` play a whole G-code print job instead - see _job_play().
+        """
+        mode = args[0].lower() if args else 'start'
+        if mode == 'job':
+            if len(args) > 2:
+                raise ValueError('usage: /print job [FILE]')
+            self._job_start(args[1] if len(args) > 1 else None)
+            return
+        if mode == 'resume':
+            self._job_resume()
+            return
+        if mode == 'cancel':
+            self._job_cancel()
+            return
+        if mode not in ('start', 'end'):
+            raise ValueError('usage: /print [start|end|job [FILE]|resume|cancel]')
+        stats = self.hh.printer.lookup_object('print_stats')
+        if mode == 'start':
+            stats.set_state('printing')
+            self.run_command('MMU_PRINT_START')
+        else:
+            self.job = None
+            self.run_command('MMU_PRINT_END')
+            stats.set_state('complete')
+
+    ######################
+    ##### Print jobs #####
+    ######################
+
+    # Macros whose bodies run while a job plays. Everywhere else the harness only records a
+    # macro call (klippy_root/extras/gcode_macro.py), which is why T1 at the prompt is silent.
+    # Park, cut and purge stay recorded no-ops even in a job: their motion is not modelled.
+    JOB_MACROS = ('MMU_START_SETUP', 'MMU_START_CHECK', 'MMU_START_LOAD_INITIAL_TOOL',
+                  'MMU_END')
+    # Played straight through the dispatcher with no per-line settle: a sliced file is almost
+    # entirely these, and settling every one would make a real print take minutes
+    JOB_MOTION = re.compile(r'^(G0|G1|G2|G3|G4|G90|G91|G92|M82|M83)$')
+    # Virtual time owed by moves is paid in slices this long, so timers fire across a print
+    JOB_TICK = 0.5
+
+    def _job_start(self, path):
+        if self.job is not None:
+            raise ValueError('a job is held at line %d - /print resume or /print cancel'
+                             % self.job.line_no)
+        builtin = path is None
+        path = print_job.BUILTIN_JOB if builtin else os.path.expanduser(path)
+        workdir = tempfile.mkdtemp(prefix='hh-job-')
+        try:
+            lines, note = print_job.prepare(path, self.hh.mmu, workdir, builtin=builtin)
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+        name = os.path.basename(path)
+        self.job = _Job(name=name, lines=lines)
+        self.info('Print job %s: %d lines, %s' % (name, len(lines), note))
+
+        stats = self.hh.printer.lookup_object('print_stats')
+        stats.filename = name
+        stats.total_duration = stats.print_duration = 0.
+        self.job.started = self.hh.reactor.monotonic()
+        self._job_set_state('printing')
+        self._job_play()
+
+    def _job_resume(self):
+        if self.job is None:
+            raise ValueError('no job is held - /print job [FILE] starts one')
+        if self.hh.mmu.is_paused():
+            raise ValueError('the machine is still paused - fix it, RESUME, then /print resume')
+        self.info('Resuming %s at line %d' % (self.job.name, self.job.next + 1))
+        self._job_set_state('printing')
+        self._job_play()
+
+    def _job_cancel(self):
+        if self.job is None:
+            raise ValueError('no job is held')
+        job, self.job = self.job, None
+        self.run_command('CANCEL_PRINT')
+        self._job_set_state('cancelled')
+        self.info('Print job %s cancelled at line %d' % (job.name, job.line_no))
+
+    def _job_set_state(self, state):
+        """Move print_stats and idle_timeout as virtual_sdcard would, so HH sees it happen."""
+        stats = self.hh.printer.lookup_object('print_stats')
+        idle = self.hh.printer.lookup_object('idle_timeout')
+        mark = len(self.sink)
+        stats.set_state(state)
+        if state in ('printing', 'complete', 'cancelled', 'error'):
+            idle.set_state('Printing' if state == 'printing' else 'Ready')
+        self.hh.reactor.advance(0.)
+        self._drain(mark)
+
+    def _job_play(self):
+        """
+        Feed the held job from where it stopped until it ends, the machine pauses, a command
+        fails (the print errors, as virtual_sdcard's would) or the job cancels itself.
+
+        What runs for real: the macros in JOB_MACROS and T<n> (their bodies, only for the
+        duration), every Happy Hare command, extrusion (G0-G3 E through gcode_move into the
+        filament model) and the extruder heater (M104/M109). Time passes as the moves would
+        take it, plus G4 dwells. Anything else the harness does not know - bed heaters,
+        EXCLUDE_OBJECT_*, the user's own PRINT_START - is ignored and listed at the end.
+        """
+        job = self.job
+        stats = self.hh.printer.lookup_object('print_stats')
+        gcode_move = self.hh.printer.lookup_object('gcode_move')
+        toolhead = self.hh.printer.lookup_object('toolhead')
+        pause_resume = self.hh.printer.lookup_object('pause_resume')
+        effects = self.hh.printer.harness_macro_effects
+        names = list(self.JOB_MACROS) + ['T%d' % t for t in range(self.hh.mmu.num_gates)]
+        saved = {n: effects.get(n) for n in names}
+        for n in names:
+            effects[n] = self._run_macro_body
+        owed = 0.
+        outcome = 'complete'
+        try:
+            while job.next < len(job.lines):
+                line = job.lines[job.next].strip()
+                job.next += 1
+                word = line.split(None, 1)[0].upper() if line else ''
+                if not word or word.startswith(';'):
+                    continue
+                job.line_no = job.next
+                job.played += 1
+                failures, cancels = self.failures, pause_resume.cancel_calls
+                if self.JOB_MOTION.match(word):
+                    dwells = len(toolhead.dwells)
+                    before = gcode_move.last_position[:4]
+                    try:
+                        self.hh.gcode.run_script(line)
+                    except Exception as exc:        # noqa: BLE001
+                        print(paint('!! %s' % exc, '1;31', self.color))
+                        self.failures += 1
+                    after = gcode_move.last_position[:4]
+                    de = after[3] - before[3]
+                    job.extruded += de
+                    xyz = sum((a - b) ** 2 for a, b in zip(after[:3], before[:3])) ** .5
+                    if gcode_move.speed > 0:
+                        owed += max(xyz, abs(de)) / gcode_move.speed
+                    owed += sum(toolhead.dwells[dwells:])
+                else:
+                    owed = self._job_pay(owed, 0.)
+                    unhandled_mark = len(self.hh.gcode.unhandled)
+                    self.run_command(line, warn_unknown=False)
+                    for raw in self.hh.gcode.unhandled[unhandled_mark:]:
+                        if raw.split(None, 1)[0].upper() != word:
+                            continue
+                        if re.match(r'^T\d+$', word):
+                            # Klipper would only say "Unknown command" and print on with
+                            # the wrong filament: a job wanting a tool the MMU lacks fails
+                            print(paint('!! %s: no such tool, this MMU has %d gates'
+                                        % (word, self.hh.mmu.num_gates), '1;31', self.color))
+                            self.failures += 1
+                        else:
+                            job.ignored[word] += 1
+                owed = self._job_pay(owed, self.JOB_TICK)
+                stats.total_duration = stats.print_duration = (
+                    self.hh.reactor.monotonic() - job.started)
+                if self.failures > failures:
+                    outcome = 'error'
+                    break
+                if pause_resume.cancel_calls > cancels:
+                    outcome = 'cancelled'
+                    break
+                if self.hh.mmu.is_paused():
+                    self._job_hold('the machine paused')
+                    return
+            self._job_pay(owed, 0.)
+        except KeyboardInterrupt:
+            self._job_hold('interrupted')
+            return
+        finally:
+            for n, effect in saved.items():
+                if effect is None:
+                    effects.pop(n, None)
+                else:
+                    effects[n] = effect
+        self.job = None
+        self._job_set_state(outcome)
+        if outcome != 'complete':
+            self.info('Print job %s %s at line %d: %s' % (
+                job.name, 'failed' if outcome == 'error' else 'cancelled', job.line_no,
+                job.lines[job.line_no - 1].strip()))
+            return
+        summary = ('Print job %s complete: %d lines, %.1fmm extruded, %d toolchanges, %s'
+                   % (job.name, job.played, job.extruded, self.hh.mmu.num_toolchanges,
+                      _duration(self.hh.reactor.monotonic() - job.started)))
+        if job.ignored:
+            summary += '\nIgnored (not simulated): %s' % ', '.join(
+                '%s x%d' % (w, n) for w, n in sorted(job.ignored.items()))
+        self.info(summary)
+
+    def _job_pay(self, owed, threshold):
+        """Spend the virtual time the moves played so far would have taken, once it adds up."""
+        if owed > 0. and owed >= threshold:
+            mark = len(self.sink)
+            self.advance(owed)
+            self._drain(mark)
+            return 0.
+        return owed
+
+    def _job_hold(self, why):
+        job = self.job
+        self.hh.printer.lookup_object('print_stats').set_state('paused')
+        self.info('Print job %s held at line %d (%s): %s\n'
+                  'Fix it, RESUME (or MMU_UNLOCK then RESUME), then /print resume - '
+                  'or /print cancel' % (job.name, job.line_no, why,
+                                        job.lines[job.line_no - 1].strip()))
+
     def _meta_pace(self, args):
         """
         Trade speed for observability. Without a factor, just report the current one.
@@ -1803,7 +2127,8 @@ class Console:
             # Only ever armed around a real prompt. script() has no arm/disarm discipline
             # of its own, so a '/live on' in a command file would leave a timer running and
             # the next tick would land inside a dispatch, where advance() asserts.
-            if not (self.live and sys.stdout.isatty() and sys.stdin.isatty()):
+            if not ((self.live or self.bridge is not None)
+                    and sys.stdout.isatty() and sys.stdin.isatty()):
                 return False
             self._last_tick = time.monotonic()
             signal.signal(signal.SIGALRM, self._tick)
@@ -1826,12 +2151,17 @@ class Console:
         # tick would then call advance() from inside a dispatch, where the reactor asserts
         # "advance() called from inside a callback". Checked HERE, in the handler, so a late
         # delivery is a no-op rather than a race.
-        if self._ticking or not self.live or self.hh is None or not self._at_prompt:
+        if self._ticking or self.hh is None or not self._at_prompt:
+            return
+        if not self.live and self.bridge is None:
             return
         if getattr(self.hh.reactor, '_g_dispatch', None) is not None:
             return                                  # belt and braces: mid-dispatch anyway
         self._ticking = True
         try:
+            self._service_bridge()
+            if not self.live:
+                return                              # a frozen clock only serves the web UI
             now = time.monotonic()
             # 'is None', not 'or': _last_tick is a float and 0.0 is a legitimate reading,
             # which 'or' would silently treat as never-ticked and skip the advance.
@@ -1856,25 +2186,37 @@ class Console:
         finally:
             self._ticking = False
 
+    def _line_buffer(self):
+        """
+        What the user has actually typed at this prompt, or ''.
+
+        get_line_buffer() is not reliably empty at the start of a line: macOS's libedit
+        build can still hand back the PREVIOUS command until the first keystroke syncs
+        it, which is how a timeout firing at an untouched prompt redraws '> MMU_GATE_MAP'
+        instead of '> '. So compare against what it read when this prompt opened and
+        treat "unchanged" as nothing typed.
+        """
+        if not HAVE_READLINE:
+            return ''
+        try:
+            pending = readline.get_line_buffer()
+        except Exception:                           # noqa: BLE001
+            return ''
+        return '' if pending == self._prompt_buffer else pending
+
     def _reprint(self, emit_output):
         """
         Print from under the prompt: wipe the prompt line, emit, put the prompt back.
 
         readline believes it still owns that line, so it has to be erased first and rebuilt
-        afterwards from get_line_buffer() - otherwise the output lands on top of what the
-        user is typing and the typing is lost.
+        afterwards - otherwise the output lands on top of what the user is typing and the
+        typing is lost.
         """
         out = raw_stdout()
         out.write('\r\033[2K')
         out.flush()
         emit_output()
-        pending = ''
-        if HAVE_READLINE:
-            try:
-                pending = readline.get_line_buffer()
-            except Exception:                       # noqa: BLE001
-                pending = ''
-        out.write(self.prompt() + pending)
+        out.write(self.prompt() + self._line_buffer())
         out.flush()
 
     def _meta_live(self, args):
@@ -1916,11 +2258,230 @@ class Console:
         self.hh.mmu.p.log_level = int(args[0]) if args else 1
         print('  log_level = %s' % self.hh.mmu.p.log_level)
 
+    # Long enough to outlast NFC_TAG_HOLD_TIME (5s), the cooldown after the reader
+    # acts on a tag - so a second tag presented straight after a first is still seen
+    TAG_POLL_WAIT, TAG_POLL_SLICE = 7.0, 0.25
+
     def _meta_tag(self, args):
+        """
+        Put an NFC tag where a reader can find it, addressed the way MMU_NFC is.
+
+        A GATE attaches the tag to that gate's filament, for the per-gate reader that
+        filament passes - nothing reads it until something scans, the same split as
+        /place and /preload. A UNIT presents the tag to that unit's shared reader by
+        hand, which is the only way to reach one: bound to no gate, it never consults
+        the filament model (nfc_fixtures.py:424).
+
+        No fallback between them. A gate with no reader of its own says so and names
+        the unit to address instead, rather than quietly acting on a reader that
+        serves every other gate on that unit too.
+        """
+        if not args:
+            self._tag_report()
+            return
         uid = args[0]
-        gate = int(args[1]) if len(args) > 1 else self.hh.mmu.gate_selected
+        where = args[1] if len(args) > 1 else None
+        if where is not None and not where.lstrip('-').isdigit():
+            self._present_tag(self._shared_reader(where), uid)
+            return
+        gate = int(where) if where is not None else self.hh.mmu.gate_selected
+        manager = getattr(self.hh.mmu.mmu_unit(gate), 'nfc_manager', None)
+        if manager is None or not manager.has_gate_nfc_reader(gate):
+            unit = self.hh.mmu.mmu_unit(gate)
+            hint = ('/tag %s %s' % (uid, unit.name) if unit.nfc_reader
+                    else 'and nor has unit %s' % unit.name)
+            raise ValueError('gate %d has no NFC reader of its own - %s' % (gate, hint))
+        if uid.lower() in ('off', 'none'):
+            raise ValueError('a gate\'s tag goes away with its filament: /remove %d' % gate)
         self.fil.attach_tag(gate, uid)
         self.hh.reactor.advance(0.)
+
+    def _shared_reader(self, name):
+        """
+        A unit name -> that unit's shared reader. Its reader name is accepted too,
+        being what the config calls it and what /tag prints.
+        """
+        for unit in self.hh.mmu.mmu_machine.units:
+            if name == unit.name:
+                if not unit.nfc_reader:
+                    raise ValueError('unit %s has no shared NFC reader' % name)
+                return unit.nfc_reader
+        if name in self.hh.nfc_chips:
+            return name
+        shared = ['%s (%s)' % (u.name, u.nfc_reader)
+                  for u in self.hh.mmu.mmu_machine.units if u.nfc_reader]
+        raise ValueError('no unit or reader %r; shared readers: %s'
+                         % (name, ', '.join(shared) or 'none'))
+
+    def _tag_report(self):
+        """Every reader, and the tag UIDs the simulated Spoolman actually knows."""
+        if not self.hh.nfc_chips:
+            print('  no virtual NFC readers (needs --virtual-nfc)')
+        shared = {u.nfc_reader: u.name for u in self.hh.mmu.mmu_machine.units if u.nfc_reader}
+        for name, chip in sorted(self.hh.nfc_chips.items()):
+            if name in shared:
+                serves = 'shared on %s - present by hand' % shared[name]
+            else:
+                serves = 'gates %s' % (','.join(str(g) for g in chip._gates) or 'none')
+            held = getattr(chip.presented, 'uid', None)
+            print('  %-14s %-34s holding %s' % (name, serves, held or 'nothing'))
+        known = self._spoolman_uids()
+        if known:
+            print('  Spoolman knows: %s' % ', '.join('%s (%s)' % kv for kv in known))
+
+    def _spoolman_uids(self):
+        """[(uid, filament name)] from the fake Spoolman, for tags that will resolve."""
+        if self.hh.moonraker is None:
+            return []
+        found = []
+        for spool in self.hh.moonraker.db.spools.values():
+            uid = (spool.get('extra', {}).get('rfid_tag') or '').strip('"')
+            if uid:
+                found.append((uid, spool.get('filament', {}).get('name', '?')))
+        return found
+
+    def _present_tag(self, reader, uid):
+        """
+        Hold a tag on one reader, and let its poll find it.
+
+        The wait is the point. Only the reader's own automatic poll stages a tag -
+        MMU_NFC READ=1 reports a UID and stages nothing - so without it a frozen-clock
+        session (any --script, and --live off) would present a tag that is never read,
+        which looks exactly like a broken command.
+        """
+        if not self.hh.nfc_chips:
+            raise ValueError('no virtual NFC readers in this session (needs --virtual-nfc)')
+        chip = self.hh.chip(reader)
+        mark = len(self.sink)
+        if uid.lower() in ('off', 'none'):
+            chip.clear()
+            self.info('tag taken off %s' % reader)
+            return
+        before = chip.reads
+        chip.present(uid)
+        waited = 0.
+        while chip.reads == before and waited < self.TAG_POLL_WAIT:
+            self.hh.reactor.advance(self.TAG_POLL_SLICE)
+            waited += self.TAG_POLL_SLICE
+        self._settle_moonraker()
+        self._drain(mark)
+        if chip.reads == before:
+            self.info('tag %s presented, but %s did not read it within %gs - it is '
+                      'disabled, or standing down for a move' % (uid, reader, waited))
+
+    # A mid-range opaque reading. TD is a transmission distance in mm, so LOW is
+    # opaque and HIGH is clear (black ~0.1, white ~4.6, transparent natural ~100)
+    TD1_DEFAULT_TD, TD1_DEFAULT_COLOR = 2.5, '7f7f7f'
+
+    def _td1_transport(self):
+        """The virtual [td1] component behind the fake Moonraker - see FakeTd1Transport."""
+        if getattr(self.hh.mmu, 'td1', None) is None:
+            raise ValueError('this profile configures no TD-1 scanner')
+        if self.hh.moonraker is None:
+            raise ValueError('no Moonraker attached - the scanners live on its side')
+        return self.hh.moonraker.td1
+
+    def _td1_serial(self, where=None):
+        """
+        Resolve a gate number, a USB serial, or nothing at all to one scanner.
+
+        A gate resolves the way MMU_TD1 does - its own in-path scanner first, then the
+        off-path one. An unrecognized word is taken as a serial and NOT rejected: a
+        scanner Moonraker reports that no gate references is how you find a serial to
+        configure, so it has to be possible to plug one in.
+        """
+        bridge = self.hh.mmu.td1
+        if where is not None and not where.lstrip('-').isdigit():
+            return where
+        gate = int(where) if where is not None else self.hh.mmu.gate_selected
+        manager = bridge.manager_for(gate)
+        device = manager.addressed_device(gate) if manager is not None else None
+        if device is not None:
+            return device.serial
+        # Nothing serves that gate - the bypass, or a unit with no scanner. One
+        # scanner on the machine is unambiguous anyway
+        serials = sorted(bridge.devices)
+        if len(serials) == 1:
+            return serials[0]
+        raise ValueError('no TD-1 scanner serves gate %s; name one of: %s'
+                         % (gate, ', '.join(serials) or 'none configured'))
+
+    # What a scanner can be doing beyond holding a measurement, one FakeTd1Transport
+    # state each
+    TD1_STATES = {'off': 'remove', 'unplug': 'unplug', 'plug': 'attach', 'fail': 'fail'}
+    TD1_USAGE = ('usage: /td1 [TD [RRGGBB]] [GATE|SERIAL], or /td1 %s [GATE|SERIAL]'
+                 % '|'.join(TD1_STATES))
+
+    def _meta_td1(self, args):
+        """
+        Put filament in front of a virtual TD-1 scanner, or take it away.
+
+        Deliberately models the LENS, not an event: a TD-1 re-measures whatever is
+        sitting in front of it on every poll, and the dedupe rules that stop that
+        flooding the gate map are real code worth exercising. So presenting the same
+        filament twice is SUPPOSED to do nothing the second time - which is the only
+        kind of case the outcome line below reports, Happy Hare announcing the rest.
+        """
+        transport = self._td1_transport()
+        if not args:
+            self._td1_report(transport)
+            return
+        state = self.TD1_STATES.get(args[0].lower())
+        if state is not None:
+            serial = self._td1_serial(args[1] if len(args) > 1 else None)
+            if state == 'fail':
+                transport.fail(serial, 'simulated optical fault')
+            else:
+                getattr(transport, state)(serial)
+        else:
+            try:
+                td = float(args[0])
+            except ValueError:
+                raise ValueError(self.TD1_USAGE) from None
+            color = self.TD1_DEFAULT_COLOR
+            rest = list(args[1:])
+            if rest and re.fullmatch(r'[0-9a-fA-F]{6}', rest[0]):
+                color = rest.pop(0).lower()
+            serial = self._td1_serial(rest[0] if rest else None)
+            transport.present(serial, td, color)
+        # Don't make the user wait out the poll interval (up to 10s of virtual time) to
+        # see what they just did. refresh() is the same round trip the poll makes
+        mark = len(self.sink)
+        outcome = None
+        try:
+            self.hh.mmu.td1.refresh(serial)
+            # Read before settling: that runs the reactor, and the background poll
+            # resets last_outcome on its way past
+            outcome = getattr(self.hh.mmu.td1.devices.get(serial), 'last_outcome', None)
+        except Exception as exc:                # noqa: BLE001 - MmuTd1Error and friends
+            print(paint('!! TD-1 %s: %s' % (serial, exc), '1;31', self.color))
+        self._settle_moonraker()
+        self._drain(mark)
+        # Only when Happy Hare stayed silent. It announces a measurement it accepts, so
+        # echoing the outcome there says the same thing twice; what needs saying is why
+        # nothing happened - deduped, disconnected, a bad reading
+        if outcome is not None and len(self.sink) == mark:
+            self.info('TD-1 %s: %s' % (serial, outcome))
+
+    def _td1_report(self, transport):
+        """What each scanner is holding, virtual side and Happy Hare's side together."""
+        serials = sorted(set(transport.readings) | set(self.hh.mmu.td1.devices))
+        if not serials:
+            print('  no TD-1 scanners')
+            return
+        for serial in serials:
+            reading = transport.record(serial)
+            if serial not in transport.readings:
+                seen = 'unplugged'
+            elif serial in transport.errors:
+                seen = 'error: %s' % transport.errors[serial]
+            elif reading is None:
+                seen = 'nothing presented'
+            else:
+                seen = 'TD %.2f, color %s' % (reading['td'], reading['color'])
+            device = self.hh.mmu.td1.devices.get(serial)
+            print('  %-16s %-30s %s' % (serial, seen,
+                                        getattr(device, 'last_outcome', None) or '-'))
 
     def _meta_header(self, args):
         if not args:
@@ -2036,6 +2597,8 @@ class Console:
                       % (mmu.num_gates, self.args.temp))
         if not self.args.no_log:
             self.info('Log: %s' % self.hh.mmu_log)
+        for line in self.web_api_lines():
+            self.info(line)
         self.info('/help for meta-commands, MMU_HELP for Happy Hare commands, '
                   'Ctrl-D to quit.')
         if self.scrollback is not None and sys.stdout.isatty():
@@ -2088,6 +2651,14 @@ class Console:
                 # can never land inside a dispatch, inside the pager, or in the middle of
                 # the tee reassembling a line.
                 self._at_prompt = True
+                # Whatever get_line_buffer() says BEFORE a key is pressed is stale, not
+                # typed - see _line_buffer()
+                self._prompt_buffer = ''
+                if HAVE_READLINE:
+                    try:
+                        self._prompt_buffer = readline.get_line_buffer()
+                    except Exception:               # noqa: BLE001
+                        pass
                 self._arm_tick(True)
                 try:
                     typed = input(prompt)
@@ -2145,6 +2716,25 @@ class Console:
                 self.draw_header()
             if not self.running:
                 break
+
+
+class _Job:
+    """A /print job: its prepared lines and how far it has got."""
+
+    def __init__(self, name, lines):
+        self.name = name
+        self.lines = lines
+        self.next = 0                               # index of the next line to play
+        self.line_no = 0                            # 1-based number of the last line played
+        self.played = 0
+        self.extruded = 0.
+        self.started = 0.
+        self.ignored = collections.Counter()
+
+
+def _duration(seconds):
+    minutes, seconds = divmod(int(round(seconds)), 60)
+    return '%dm%02ds' % (minutes, seconds) if minutes else '%ds' % seconds
 
 
 class PinnedHeader:
@@ -2569,6 +3159,13 @@ def parse_args(argv=None):
     p.add_argument('--no-moonraker', action='store_true',
                    help='do not attach the fake Moonraker/Spoolman, so calls out to it go '
                         'unanswered - which is what a printer with Moonraker down looks like')
+    p.add_argument('--serve', nargs='?', const=API_PORT, default=None, type=int, metavar='PORT',
+                   help='serve the Moonraker-compatible web API on this port (default %d). It is '
+                        'already on by default at a terminal, so this is for choosing the port or '
+                        'turning it on when not at one' % API_PORT)
+    p.add_argument('--no-serve', '--no_serve', dest='no_serve', action='store_true',
+                   help='do not serve the web API that lets Mainsail or Fluidd connect to the '
+                        'simulator')
     p.add_argument('--wall', dest='wall', action='store_true', default=None,
                    help='with --pace, sleep in real time so an operation can be watched '
                         '(the default at an interactive prompt, off for a script or pipe)')
@@ -2581,7 +3178,7 @@ def parse_args(argv=None):
     p.add_argument('--trace', type=int, default=0, metavar='0-4',
                    help="Happy Hare log_level; 4 is full narration")
     p.add_argument('--virtual-nfc', dest='virtual_nfc', action='store_true', default=True,
-                   help='virtualise NFC readers so /tag works (default: on)')
+                   help='virtualize NFC readers so /tag works (default: on)')
     p.add_argument('--no-virtual-nfc', dest='virtual_nfc', action='store_false',
                    help='use the real reader driver instead, against a fake bus scripted '
                         'with a finite number of init cycles (test/hh/nfc_fixtures.py) - '

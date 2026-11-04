@@ -86,6 +86,8 @@ class MmuStatusCommand(BaseCommand):
             lines.append(f"{UI_CASCADE} {unit.selector.get_mmu_status_config()}\n")
             if unit.has_encoder():
                 lines.append(f"{UI_CASCADE} Encoder reads {unit.encoder.get_distance():.1f}mm\n")
+            if unit.has_buffer():
+                lines.append(f"{UI_CASCADE} Buffer reads {unit.sync_feedback.get_sync_feedback_string(detail=True)}\n")
 
 
         # This is all now the currently active unit ---------
@@ -350,9 +352,40 @@ class MmuStatusCommand(BaseCommand):
                 else:
                     lines.append("\n- Tip is formed by slicer only when printing")
 
+            before_extruder_cut = mmu.cutter_before_extruder()
+            if before_extruder_cut:
+                cut_vars = mmu.cut_tip_vars()
+                blade_pos = self.blade_pos = float(cut_vars['blade_pos']) # Temp scalar for _f_calc() use
+                tetn = mmu_unit.toolhead_wrapper.p.toolhead_extruder_to_nozzle
+                lines.append(
+                    f"\n- Filament is cut BEFORE the extruder, {blade_pos:.1f}mm from the nozzle "
+                    f"({blade_pos - tetn:.1f}mm before the extruder gears). The cut fragment is pushed back past "
+                    "the gears and purged by the next load"
+                )
+                error = mmu.cut_pushback_error()
+                if error:
+                    lines.append(f". {{5}}{error}{{6}}")
+
             # Extruder unloading -------------------------------------------------
 
-            if mmu.sensor_manager.has_sensor(SENSOR_EXTRUDER_ENTRY):
+            if before_extruder_cut:
+                lines.append(
+                    "\n- Filament end is left before the extruder so no extruder unload is needed and the bowden "
+                    f"unload is {self._f_calc('blade_pos - toolhead_extruder_to_nozzle')} shorter"
+                )
+                if mmu.sensor_manager.has_sensor(SENSOR_EXTRUDER_ENTRY):
+                    method = "the EXTRUDER sensor"
+                elif mmu.can_use_encoder():
+                    method = "a short gear-only pull measured by the encoder"
+                elif mmu.sensor_manager.has_sensor(SENSOR_TENSION):
+                    method = "a short gear-only pull watched by the sync-feedback buffer"
+                else:
+                    method = None
+                lines.append(
+                    f". The cut is verified with {method} and a missed cut will pause" if method
+                    else ". The cut can't be verified (no extruder sensor, encoder or sync-feedback buffer)"
+                )
+            elif mmu.sensor_manager.has_sensor(SENSOR_EXTRUDER_ENTRY):
                 lines.append(
                     "\n- Extruder (synced) unloads by reverse homing a maximum of "
                     f"{self._f_calc('toolhead_entry_to_extruder + toolhead_extruder_to_nozzle - toolhead_residual_filament - toolhead_ooze_reduction - toolchange_retract + toolhead_unload_safety_margin')} "
@@ -375,6 +408,24 @@ class MmuStatusCommand(BaseCommand):
                     f"{self._f_calc('toolhead_extruder_to_nozzle + toolhead_unload_safety_margin')} "
                     "less tip-cutting reported park position to exit extruder"
                 )
+
+            unload_test = mmu.p.toolhead_unload_test
+            if unload_test != TOOLHEAD_UNLOAD_TEST_DEFAULT and not before_extruder_cut:
+                if mmu.sensor_manager.has_sensor(SENSOR_EXTRUDER_ENTRY) or mmu.sensor_manager.has_sensor(SENSOR_TOOLHEAD):
+                    method = "the distance to clear the sensor compared with the tip park position"
+                elif mmu.sensor_manager.has_sensor(SENSOR_PROPORTIONAL):
+                    method = "the sync-feedback buffer"
+                elif mmu.has_encoder():
+                    method = "the encoder"
+                else:
+                    method = None
+                if method:
+                    lines.append(
+                        f". Unload is tested using {method} and will "
+                        f"{'pause' if unload_test == TOOLHEAD_UNLOAD_TEST_PAUSE else 'warn'} on failure"
+                    )
+                else:
+                    lines.append(". Unload test is enabled but no sensor or encoder is available to perform it")
 
             # Bowden unloading ---------------------------------------------------
 

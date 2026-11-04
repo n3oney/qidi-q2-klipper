@@ -17,7 +17,7 @@
 # This defines the current version.
 # IMPORTANT keep version string up-to-date and consistent with git tag
 # Config upgrades are performed when <major>,<minor> is changed
-VERSION = "4.0.0" # When <major.minor> is revved, Happy Hare will instruct users to re-run ./install.sh
+VERSION = "4.2.0" # When <major.minor> is revved, Happy Hare will instruct users to re-run ./install.sh
 
 # Vendor MMU's supported
 VENDOR_ERCF           = "ERCF"
@@ -81,6 +81,9 @@ GATE_EMPTY = 0
 GATE_AVAILABLE = 1 # Available to load from either buffer or spool
 GATE_AVAILABLE_FROM_BUFFER = 2
 
+# Tail of most pause hints: RESUME continues the print but never reloads the tool itself
+HINT_RELOAD = "then reload the tool (MMU_RECOVER first if needed) and RESUME"
+
 FILAMENT_POS_UNKNOWN = -1
 FILAMENT_POS_UNLOADED = 0       # Parked in gate
 FILAMENT_POS_HOMED_GATE = 1     # Homed at either gate or mmu exit sensor (currently assumed mutually exclusive sensors)
@@ -120,6 +123,12 @@ FORM_TIP_STANDALONE = 2         # Happy Hare forms tips
 PURGE_NONE = 0                  # Skip purging after load
 PURGE_SLICER = 1                # Slicer purges on wipetower
 PURGE_STANDALONE = 2            # Happy Hare purges
+
+TOOLHEAD_UNLOAD_TEST_DEFAULT = 0  # Existing extruder unload warnings only
+TOOLHEAD_UNLOAD_TEST_WARN = 1     # Also check unload homing distance, warn on failure
+TOOLHEAD_UNLOAD_TEST_PAUSE = 2    # Also check unload homing distance, pause on failure
+UNLOAD_MIN_CUT_FRAGMENT = 2.0     # Smallest cut fragment (mm) whose absence the homing distance can resolve
+CUT_PUSHBACK_CLEARANCE = 3.0      # Distance (mm) a fragment cut before the extruder must be pushed past the gears (also in _MMU_CUT_TIP)
 
 ACTION_IDLE = 0
 ACTION_LOADING = 1
@@ -175,6 +184,12 @@ GATE_ENDSTOPS     = [SENSOR_SHARED_EXIT, SENSOR_ENCODER, SENSOR_EXIT_PREFIX, SEN
 # Gate endstops that are a per-UNIT resource shared by every gate on that unit, rather than
 # owned by a single gate (contrast SENSOR_EXIT_PREFIX, which is per-gate)
 SHARED_GATE_ENDSTOPS = [SENSOR_SHARED_EXIT, SENSOR_EXTRUDER_ENTRY, SENSOR_ENCODER]
+
+# What a gate's own sensors say about it, from MmuFilamentMovement.gate_occupancy().
+# Distinct from the recorded GATE_* status, which is remembered rather than observed.
+OCCUPANCY_PRESENT = "present"   # a sensor sees filament
+OCCUPANCY_EMPTY   = "empty"     # the entry switch says the lane is clear
+OCCUPANCY_UNKNOWN = "unknown"   # no entry switch fitted, so nothing to ask
 
 # Verdicts from MmuNfcFieldArbiter's "who is in my reader field?" classification ladder.
 # NFC_FIELD_NEIGHBOR is an intermediate/internal state used while attempting eviction and
@@ -243,29 +258,56 @@ FILAMENT_RELEASE_STATE = 0
 FILAMENT_DRIVE_STATE   = 1
 FILAMENT_HOLD_STATE    = 2
 
+# TD-1 filament measurement
+# How far apart two readings must be to be different filament rather than the same
+# filament read twice. A TD-1 is analogue (AJAX quote +/-7.5%), so both sit outside that
+TD1_SAME_TD_FRACTION   = 0.15  # Relative difference in transmission distance
+TD1_SAME_RGB_DISTANCE  = 12    # Largest per-channel color difference, out of 255
+
+# The TD at which filament reads as fully transparent when deriving an alpha channel.
+# AJAX's own examples anchor the scale: black ~0.1, white ~4.6, transparent natural ~100
+TD1_CLEAR_TD           = 100.0
+
+# Per-gate TD-1 state in printer.mmu - Happy Hare's policy only. Device connectivity
+# belongs to Moonraker's [td1]
+TD1_STATE_NONE         = ''          # No scanner serves this gate
+TD1_STATE_ENABLED      = 'enabled'   # Scanner in use, readings applied on request only
+TD1_STATE_AUTO         = 'auto'      # Scanner in use, new readings applied automatically
+TD1_STATE_DISABLED     = 'disabled'  # Scanner present but Happy Hare is ignoring it
+
 # mmu_vars.cfg variables
-VARS_MMU_REVISION                  = "mmu__revision"
-VARS_MMU_ENABLE_ENDLESS_SPOOL      = "mmu_state_enable_endless_spool"
-VARS_MMU_ENDLESS_SPOOL_GROUPS      = "mmu_state_endless_spool_groups"
-VARS_MMU_SENSOR_ENABLED            = "mmu_state_sensor_enabled"  # Sparse {qualified_sensor_name: False}, only disabled entries stored
-VARS_MMU_TOOL_TO_GATE_MAP          = "mmu_state_tool_to_gate_map"
-VARS_MMU_GATE_STATUS               = "mmu_state_gate_status"
-VARS_MMU_GATE_MATERIAL             = "mmu_state_gate_material"
-VARS_MMU_GATE_VENDOR               = "mmu_state_gate_vendor"
-VARS_MMU_GATE_COLOR                = "mmu_state_gate_color"
-VARS_MMU_GATE_FILAMENT_NAME        = "mmu_state_gate_filament_name"
-VARS_MMU_GATE_TEMPERATURE          = "mmu_state_gate_temperature"
-VARS_MMU_GATE_SPOOL_ID             = "mmu_state_gate_spool_id"
-VARS_MMU_GATE_SPOOL_RFID           = "mmu_state_gate_spool_rfid"
-VARS_MMU_GATE_SPEED_OVERRIDE       = "mmu_state_gate_speed_override"
-VARS_MMU_GATE_SELECTED             = "mmu_state_gate_selected"
-VARS_MMU_TOOL_SELECTED             = "mmu_state_tool_selected"
-VARS_MMU_LAST_TOOL                 = "mmu_state_last_tool"
-VARS_MMU_FILAMENT_POS              = "mmu_state_filament_pos"
-VARS_MMU_FILAMENT_REMAINING        = "mmu_state_filament_remaining"
-VARS_MMU_FILAMENT_REMAINING_COLOR  = "mmu_state_filament_remaining_color"
-VARS_MMU_SWAP_STATISTICS           = "mmu_statistics_swaps"
-VARS_MMU_COUNTERS                  = "mmu_statistics_counters"
+VARS_MMU_REVISION                    = "mmu__revision"
+VARS_MMU_ENABLE_ENDLESS_SPOOL        = "mmu_state_enable_endless_spool"
+VARS_MMU_ENDLESS_SPOOL_GROUPS        = "mmu_state_endless_spool_groups"
+VARS_MMU_SENSOR_ENABLED              = "mmu_state_sensor_enabled"  # Sparse {qualified_sensor_name: False}, only disabled entries stored
+VARS_MMU_TOOL_TO_GATE_MAP            = "mmu_state_tool_to_gate_map"
+VARS_MMU_GATE_STATUS                 = "mmu_state_gate_status"
+VARS_MMU_GATE_MATERIAL               = "mmu_state_gate_material"
+VARS_MMU_GATE_VENDOR                 = "mmu_state_gate_vendor"
+VARS_MMU_GATE_TD                     = "mmu_state_gate_td"
+VARS_MMU_GATE_TD1_COLOR              = "mmu_state_gate_td1_color"
+VARS_MMU_GATE_COLOR                  = "mmu_state_gate_color"
+VARS_MMU_GATE_FILAMENT_NAME          = "mmu_state_gate_filament_name"
+VARS_MMU_GATE_TEMPERATURE            = "mmu_state_gate_temperature"
+VARS_MMU_GATE_SPOOL_ID               = "mmu_state_gate_spool_id"
+VARS_MMU_GATE_SPOOL_RFID             = "mmu_state_gate_spool_rfid"
+VARS_MMU_GATE_SPEED_OVERRIDE         = "mmu_state_gate_speed_override"
+VARS_MMU_GATE_REMAINING_WEIGHT       = "mmu_state_gate_remaining_weight"
+VARS_MMU_GATE_INITIAL_WEIGHT         = "mmu_state_gate_initial_weight"
+VARS_MMU_MIGRATION_APPLIED           = "mmu_state_migration_applied"   # last config migration saved with state
+VARS_MMU_GATE_MAP_UNITS              = "mmu_state_gate_map_units"      # [[unit_name, num_gates], ...] the gate lists were saved with
+VARS_MMU_GATE_SELECTED               = "mmu_state_gate_selected"
+VARS_MMU_TOOL_SELECTED               = "mmu_state_tool_selected"
+VARS_MMU_LAST_TOOL                   = "mmu_state_last_tool"
+VARS_MMU_FILAMENT_POS                = "mmu_state_filament_pos"
+VARS_MMU_BYPASS_FILAMENT             = "mmu_state_bypass_filament"
+VARS_MMU_FILAMENT_REMAINING          = "mmu_state_filament_remaining"
+VARS_MMU_FILAMENT_REMAINING_COLOR    = "mmu_state_filament_remaining_color"
+VARS_MMU_FILAMENT_REMAINING_MATERIAL = "mmu_state_filament_remaining_material"
+VARS_MMU_FILAMENT_REMAINING_TEMP     = "mmu_state_filament_remaining_temp"
+VARS_MMU_RETRACTED_LENGTH            = "mmu_state_retracted_length"
+VARS_MMU_SWAP_STATISTICS             = "mmu_statistics_swaps"
+VARS_MMU_COUNTERS                    = "mmu_statistics_counters"
 
 # Per-encoder variables (calibration)
 VARS_MMU_ENCODER_RESOLUTION        = "mmu_encoder_resolution"
@@ -348,7 +390,7 @@ UPGRADE_REMINDER = "Sorry but Happy Hare requires you to re-run this to complete
 TMC_CHIPS = ["tmc2209", "tmc2130", "tmc2208", "tmc2660", "tmc5160", "tmc2240"]
 
 # Klipper TMC and stepper params that are shared to avoid replicated definitions
-SHAREABLE_TMC_PARAMS     = ['run_current', 'hold_current', 'interpolate', 'sense_resistor', 'stealthchop_threshold']
+SHAREABLE_TMC_PARAMS     = ['run_current', 'hold_current', 'interpolate', 'sense_resistor', 'rref', 'stealthchop_threshold']
 SHAREABLE_STEPPER_PARAMS = ['rotation_distance', 'gear_ratio', 'microsteps', 'full_steps_per_rotation']
 OTHER_STEPPER_PARAMS     = ['step_pin', 'dir_pin', 'enable_pin', 'endstop_pin', 'rotation_distance', 'pressure_advance', 'pressure_advance_smooth_time']
 

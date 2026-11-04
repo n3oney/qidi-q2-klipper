@@ -150,6 +150,23 @@ class TestSharedReaderAutoCreate(RoundTripTestCase):
         self.rt.present_tag(UNKNOWN_TAG, gate=None, deep=False)
         self.assertEqual(self.rt.mmu.pending_tag, (UNKNOWN_TAG, None))
 
+    def test_weak_pending_still_expires_after_the_miss(self):
+        """
+        Retained is not the same as permanent. The miss reports NEXT_SPOOLID=-2, which
+        takes set_pending_spool_id's cancel branch, and that branch must still renew the
+        timeout window for a bare uid - it is excluded from the LED overlay, not from
+        expiry. Left armed indefinitely it would land on whichever gate is preloaded
+        next, however much later, stamping a stale RFID onto it.
+        """
+        self.rt.present_tag(UNKNOWN_TAG, gate=None, deep=False)
+        self.assertEqual(self.rt.mmu.pending_tag, (UNKNOWN_TAG, None))
+        self.assertIsNone(self.rt.mmu.pending_phase,
+                          'a bare uid carries no spool_id, so no overlay')
+        timeout = self.rt.mmu.p.spoolman_pending_id_timeout
+        self.rt.advance(timeout + 2.0)
+        self.assertIsNone(self.rt.mmu.pending_tag,
+                          'the weak pending must expire rather than stay armed')
+
 
 class TestKnownTagResolution(RoundTripTestCase):
     SPOOLS = (dict(uid=TAG_A, material='PLA', vendor='Prusament',
@@ -320,6 +337,63 @@ class TestPendingCancellation(RoundTripTestCase):
         self.rt.run_gcode('MMU_GATE_MAP NEXT_SPOOLID=-1')
         self.assertEqual(len(self.rt.errors), errors_before)
 
+    def test_zero_clears_a_staged_tag_as_well_as_the_spool_id(self):
+        """
+        NEXT_SPOOLID=0 is documented as the cancel, so it clears the whole pending. A
+        failed lookup is the case that keeps a tag staged for the next gate; a user
+        saying no is not - and previously 0 not only kept it but handed it a fresh
+        timeout window, so a cancel extended the very thing it claimed to cancel.
+        """
+        self.rt.present_tag(UNKNOWN_TAG, gate=None, deep=False)   # miss -> weak pending
+        self.assertEqual(self.rt.mmu.pending_tag, (UNKNOWN_TAG, None))
+
+        self.rt.run_gcode('MMU_GATE_MAP NEXT_SPOOLID=0')
+        self.assertIsNone(self.rt.mmu.pending_tag, 'the staged tag must go too')
+        self.assertEqual(self.rt.mmu.pending_spool_id, -1)
+        self.assertIsNone(self.rt.mmu.pending_phase, 'and the overlay with it')
+
+    def test_mmu_nfc_clear_pending_discards_the_tag_and_its_spool(self):
+        """
+        The targeted counterpart of NEXT_SPOOLID=0. A resolved spool_id goes with the tag
+        that produced it - keeping it would assign a spool to a gate whose RFID was just
+        discarded. Nothing else is staged here, so the countdown ends too.
+        """
+        self._pend()                                     # TAG_A resolves to spool 1
+        self.assertEqual(self.rt.mmu.pending_spool_id, 1)
+        self.assertIsNotNone(self.rt.mmu.pending_tag)
+
+        self.rt.run_gcode('MMU_NFC CLEAR_PENDING=1')
+        self.assertIsNone(self.rt.mmu.pending_tag)
+        self.assertEqual(self.rt.mmu.pending_spool_id, -1,
+                         'the spool id was the tag\'s resolution, so it goes too')
+        self.assertIsNone(self.rt.mmu.pending_phase)
+
+    def test_mmu_nfc_clear_pending_leaves_a_hand_set_spool_id_alone(self):
+        """
+        A spool_id typed by hand has no tag beside it, which is how the two are told
+        apart. MMU_NFC has nothing of its own to discard, so it must not touch it.
+        """
+        self.rt.run_gcode('MMU_GATE_MAP NEXT_SPOOLID=77')
+        self.assertEqual(self.rt.mmu.pending_spool_id, 77)
+
+        self.rt.run_gcode('MMU_NFC CLEAR_PENDING=1')
+        self.assertEqual(self.rt.mmu.pending_spool_id, 77, 'not the NFC reader\'s to clear')
+        self.assertEqual(self.rt.mmu.pending_phase, 'pending')
+
+    def test_a_cancelled_tag_does_not_re_stage_itself(self):
+        """
+        The tag is still sitting in front of the shared reader after the cancel. The read
+        dedupe is what stops it being picked up again, so a cancel must not clear it the
+        way a timeout does (allow_reread) - otherwise nothing was really cancelled.
+        """
+        self.rt.present_tag(UNKNOWN_TAG, gate=None, deep=False)
+        self.rt.run_gcode('MMU_GATE_MAP NEXT_SPOOLID=0')
+        self.assertIsNone(self.rt.mmu.pending_tag)
+        self.rt.advance(self.rt.mmu.p.spoolman_pending_id_timeout + 5.0)
+        self.assertIsNone(self.rt.mmu.pending_tag,
+                          'a cancelled tag must not come back on its own')
+        self.assertEqual(self.rt.mmu.pending_spool_id, -1)
+
 
 class TestGateMapMaintenance(RoundTripTestCase):
     SPOOLS = (dict(uid=TAG_A, material='ABS', vendor='Polymaker'),)
@@ -349,6 +423,15 @@ class TestGateMapMaintenance(RoundTripTestCase):
         self.rt.mmu.gate_maps.reset_gate(2)
         self.rt.settle()
         self.assertEqual(self.rt.mmu.gate_spool_id[0], 1)
+
+    def test_spool_created_after_startup_sticks(self):
+        """#967: push mode must not clear a spool Moonraker hasn't cached yet."""
+        sid = self.rt.db.add_spool(material='PETG', vendor='Overture')
+        self.rt.run_gcode('MMU_GATE_MAP GATE=3 SPOOLID=%d' % sid)
+        self.assertEqual(self.rt.db.spool_gate(sid), 3)
+        self.assertEqual(self.rt.mmu.gate_spool_id[3], sid)
+        self.assertEqual(self.rt.mmu.gate_material[3], 'PETG')
+        self.assertEqual(self.rt.mmu.gate_vendor[3], 'Overture')
 
 
 class TestSpoolmanOff(RoundTripTestCase):
@@ -477,7 +560,7 @@ class TestSpoolmanRfidCommand(RoundTripTestCase):
 
     def test_separators_are_stripped(self):
         self.rt.run_gcode('MMU_SPOOLMAN_TAG SPOOLID=2 RFID=bb:bb:22:22')
-        self.assertEqual(self.rt.db.spool_uid(2), TAG_B, 'normalised uppercase, no separators')
+        self.assertEqual(self.rt.db.spool_uid(2), TAG_B, 'normalized uppercase, no separators')
 
     def test_does_not_unset_the_gate_assignment(self):
         """

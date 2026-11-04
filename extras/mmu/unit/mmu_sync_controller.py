@@ -298,13 +298,16 @@ class _AutotuneEngine:
 
     # -------------------------------- API -----------------------------------
 
-    def restart(self, rd_init, reset_totals=True, reset_cooldown=True, reset_confidence=True):
+    def restart(self, rd_init, reset_totals=True, reset_cooldown=True, reset_confidence=True, reset_baseline=False):
         """
         Rebase all autotune anchors/windows on a fresh baseline for new starting rd value
           - Cooldown timers are either reset-to-now (default) or to a large negative origin
           - Total counts are optionally reset
+          - Persisted (tuned) baseline is optionally reset, e.g. for a new gate
         """
         self._autotune_current = rd_init
+        if reset_baseline:
+            self._autotune_baseline = rd_init
         self._paused = False
 
         # Reset or preserve cooldown origins
@@ -328,6 +331,15 @@ class _AutotuneEngine:
         # PD window stats
         self._stable_time = 0.0
         self._stable_motion_mm = 0.0
+
+        self.invalidate_twolevel_evidence(reset_confidence=False)
+
+
+    def invalidate_twolevel_evidence(self, reset_confidence=True):
+        """Discard measurements tied to the old speed band, preserving run state."""
+        if reset_confidence:
+            self._rd_cert_fifo.clear()
+            self._rd_cert_last_score = -1.0
 
         # Two-level estimator buckets & evidence
         self._tl_flips = 0
@@ -475,16 +487,6 @@ class _AutotuneEngine:
             status["note"] = "Autotune: {} {}".format(travel, _note) if _note else ""
             return status
 
-        # Do nothing on truly trivial changes
-        if not report_trivial and math.isclose(rec_rd, self._autotune_current, abs_tol=1e-3):
-            status["note"] = "Autotune: {} Rejected rd {:.4f} because too trivial a delta".format(travel, rec_rd)
-            return status
-
-        # We have new tuned rd value...
-        self._autotune_current = rec_rd
-        status["rd"] = rec_rd
-        status["note"] = "Autotune: {} {} and {}".format(travel, note, _note)
-
         # Should we recommend saving as new default reference?
         if self._rd_cert_last_score >= self._autotune_min_cert_score:
             frac = self._frac_speed_delta(rec_rd, self._autotune_baseline)
@@ -492,6 +494,16 @@ class _AutotuneEngine:
             if frac >= min_frac:
                 self._autotune_baseline = rec_rd
                 status["save"] = True
+
+        # Do nothing on truly trivial changes
+        if not report_trivial and not status["save"] and math.isclose(rec_rd, self._autotune_current, abs_tol=1e-3):
+            status["note"] = "Autotune: {} Rejected rd {:.4f} because too trivial a delta".format(travel, rec_rd)
+            return status
+
+        # We have new tuned rd value...
+        self._autotune_current = rec_rd
+        status["rd"] = rec_rd
+        status["note"] = "Autotune: {} {} and {}".format(travel, note, _note)
 
         self.restart(rec_rd, reset_totals=False, reset_cooldown=False, reset_confidence=False)
         return status
@@ -901,6 +913,7 @@ class _FlowguardEngine:
             self._relief_comp_mm = 0.0
             self._tens_motion_mm = 0.0
             self._relief_tens_mm = 0.0
+            self._level = 0.0 # Nothing consumed on either side, so the dial returns to center
 
         return self.status()
 
@@ -1095,7 +1108,7 @@ class SyncController:
 
         if hard_reset:
             # Rebase autotune helper on the new start
-            self.autotune.restart(rd_init)
+            self.autotune.restart(rd_init, reset_baseline=True)
 
         # Reset FlowGuard engine state on controller reset
         self.flowguard.reset()
@@ -1301,6 +1314,18 @@ class SyncController:
 
         self.rd_low  = rd / (1.0 + f)
         self.rd_high = rd / (1.0 - f)
+
+
+    def apply_twolevel_tuning(self):
+        """
+        Recompute the twolevel low/high rd around the current reference after a
+        live change of rd_twolevel_speed_multiplier/rd_twolevel_boost_multiplier
+        """
+        if self.twolevel_active:
+            old_band = (self.rd_low, self.rd_high)
+            self._set_low_high_rd(self.rd_ref)
+            if (self.rd_low, self.rd_high) != old_band:
+                self.autotune.invalidate_twolevel_evidence()
 
 
     def _clamp_to_envelope(self, rd):
