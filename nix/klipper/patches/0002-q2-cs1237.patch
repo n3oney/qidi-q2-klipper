@@ -1,8 +1,8 @@
 diff --git a/klippy/extras/load_cell/cs1237.py b/klippy/extras/load_cell/cs1237.py
-index 0fdfba9349..2cb136d1f3 100644
+index 0fdfba9349..da78c18df5 100644
 --- a/klippy/extras/load_cell/cs1237.py
 +++ b/klippy/extras/load_cell/cs1237.py
-@@ -1,156 +1,184 @@ class CS1237(LoadCellSensor):
+@@ -1,156 +1,182 @@ class CS1237(LoadCellSensor):
 -# Chipsea CS1237 support
 +# CS1237 Support
  #
@@ -233,15 +233,12 @@ index 0fdfba9349..2cb136d1f3 100644
          logging.info("CS1237 finished '%s' measurements", self.name)
  
 -    def _process_batch(self, eventtime):
--        samples, overflows = self.ffreader.pull_samples()
++    def _process_batch(self, eventtime) -> BulkAdcData:
++        prev_error_count = self.last_error_count
+         samples, overflows = self.ffreader.pull_samples()
 -        batch_errors = self._convert_samples(samples)
 -        self.error_count += batch_errors
-+    def _process_batch(self, eventtime) -> BulkAdcData:
-+        prev_overflows = self.ffreader.get_last_overflows()
-+        prev_error_count = self.last_error_count
-+        samples = self.ffreader.pull_samples()
 +        self._convert_samples(samples)
-+        overflows = self.ffreader.get_last_overflows() - prev_overflows
 +        errors = self.last_error_count - prev_error_count
 +        if errors > 0:
 +            logging.error("%s: Forced sensor restart due to error", self.name)
@@ -260,9 +257,8 @@ index 0fdfba9349..2cb136d1f3 100644
          return {
              "data": samples,
 -            "errors": batch_errors,
--            "overflows": overflows,
-+            "errors": self.last_error_count,
-+            "overflows": self.ffreader.get_last_overflows(),
++            "errors": errors,
+             "overflows": overflows,
          }
  
  
