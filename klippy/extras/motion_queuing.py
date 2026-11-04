@@ -59,6 +59,8 @@ class PrinterMotionQueuing:
         self.do_kick_flush_timer = True
         self.last_flush_time = self.last_step_gen_time = 0.0
         self.need_flush_time = self.need_step_gen_time = 0.0
+        # "Drip" timing (for homing and probing moves)
+        self.drip_start_times = []
         # Register handlers
         printer.register_event_handler("klippy:shutdown", self._handle_shutdown)
         printer.register_event_handler("klippy:disconnect", self._handle_disconnect)
@@ -88,19 +90,11 @@ class PrinterMotionQueuing:
         self.steppersyncs.append((mcu, ss))
         return ss
 
-    def allocate_syncemitter(
-        self, mcu, name, alloc_stepcompress=True,
-        high_precision_stepcompress=False
-    ):
+    def allocate_syncemitter(self, mcu, name, alloc_stepcompress=True):
         name = name.encode("utf-8")[:15]
         ss = self._lookup_steppersync(mcu)
         ffi_main, ffi_lib = chelper.get_ffi()
-        stepcompress_type = (
-            2 if high_precision_stepcompress else int(alloc_stepcompress)
-        )
-        se = ffi_lib.steppersync_alloc_syncemitter(
-            ss, name, stepcompress_type
-        )
+        se = ffi_lib.steppersync_alloc_syncemitter(ss, name, alloc_stepcompress)
         self.syncemitters.append(se)
         return se
 
@@ -117,6 +111,10 @@ class PrinterMotionQueuing:
         sync_time = self.last_step_gen_time
         ffi_main, ffi_lib = chelper.get_ffi()
         for mcu, ss in self.steppersyncs:
+            if mcu.non_critical_disconnected:
+                # No clock to synchronize with; the mcu is recalibrated
+                # here again once it has reconnected
+                continue
             offset, freq = mcu.calibrate_clock(sync_time, eventtime)
             ffi_lib.steppersync_set_time(ss, offset, freq)
         # Calculate history expiration
@@ -180,8 +178,9 @@ class PrinterMotionQueuing:
             want_step_gen_time, self.last_step_gen_time, flush_time
         )
         # Invoke flush callbacks (if any)
-        for cb in self.flush_callbacks:
-            cb(flush_time, step_gen_time)
+        with self.reactor.assert_no_pause():
+            for cb in self.flush_callbacks:
+                cb(flush_time, step_gen_time)
         # Determine maximum history to keep
         trapq_free_time = step_gen_time - self.kin_flush_delay
         clear_history_time = self.clear_history_time
@@ -278,8 +277,10 @@ class PrinterMotionQueuing:
             flush_count = 0
             while self.last_step_gen_time < faux_time:
                 target = self.last_step_gen_time + batch_time
-                if flush_count > 100.0:
-                    target = faux_time
+                if flush_count > 100.0 and faux_time > target:
+                    target += (
+                        int((faux_time - target) / batch_time) * batch_time
+                    )
                 self._advance_flush_time(0.0, target)
                 flush_count += 1
             if flush_count:
@@ -303,12 +304,14 @@ class PrinterMotionQueuing:
             self.do_kick_flush_timer = False
             self.reactor.update_timer(self.flush_timer, self.reactor.NOW)
 
+    # "Drip" timing (for homing and probing moves)
     def drip_update_time(self, start_time, end_time, drip_completion):
+        self.drip_start_times.append(start_time)
         self._await_flush_time(start_time)
         # Disable background flushing from timer
         self.reactor.update_timer(self.flush_timer, self.reactor.NEVER)
         self.do_kick_flush_timer = False
-        self._advance_flush_time(start_time)
+        self._advance_flush_time(start_time - SDS_CHECK_TIME, start_time)
         # Flush in segments until drip_completion signal
         flush_time = start_time
         while flush_time < end_time:
@@ -323,10 +326,16 @@ class PrinterMotionQueuing:
                 continue
             flush_time = min(flush_time + DRIP_SEGMENT_TIME, end_time)
             self.note_mcu_movequeue_activity(flush_time)
-            self._advance_flush_time(flush_time)
+            self._advance_flush_time(flush_time - SDS_CHECK_TIME, flush_time)
         # Restore background flushing
         self.reactor.update_timer(self.flush_timer, self.reactor.NOW)
         self._advance_flush_time(flush_time + self.kin_flush_delay)
+        self.drip_start_times.remove(start_time)
+
+    def check_drip_timing(self):
+        if not self.drip_start_times:
+            return None
+        return min(self.drip_start_times)
 
 
 def load_config(config):

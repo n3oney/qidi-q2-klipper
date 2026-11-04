@@ -28,8 +28,6 @@
 #define CHECK_LINES 1
 #define QUEUE_START_SIZE 1024
 
-
-
 struct step_move {
     uint32_t interval;
     uint16_t count;
@@ -226,8 +224,8 @@ stepcompress_alloc(struct list_head *msg_queue)
     struct stepcompress *sc = malloc(sizeof(*sc));
     memset(sc, 0, sizeof(*sc));
     list_init(&sc->history_list);
-    sc->msg_queue = msg_queue;
     sc->sdir = -1;
+    sc->msg_queue = msg_queue;
     sc->queue_flush = queue_flush;
     sc->queue_flush_far = queue_flush_far;
     return sc;

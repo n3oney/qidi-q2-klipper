@@ -19,6 +19,7 @@ class error(Exception):
 
 MIN_BOTH_EDGE_DURATION = 0.000000500
 MIN_OPTIMIZED_BOTH_EDGE_DURATION = 0.000000150
+MAX_STEPCOMPRESS_ERROR = 0.000025
 
 
 # Interface to low-level mcu and chelper code
@@ -59,13 +60,13 @@ class MCU_stepper:
         self._active_callbacks = []
         motion_queuing = printer.load_object(config, "motion_queuing")
         sname = self._name.split()[-1]
-        self._syncemitter = motion_queuing.allocate_syncemitter(
-            mcu, sname, high_precision_stepcompress=high_precision_stepcompr
-        )
+        self._syncemitter = motion_queuing.allocate_syncemitter(mcu, sname)
         ffi_main, ffi_lib = chelper.get_ffi()
         self._stepqueue = ffi_lib.syncemitter_get_stepcompress(
             self._syncemitter
         )
+        if high_precision_stepcompr:
+            ffi_lib.stepcompress_hp_enable(self._stepqueue)
         ffi_lib.stepcompress_set_invert_sdir(self._stepqueue, self._invert_dir)
         self._stepper_kinematics = None
         self._itersolve_check_active = ffi_lib.itersolve_check_active
@@ -182,8 +183,7 @@ class MCU_stepper:
             "stepper_position oid=%c pos=%i",
             oid=self._oid,
         )
-        max_error = self._mcu.get_max_stepper_error()
-        max_error_ticks = self._mcu.seconds_to_clock(max_error)
+        max_error_ticks = self._mcu.seconds_to_clock(MAX_STEPCOMPRESS_ERROR)
         ffi_main, ffi_lib = chelper.get_ffi()
         ffi_lib.stepcompress_fill(
             self._stepqueue,

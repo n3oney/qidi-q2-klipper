@@ -306,7 +306,6 @@ input_shaper_set_sk(struct stepper_kinematics *sk
     return 0;
 }
 
-
 int __visible
 input_shaper_set_shaper_params(struct stepper_kinematics *sk, char axis
                                , int n, double a[], double t[])
@@ -343,7 +342,6 @@ input_shaper_set_smoother_params(struct stepper_kinematics *sk, char axis
     }
     return status;
 }
-
 
 struct stepper_kinematics * __visible
 input_shaper_alloc(void)

@@ -21,7 +21,7 @@ import board_defs
 import fatfs_lib
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent.parent))
-from klippy import clocksync, mcu, reactor, serialhdl
+from klippy import clocksync, reactor, serialhdl
 
 ###########################################################
 #
@@ -155,11 +155,43 @@ class MCUConfigError(SPIFlashError):
     pass
 
 
+# Wrapper around query commands
+class CommandQueryWrapper:
+    def __init__(self, serial, msgformat, respformat, oid=None):
+        self._serial = serial
+        self._cmd = serial.get_msgparser().lookup_command(msgformat)
+        serial.get_msgparser().lookup_command(respformat)
+        self._response = respformat.split()[0]
+        self._oid = oid
+        self._cmd_queue = serial.get_default_command_queue()
+
+    def send(self, data=(), minclock=0, reqclock=0, retry=True):
+        cmds = [self._cmd.encode(data)]
+        xh = serialhdl.SerialRetryCommand(
+            self._serial, self._response, self._oid
+        )
+        reqclock = max(minclock, reqclock)
+        return xh.get_response(cmds, self._cmd_queue, minclock, reqclock, retry)
+
+
+# Wrapper around command sending
+class CommandWrapper:
+    def __init__(self, serial, msgformat):
+        self._serial = serial
+        msgparser = serial.get_msgparser()
+        self._cmd = msgparser.lookup_command(msgformat)
+        self._cmd_queue = serial.get_default_command_queue()
+
+    def send(self, data=(), minclock=0, reqclock=0):
+        cmd = self._cmd.encode(data)
+        self._serial.raw_send(cmd, minclock, reqclock, self._cmd_queue)
+
+
 class SPIDirect:
     def __init__(self, ser):
         self.oid = SPI_OID
-        self._spi_send_cmd = mcu.CommandWrapper(ser, SPI_SEND_CMD)
-        self._spi_transfer_cmd = mcu.CommandQueryWrapper(
+        self._spi_send_cmd = CommandWrapper(ser, SPI_SEND_CMD)
+        self._spi_transfer_cmd = CommandQueryWrapper(
             ser, SPI_XFER_CMD, SPI_XFER_RESPONSE, self.oid
         )
 
@@ -173,22 +205,22 @@ class SPIDirect:
 class SDIODirect:
     def __init__(self, ser):
         self.oid = SDIO_OID
-        self._sdio_send_cmd = mcu.CommandQueryWrapper(
+        self._sdio_send_cmd = CommandQueryWrapper(
             ser, SDIO_SEND_CMD, SDIO_SEND_CMD_RESPONSE, self.oid
         )
-        self._sdio_read_data = mcu.CommandQueryWrapper(
+        self._sdio_read_data = CommandQueryWrapper(
             ser, SDIO_READ_DATA, SDIO_READ_DATA_RESPONSE, self.oid
         )
-        self._sdio_write_data = mcu.CommandQueryWrapper(
+        self._sdio_write_data = CommandQueryWrapper(
             ser, SDIO_WRITE_DATA, SDIO_WRITE_DATA_RESPONSE, self.oid
         )
-        self._sdio_read_data_buffer = mcu.CommandQueryWrapper(
+        self._sdio_read_data_buffer = CommandQueryWrapper(
             ser, SDIO_READ_DATA_BUFFER, SDIO_READ_DATA_BUFFER_RESPONSE, self.oid
         )
-        self._sdio_write_data_buffer = mcu.CommandWrapper(
+        self._sdio_write_data_buffer = CommandWrapper(
             ser, SDIO_WRITE_DATA_BUFFER
         )
-        self._sdio_set_speed = mcu.CommandWrapper(ser, SDIO_SET_SPEED)
+        self._sdio_set_speed = CommandWrapper(ser, SDIO_SET_SPEED)
 
     def sdio_send_cmd(self, cmd, argument, wait):
         return self._sdio_send_cmd.send([self.oid, cmd, argument, wait])
@@ -1421,7 +1453,7 @@ class MCUConnection:
         # Iterate through backwards compatible response strings
         for response in GET_CFG_RESPONSES:
             try:
-                get_cfg_cmd = mcu.CommandQueryWrapper(
+                get_cfg_cmd = CommandQueryWrapper(
                     self._serial, GET_CFG_CMD, response
                 )
                 break
@@ -1552,7 +1584,29 @@ class MCUConnection:
         input_sha = hashlib.sha1()
         sd_sha = hashlib.sha1()
         klipper_bin_path = self.board_config["klipper_bin_path"]
+        add_ts = self.board_config.get("requires_unique_fw_name", False)
         fw_path = self.board_config.get("firmware_path", "firmware.bin")
+        if add_ts:
+            fw_dir = os.path.dirname(fw_path)
+            fw_name, fw_ext = os.path.splitext(os.path.basename(fw_path))
+            ts = time.strftime("%Y%m%d%H%M%S")
+            fw_name_ts = f"{ts}{fw_name}{fw_ext}"
+            if fw_dir:
+                fw_path = os.path.join(fw_dir, fw_name_ts)
+            else:
+                fw_path = fw_name_ts
+            list_dir = fw_dir if fw_dir else ""
+            try:
+                output_line("\nSD Card FW Directory Contents:")
+                for f in self.fatfs.list_sd_directory(list_dir):
+                    fname = f["name"].decode("utf-8")
+                    if fname.endswith(fw_ext):
+                        self.fatfs.remove_item(os.path.join(list_dir, fname))
+                        output_line(
+                            "Old firmware file %s found and deleted" % (fname,)
+                        )
+            except Exception:
+                logging.exception("Error cleaning old firmware files")
         try:
             with open(klipper_bin_path, "rb") as local_f:
                 with self.fatfs.open_file(fw_path, "wb") as sd_f:

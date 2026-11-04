@@ -181,4 +181,4 @@ class CS1237(LoadCellSensor):
         }
 
 
-CS1237_SENSOR_TYPES = {"cs1237": CS1237, "c_sensor": CS1237}
+CS1237_SENSOR_TYPE = {"cs1237": CS1237, "c_sensor": CS1237}

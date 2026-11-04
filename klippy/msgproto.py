@@ -293,6 +293,7 @@ class MessageParser:
         self.msgid_by_format = {}
         self.msgid_parser = PT_int32()
         self.config = {}
+        self.kconfig = None
         self.version = self.build_versions = ""
         self.raw_identify_data = ""
         self._init_messages(DefaultMessages)
@@ -425,6 +426,28 @@ class MessageParser:
             self._error("Unable to encode: %s", msgname)
         return cmd
 
+    def create_dummy_response(self, msgname, params=None):
+        mp = self.messages_by_name.get(msgname)
+        if mp is None:
+            self._error("Unknown response: %s", msgname)
+        argparts = dict(params or {})
+        for name, t in mp.name_to_type.items():
+            if name not in argparts:
+                tval = 0
+                if t.is_dynamic_string:
+                    tval = ()
+                argparts[name] = tval
+        try:
+            msg = mp.encode_by_name(**argparts)
+        except error as e:
+            raise
+        except:
+            # logging.exception("Unable to encode")
+            self._error("Unable to encode: %s", msgname)
+        res, pos = mp.parse(msg, 0)
+        res["#name"] = msgname
+        return res
+
     def fill_enumerations(self, enumerations):
         for add_name, add_enums in enumerations.items():
             enums = self.enumerations.setdefault(add_name, {})
@@ -485,6 +508,7 @@ class MessageParser:
                 all_messages, commands.values(), output.values()
             )
             self.config.update(data.get("config", {}))
+            self.kconfig = data.get("kconfig")
             self.app = data.get("app", "")
             self.version = data.get("version", "")
             self.build_versions = data.get("build_versions", "")
@@ -511,6 +535,9 @@ class MessageParser:
 
     def get_constants(self):
         return dict(self.config)
+
+    def get_kconfig(self):
+        return self.kconfig
 
     class sentinel:
         pass

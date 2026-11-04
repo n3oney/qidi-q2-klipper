@@ -25,8 +25,8 @@ SOURCE_FILES = [
     "pyhelper.c",
     "serialqueue.c",
     "stepcompress.c",
-    "stepcompress_hp.c",
     "steppersync.c",
+    "stepcompress_hp.c",
     "itersolve.c",
     "trapq.c",
     "pollreactor.c",
@@ -70,6 +70,7 @@ defs_stepcompress = """
     void stepcompress_fill(struct stepcompress *sc, uint32_t oid
         , uint32_t max_error, int32_t queue_step_msgtag
         , int32_t set_next_step_dir_msgtag);
+    void stepcompress_hp_enable(struct stepcompress *sc);
     void stepcompress_set_invert_sdir(struct stepcompress *sc
         , uint32_t invert_sdir);
     int stepcompress_reset(struct stepcompress *sc, uint64_t last_step_clock);
@@ -182,13 +183,12 @@ defs_kin_winch = """
 
 defs_kin_extruder = """
     struct pressure_advance_params;
-    typedef double (*pressure_advance_func)(
-        double, double, struct pressure_advance_params *);
     struct stepper_kinematics *extruder_stepper_alloc(void);
     void extruder_stepper_free(struct stepper_kinematics *sk);
     void extruder_set_pressure_advance(struct stepper_kinematics *sk
-        , double print_time, pressure_advance_func func
-        , int n_params, double params[], double time_offset);
+        , double print_time, int n_params, double params[]
+        , double (*func)(double, double, struct pressure_advance_params *)
+        , double time_offset);
     double pressure_advance_linear_model_func(double position
         , double pa_velocity, struct pressure_advance_params *pa_params);
     double pressure_advance_tanh_model_func(double position
@@ -202,7 +202,6 @@ defs_kin_extruder = """
 """
 
 defs_kin_shaper = """
-
     int input_shaper_set_shaper_params(struct stepper_kinematics *sk, char axis
         , int n, double a[], double t[]);
     int input_shaper_set_smoother_params(struct stepper_kinematics *sk
@@ -256,6 +255,8 @@ defs_trdispatch = """
     void trdispatch_start(struct trdispatch *td, uint32_t dispatch_reason);
     void trdispatch_stop(struct trdispatch *td);
     struct trdispatch *trdispatch_alloc(void);
+    void trdispatch_free(struct trdispatch *td);
+    void trdispatch_mcu_free(struct trdispatch_mcu *tdm);
     struct trdispatch_mcu *trdispatch_mcu_alloc(struct trdispatch *td
         , struct serialqueue *sq, struct command_queue *cq, uint32_t trsync_oid
         , uint32_t set_timeout_msgtag, uint32_t trigger_msgtag

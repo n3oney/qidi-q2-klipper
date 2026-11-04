@@ -36,7 +36,7 @@ LIS_I2C_ADDR = 0x19
 # Right shift for left justified registers.
 FREEFALL_ACCEL = 9.80665
 LIS2DW_SCALE = FREEFALL_ACCEL * 1.952 / 4
-LIS3DH_SCALE = FREEFALL_ACCEL * 3.906 / 16
+LIS3DH_SCALE = FREEFALL_ACCEL * 11.718 / 16
 
 BATCH_UPDATES = 0.100
 
@@ -117,7 +117,7 @@ class LIS2DW:
         )
 
     def check_connected(self):
-        if self.mcu.non_critical_disconnected:
+        if self.mcu.non_critical_disconnected or self.mcu._reconnecting:
             raise self.printer.command_error(
                 f"LIS2DW: {self.name} could not connect because mcu: {self.mcu.get_name()} is non_critical_disconnected!"
             )
@@ -145,7 +145,6 @@ class LIS2DW:
             )
 
     def start_internal_client(self):
-        self.check_connected()
         aqh = adxl345.AccelQueryHelper(self.printer)
         self.batch_bulk.add_client(aqh.handle_batch)
         return aqh
@@ -164,10 +163,11 @@ class LIS2DW:
 
     # Start, stop, and process message batches
     def _start_measurements(self):
+        self.check_connected()
         # In case of miswiring, testing LIS2DW device ID prevents treating
         # noise or wrong signal as a correctly initialized device
         dev_id = self.read_reg(REG_LIS2DW_WHO_AM_I_ADDR)
-        logging.info("lis2dw_dev_id: %x", dev_id)
+        logging.info("%s_dev_id: %x", self.lis_type, dev_id)
         if self.lis_type == LIS2DW_TYPE:
             if dev_id != LIS2DW_DEV_ID:
                 raise self.printer.command_error(
@@ -202,8 +202,8 @@ class LIS2DW:
             self.set_reg(REG_LIS2DW_CTRL_REG1_ADDR, 0x97)
             # Disable all filtering
             self.set_reg(REG_LIS2DW_CTRL_REG2_ADDR, 0)
-            # Set +-8g, High Resolution mode
-            self.set_reg(REG_LIS2DW_CTRL_REG4_ADDR, 0x28)
+            # Set +-16g, High Resolution mode
+            self.set_reg(REG_LIS2DW_CTRL_REG4_ADDR, 0x38)
             # Enable FIFO
             self.set_reg(REG_LIS2DW_CTRL_REG5_ADDR, 0x40)
             # Stream mode
@@ -215,7 +215,7 @@ class LIS2DW:
             self.set_reg(REG_LIS2DW_FIFO_CTRL, 0xC0)
         else:
             self.set_reg(REG_LIS2DW_FIFO_CTRL, 0x80)
-        logging.info("LIS2DW starting '%s' measurements", self.name)
+        logging.info("%s starting '%s' measurements", self.lis_type, self.name)
         # Initialize clock tracking
         self.ffreader.note_start()
         self.last_error_count = 0
@@ -225,18 +225,18 @@ class LIS2DW:
         self.set_reg(REG_LIS2DW_FIFO_CTRL, 0x00)
         self.query_lis2dw_cmd.send_wait_ack([self.oid, 0])
         self.ffreader.note_end()
-        logging.info("LIS2DW finished '%s' measurements", self.name)
+        logging.info("%s finished '%s' measurements", self.lis_type, self.name)
         self.set_reg(REG_LIS2DW_FIFO_CTRL, 0x00)
 
     def _process_batch(self, eventtime):
-        samples = self.ffreader.pull_samples()
+        samples, _ = self.ffreader.pull_samples()
         self._convert_samples(samples)
         if not samples:
             return {}
         return {
             "data": samples,
             "errors": self.last_error_count,
-            "overflows": self.ffreader.get_last_overflows(),
+            "overflows": self.ffreader.get_total_overflows(),
         }
 
 

@@ -6,7 +6,7 @@
 import collections
 import logging
 
-from klippy import stepper
+from klippy import mcu, stepper
 
 from . import bulk_sensor
 
@@ -119,7 +119,7 @@ class FieldHelper:
 
 
 class TMCErrorCheck:
-    def __init__(self, config, mcu_tmc):
+    def __init__(self, config, mcu_tmc, temp_from_adc=None):
         self.printer = config.get_printer()
         name_parts = config.get_name().split()
         self.stepper_name = " ".join(name_parts[1:])
@@ -127,6 +127,17 @@ class TMCErrorCheck:
         self.fields = mcu_tmc.get_fields()
         self.check_timer = None
         self.last_drv_status = self.last_drv_fields = None
+        # A non-critical mcu only counts as back once its config is resent
+        self.mcu_offline = False
+        mcu = mcu_tmc.get_mcu()
+        self.printer.register_event_handler(
+            mcu.get_non_critical_disconnect_event_name(),
+            self._handle_mcu_offline,
+        )
+        self.printer.register_event_handler(
+            mcu.get_non_critical_reconnect_event_name(),
+            self._handle_mcu_online,
+        )
         # Setup for GSTAT query
         reg_name = self.fields.lookup_register("drv_err")
         if reg_name is not None:
@@ -158,6 +169,7 @@ class TMCErrorCheck:
         # Setup for temperature query
         self.adc_temp = None
         self.adc_temp_reg = self.fields.lookup_register("adc_temp")
+        self.temp_from_adc = temp_from_adc
         if self.adc_temp_reg is not None:
             pheaters = self.printer.load_object(config, "heaters")
             pheaters.register_monitor(config)
@@ -212,7 +224,16 @@ class TMCErrorCheck:
             self.adc_temp = None
             return
 
+    def _handle_mcu_offline(self):
+        self.mcu_offline = True
+
+    def _handle_mcu_online(self):
+        self.mcu_offline = False
+
     def _do_periodic_check(self, eventtime):
+        mcu = self.mcu_tmc.get_mcu()
+        if self.mcu_offline or mcu.non_critical_disconnected:
+            return eventtime + 1.0
         try:
             self._query_register(self.drv_status_reg_info)
             if self.gstat_reg_info is not None:
@@ -220,6 +241,9 @@ class TMCErrorCheck:
             if self.adc_temp_reg is not None:
                 self._query_temperature()
         except self.printer.command_error as e:
+            # A non-critical mcu dropping mid-query is not a driver fault
+            if mcu.non_critical_disconnected:
+                return eventtime + 1.0
             self.printer.invoke_shutdown(str(e))
             return self.printer.get_reactor().NEVER
         return eventtime + 1.0
@@ -255,7 +279,8 @@ class TMCErrorCheck:
             return {"drv_status": None, "temperature": None}
         temp = None
         if self.adc_temp is not None:
-            temp = round((self.adc_temp - 2038) / 7.7, 2)
+            adc = self.fields.get_field("adc_temp", self.adc_temp)
+            temp = round(self.temp_from_adc(adc), 2)
         last_value, reg_name = self.drv_status_reg_info[:2]
         if last_value != self.last_drv_status:
             self.last_drv_status = last_value
@@ -367,12 +392,20 @@ class TMCStallguardDump:
 
 
 class TMCCommandHelper:
-    def __init__(self, config, mcu_tmc, current_helper):
+    def __init__(
+        self,
+        config,
+        mcu_tmc,
+        current_helper,
+        temp_from_adc=None,
+        init_callback=None,
+    ):
         self.printer = config.get_printer()
         self.stepper_name = " ".join(config.get_name().split()[1:])
         self.name = config.get_name().split()[-1]
         self.mcu_tmc = mcu_tmc
         self.current_helper = current_helper
+        self.init_callback = init_callback
         self.fields = mcu_tmc.get_fields()
         self.stepper = None
         # Stepper phase tracking
@@ -384,7 +417,7 @@ class TMCCommandHelper:
         # DUMP_TMC support
         self.read_registers = self.read_translate = None
         # Common tmc helpers
-        self.echeck_helper = TMCErrorCheck(config, mcu_tmc)
+        self.echeck_helper = TMCErrorCheck(config, mcu_tmc, temp_from_adc)
         self.record_helper = TMCStallguardDump(config, mcu_tmc)
         # Set microstep config options
         TMCMicrostepHelper(config, mcu_tmc)
@@ -426,6 +459,8 @@ class TMCCommandHelper:
         )
 
     def _init_registers(self, print_time=None):
+        if self.init_callback is not None:
+            self.init_callback()
         # Send registers
         for reg_name in list(self.fields.registers.keys()):
             val = self.fields.registers[reg_name]  # Val may change during loop
@@ -522,6 +557,9 @@ class TMCCommandHelper:
     # Stepper phase tracking
     def _get_phases(self):
         return (256 >> self.fields.get_field("mres")) * 4
+
+    def clear_mcu_phase_offset(self):
+        self.mcu_phase_offset = None
 
     def get_phase_offset(self):
         return self.mcu_phase_offset, self._get_phases()
@@ -735,7 +773,7 @@ class TMCVirtualPinHelper:
             raise ppins.error("tmc virtual endstop only useful as endstop")
         if pin_params["invert"] or pin_params["pullup"]:
             raise ppins.error("Can not pullup/invert tmc virtual pin")
-        if self.diag_pin is None:
+        if self.diag_pin is None and not hasattr(self.mcu_tmc, "tmc_spi"):
             raise ppins.error("tmc virtual endstop requires diag pin config")
         # Setup for sensorless homing
         self.printer.register_event_handler(
@@ -744,7 +782,10 @@ class TMCVirtualPinHelper:
         self.printer.register_event_handler(
             "homing:homing_move_end", self.handle_homing_move_end
         )
-        self.mcu_endstop = ppins.setup_pin("endstop", self.diag_pin)
+        if self.diag_pin is None:
+            self.mcu_endstop = TMCSpiEndstop(self.printer, self.mcu_tmc)
+        else:
+            self.mcu_endstop = ppins.setup_pin("endstop", self.diag_pin)
         return self.mcu_endstop
 
     def _set_field(self, field_name, value):
@@ -795,6 +836,117 @@ class TMCVirtualPinHelper:
             self._set_field(field, val)
         self._send_fields()
         self._prev_state.clear()
+
+
+# Sensorless homing by polling the stallguard flag over spi
+class TMCSpiEndstop:
+    POLL_TIME = 0.001
+    # Stallguard needs some time at speed before its flag is valid
+    SETTLE_TIME = 0.150
+    # Matches MAX_DATA_LEN in src/tmc_spi_endstop.c
+    MAX_CHAIN_LEN = 8
+
+    def __init__(self, printer, mcu_tmc):
+        tmc_spi = mcu_tmc.tmc_spi
+        if tmc_spi.chain_len > self.MAX_CHAIN_LEN:
+            raise printer.config_error(
+                "Sensorless homing via SPI supports at most %d drivers"
+                " in a daisy chain" % (self.MAX_CHAIN_LEN,)
+            )
+        self._printer = printer
+        self._mutex = mcu_tmc.mutex
+        self._mcu_tmc = mcu_tmc
+        self._mcu = tmc_spi.get_mcu()
+        self._oid = self._mcu.create_oid()
+        self._dispatch = mcu.TriggerDispatch(self._mcu)
+        self._home_cmd = self._query_cmd = None
+        self._mcu.add_config_cmd(
+            "config_tmc_spi_endstop oid=%d spi_oid=%d data_len=%d"
+            " status_pos=%d"
+            % (
+                self._oid,
+                tmc_spi.spi.get_oid(),
+                tmc_spi.chain_len * 5,
+                (tmc_spi.chain_len - mcu_tmc.chain_pos) * 5,
+            )
+        )
+        self._mcu.add_config_cmd(
+            "tmc_spi_endstop_home oid=%d clock=0 rest_ticks=0"
+            " trsync_oid=0 trigger_reason=0" % (self._oid,),
+            on_restart=True,
+        )
+        self._mcu.register_config_callback(self._build_config)
+
+    def _build_config(self):
+        cmd_queue = self._dispatch.get_command_queue()
+        self._home_cmd = self._mcu.lookup_command(
+            "tmc_spi_endstop_home oid=%c clock=%u rest_ticks=%u"
+            " trsync_oid=%c trigger_reason=%c",
+            cq=cmd_queue,
+        )
+        self._query_cmd = self._mcu.lookup_query_command(
+            "tmc_spi_endstop_query_state oid=%c",
+            "tmc_spi_endstop_state oid=%c trigger_clock=%u",
+            oid=self._oid,
+            cq=cmd_queue,
+        )
+
+    def get_mcu(self):
+        return self._mcu
+
+    def add_stepper(self, stepper):
+        self._dispatch.add_stepper(stepper)
+
+    def get_steppers(self):
+        return self._dispatch.get_steppers()
+
+    def home_start(
+        self, print_time, sample_time, sample_count, rest_time, triggered=True
+    ):
+        toolhead = self._printer.lookup_object("toolhead")
+        accel = toolhead.get_max_velocity()[1]
+        speed = self.get_steppers()[0].get_step_dist() / rest_time
+        guard_time = speed / accel + self.SETTLE_TIME
+        # Host register reads must not interleave with the mcu polling
+        self._mutex.lock()
+        clock = self._mcu.print_time_to_clock(print_time + guard_time)
+        trigger_completion = self._dispatch.start(print_time)
+        self._home_cmd.send(
+            [
+                self._oid,
+                clock,
+                self._mcu.seconds_to_clock(self.POLL_TIME),
+                self._dispatch.get_oid(),
+                mcu.MCU_trsync.REASON_ENDSTOP_HIT,
+            ],
+            reqclock=clock,
+        )
+        return trigger_completion
+
+    def home_wait(self, home_end_time):
+        try:
+            self._dispatch.wait_end(home_end_time)
+            self._home_cmd.send([self._oid, 0, 0, 0, 0])
+        finally:
+            self._mutex.unlock()
+        res = self._dispatch.stop()
+        if res >= mcu.MCU_trsync.REASON_COMMS_TIMEOUT:
+            cmderr = self._printer.command_error
+            raise cmderr("Communication timeout during homing")
+        if res != mcu.MCU_trsync.REASON_ENDSTOP_HIT:
+            return 0.0
+        if self._mcu.is_fileoutput():
+            return home_end_time
+        params = self._query_cmd.send([self._oid])
+        clock = self._mcu.clock32_to_clock64(params["trigger_clock"])
+        return self._mcu.clock_to_print_time(clock)
+
+    def query_endstop(self, print_time):
+        if self._mcu.is_fileoutput():
+            return 0
+        status = self._mcu_tmc.get_register_raw("DRV_STATUS")["spi_status"]
+        # Ignore the stale stall flag at standstill
+        return status & 0x0C == 0x04
 
 
 ######################################################################

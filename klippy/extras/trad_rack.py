@@ -10,10 +10,11 @@ import os
 import time
 from collections import deque
 
-from .. import chelper, toolhead
-from ..gcode import CommandError
-from ..kinematics import extruder
-from ..stepper import LookupMultiRail
+from klippy import chelper, toolhead
+from klippy.gcode import CommandError
+from klippy.kinematics import extruder as kinematics_extruder
+from klippy.stepper import LookupMultiRail
+
 from .homing import Homing, HomingMove
 
 SERVO_NAME = "servo tr_servo"
@@ -2347,18 +2348,14 @@ class TradRack:
 class TradRackToolHead(toolhead.ToolHead, object):
     def __init__(self, config, buffer_pull_speed, is_extruder_synced):
         self.printer = config.get_printer()
-        self.danger_options = self.printer.lookup_object("danger_options")
+        try:
+            self.danger_options = self.printer.lookup_object("danger_options")
+        except config.error:
+            pass
         self.reactor = self.printer.get_reactor()
-        self.all_mcus = [
-            m for n, m in self.printer.lookup_objects(module="mcu")
-        ]
-        self.mcu = self.all_mcus[0]
-        if hasattr(toolhead, "LookAheadQueue"):
-            self.lookahead = toolhead.LookAheadQueue(self)
-            self.lookahead.set_flush_time(toolhead.BUFFER_TIME_HIGH)
-        else:
-            self.move_queue = toolhead.MoveQueue(self)
-            self.move_queue.set_flush_time(toolhead.BUFFER_TIME_HIGH)
+        self.mcu = self.printer.lookup_object("mcu")
+        self.lookahead = toolhead.LookAheadQueue()
+        self.lookahead.set_flush_time(toolhead.BUFFER_TIME_HIGH)
         self.commanded_pos = [0.0, 0.0, 0.0, 0.0]
         # Velocity and acceleration control
         tr_config = config.getsection("trad_rack")
@@ -2394,7 +2391,6 @@ class TradRackToolHead(toolhead.ToolHead, object):
         self.print_time = 0.0
         self.special_queuing_state = "NeedPrime"
         self.priming_timer = None
-        self.drip_completion = None
         # Setup for generating moves
         self.motion_queuing = self.printer.load_object(config, "motion_queuing")
         self.motion_queuing.register_flush_callback(
@@ -2405,7 +2401,8 @@ class TradRackToolHead(toolhead.ToolHead, object):
         # Create kinematic class
         gcode = self.printer.lookup_object("gcode")
         self.Coord = gcode.Coord
-        self.extruder = extruder.DummyExtruder(self.printer)
+        extruder = kinematics_extruder.DummyExtruder(self.printer)
+        self.extra_axes = [extruder]
         try:
             self.kin = TradRackKinematics(self, config, is_extruder_synced)
         except config.error as e:

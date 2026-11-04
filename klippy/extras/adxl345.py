@@ -8,6 +8,7 @@ import logging
 import math
 import multiprocessing
 import os
+import tempfile
 import time
 
 from . import bulk_sensor, bus
@@ -136,7 +137,12 @@ class AccelCommandHelper:
         name_parts = config.get_name().split()
         self.base_name = name_parts[0]
         self.name = name_parts[-1]
-        self.register_commands(self.name)
+        try:
+            self.register_commands(self.name)
+        except config.error:
+            raise config.error(
+                "Accelerometer with name '%s' already defined" % self.name
+            )
         if len(name_parts) == 1:
             if self.name == "adxl345" or not config.has_section("adxl345"):
                 self.register_commands(None)
@@ -189,10 +195,15 @@ class AccelCommandHelper:
         self.bg_client = None
         bg_client.finish_measurements()
         # Write data to file
+        tmpdir = tempfile.gettempdir()
         if self.base_name == self.name:
-            filename = "/tmp/%s-%s.csv" % (self.base_name, name)
+            filename = os.path.join(
+                tmpdir, "%s-%s.csv" % (self.base_name, name)
+            )
         else:
-            filename = "/tmp/%s-%s-%s.csv" % (self.base_name, self.name, name)
+            filename = os.path.join(
+                tmpdir, "%s-%s-%s.csv" % (self.base_name, self.name, name)
+            )
         bg_client.write_to_file(filename)
         gcmd.respond_info(
             "Writing raw accelerometer data to %s file" % (filename,)
@@ -317,7 +328,7 @@ class ADXL345:
         )
 
     def check_connected(self):
-        if self.mcu.non_critical_disconnected:
+        if self.mcu.non_critical_disconnected or self.mcu._reconnecting:
             raise self.printer.command_error(
                 f"ADXL: {self.name} could not connect because mcu: {self.mcu.get_name()} is non_critical_disconnected!"
             )
@@ -339,7 +350,6 @@ class ADXL345:
             )
 
     def start_internal_client(self):
-        self.check_connected()
         aqh = AccelQueryHelper(self.printer)
         self.batch_bulk.add_client(aqh.handle_batch)
         return aqh
@@ -367,6 +377,7 @@ class ADXL345:
 
     # Start, stop, and process message batches
     def _start_measurements(self):
+        self.check_connected()
         # In case of miswiring, testing ADXL345 device ID prevents treating
         # noise or wrong signal as a correctly initialized device
         dev_id = self.read_reg(REG_DEVID)
@@ -400,14 +411,14 @@ class ADXL345:
         logging.info("ADXL345 finished '%s' measurements", self.name)
 
     def _process_batch(self, eventtime):
-        samples = self.ffreader.pull_samples()
+        samples, _ = self.ffreader.pull_samples()
         self._convert_samples(samples)
         if not samples:
             return {}
         return {
             "data": samples,
             "errors": self.last_error_count,
-            "overflows": self.ffreader.get_last_overflows(),
+            "overflows": self.ffreader.get_total_overflows(),
         }
 
 

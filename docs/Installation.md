@@ -81,6 +81,48 @@ KIAUH can be used to install Kalico and its associated programs on a variety
 of Linux-based systems that run a form of Debian. More information can be found
 at https://github.com/dw-0/kiauh
 
+## Installing with the setup scripts
+
+As an alternative to KIAUH, the repository ships OS-specific setup
+scripts in [scripts/](../scripts/) (for example `install-debian.sh`,
+`install-arch.sh` or `install-ubuntu-22.04.sh`). After cloning the
+repository, the matching script installs the required system packages,
+creates the `~/klippy-env` python environment and registers the
+`klipper` service:
+
+```bash
+git clone https://github.com/KalicoCrew/kalico.git ~/klipper
+~/klipper/scripts/install-debian.sh
+```
+
+Note that these scripts install Kalico itself; Moonraker and a web
+interface such as Mainsail or Fluidd still need to be installed
+separately.
+
+## Running in Docker
+
+A container image is published at `ghcr.io/kalicocrew/kalico` for
+`amd64` and `arm64`. It is a drop-in replacement for the
+[prind](https://github.com/mkuf/prind) `mkuf/klipper` image: paths,
+uid and volumes are the same, so an existing prind setup only needs
+the image changed in `docker-compose.yaml`:
+
+```yaml
+services:
+  klipper:
+    image: ghcr.io/kalicocrew/kalico:latest
+```
+
+Available tags:
+
+- `latest`: the most recent monthly release
+- `vYYYY.MM.NN`: a specific release
+- `main`: the current `main` branch
+
+Only the klippy image is published. prind's `tools` and `hostmcu`
+images are not, so build and flash the micro-controller firmware
+(including the Linux host MCU) from the Kalico repository, see below.
+
 ## Building and flashing the micro-controller
 
 To compile the micro-controller code, start by running these commands

@@ -25,6 +25,7 @@ AMBIENT_TEMP = 25.0
 PID_PARAM_BASE = 255.0
 MAX_MAINTHREAD_TIME = 5.0
 QUELL_STALE_TIME = 7.0
+MIN_PWM_CHANGE_RATIO = 0.05
 PID_PROFILE_VERSION = 1
 PID_PROFILE_OPTIONS = {
     "pid_target": (float, "%.2f"),
@@ -35,6 +36,7 @@ PID_PROFILE_OPTIONS = {
     "pid_ki": (float, "%.3f"),
     "pid_kd": (float, "%.3f"),
 }
+PID_CONTROL_TYPES = ("pid", "pid_v", "dual_loop_pid")
 DUAL_LOOP_PID_INNER_TARGET_OPTION = "inner_target_temp"
 DUAL_LOOP_PID_INNER_TARGET_DEPRECATED_OPTION = "inner_max_temp"
 
@@ -94,6 +96,7 @@ class Heater:
         self.max_power = config.getfloat(
             "max_power", 1.0, above=0.0, maxval=1.0
         )
+        self.min_pwm_change = self.max_power * MIN_PWM_CHANGE_RATIO
         self.config_smooth_time = config.getfloat("smooth_time", 1.0, above=0.0)
         self.smooth_time = self.config_smooth_time
         self.inv_smooth_time = 1.0 / self.smooth_time
@@ -117,7 +120,8 @@ class Heater:
         pwm_cycle_time = config.getfloat(
             "pwm_cycle_time", 0.100, above=0.0, maxval=self.pwm_delay
         )
-        self.mcu_pwm.setup_cycle_time(pwm_cycle_time)
+        hardware_pwm = config.getboolean("hardware_pwm", False)
+        self.mcu_pwm.setup_cycle_time(pwm_cycle_time, hardware_pwm)
         self.mcu_pwm.setup_max_duration(MAX_HEAT_TIME)
         # Load additional modules
         self.printer.load_object(config, "verify_heater %s" % (short_name,))
@@ -184,7 +188,7 @@ class Heater:
             value = 0.0
         if (read_time < self.next_pwm_time or not self.last_pwm_value) and abs(
             value - self.last_pwm_value
-        ) < 0.05:
+        ) < self.min_pwm_change:
             # No significant change in value - can suppress update
             return
         pwm_time = read_time + self.pwm_delay
@@ -711,8 +715,24 @@ class Heater:
             self.outer_instance.gcode.respond_info(msg)
             self.save_profile(profile_name=profile_name, verbose=True)
 
+        def _profile_fields_msg(self, profile):
+            # Generic field dump for non-PID profile types
+            msg = "Control: %s\n" % (profile["control"],)
+            for key, value in sorted(profile.items()):
+                if key in ("control", "name") or value is None:
+                    continue
+                if isinstance(value, (int, float, str)):
+                    msg += "%s: %s\n" % (key, value)
+            msg += "name: %s" % (profile["name"],)
+            return msg
+
         def get_values(self, profile_name, gcmd, verbose):
             temp_profile = self.outer_instance.get_control().get_profile()
+            if temp_profile["control"] not in PID_CONTROL_TYPES:
+                self.outer_instance.gcode.respond_info(
+                    self._profile_fields_msg(temp_profile)
+                )
+                return
             target = temp_profile["pid_target"]
             tolerance = temp_profile["pid_tolerance"]
             control = temp_profile["control"]
@@ -749,27 +769,47 @@ class Heater:
 
         def save_profile(self, profile_name=None, gcmd=None, verbose=True):
             temp_profile = self.outer_instance.get_control().get_profile()
+            control = temp_profile["control"]
+            if control not in PID_CONTROL_TYPES and control != "watermark":
+                self.outer_instance.gcode.respond_info(
+                    "Saving [%s] profiles with PID_PROFILE SAVE"
+                    " is not supported." % (control,)
+                )
+                return
             if profile_name is None:
                 profile_name = temp_profile["name"]
             section_name = self._compute_section_name(profile_name)
             self.outer_instance.configfile.set(
                 section_name, "pid_version", PID_PROFILE_VERSION
             )
-            is_dual_loop = temp_profile["control"] == "dual_loop_pid"
-            for key, (type, placeholder) in PID_PROFILE_OPTIONS.items():
-                value = temp_profile[key]
-                if value is not None:
-                    self.outer_instance.configfile.set(
-                        section_name, key, placeholder % value
-                    )
-                # Mirror the inner/secondary loop keys read in _init_profile
-                if is_dual_loop and key in ("pid_kp", "pid_ki", "pid_kd"):
-                    inner_key = "inner_" + key
-                    inner_value = temp_profile.get(inner_key)
-                    if inner_value is not None:
+            if control == "watermark":
+                self.outer_instance.configfile.set(
+                    section_name, "control", control
+                )
+                self.outer_instance.configfile.set(
+                    section_name,
+                    "max_delta",
+                    "%.4f" % (temp_profile["max_delta"],),
+                )
+            else:
+                is_dual_loop = control == "dual_loop_pid"
+                for key, (type, placeholder) in PID_PROFILE_OPTIONS.items():
+                    value = temp_profile[key]
+                    if value is not None:
                         self.outer_instance.configfile.set(
-                            section_name, inner_key, placeholder % inner_value
+                            section_name, key, placeholder % value
                         )
+                    # Mirror the inner/secondary loop keys read in
+                    # _init_profile
+                    if is_dual_loop and key in ("pid_kp", "pid_ki", "pid_kd"):
+                        inner_key = "inner_" + key
+                        inner_value = temp_profile.get(inner_key)
+                        if inner_value is not None:
+                            self.outer_instance.configfile.set(
+                                section_name,
+                                inner_key,
+                                placeholder % inner_value,
+                            )
             temp_profile["name"] = profile_name
             self.profiles[profile_name] = temp_profile
             if verbose:
@@ -836,6 +876,11 @@ class Heater:
                 % (profile["name"], self.outer_instance.short_name)
             )
             if verbose == "high":
+                if profile["control"] not in PID_CONTROL_TYPES:
+                    self.outer_instance.gcode.respond_info(
+                        self._profile_fields_msg(profile)
+                    )
+                    return
                 smooth_time = (
                     self.outer_instance.get_smooth_time()
                     if profile["smooth_time"] is None

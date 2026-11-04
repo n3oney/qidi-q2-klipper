@@ -105,6 +105,7 @@ nav:
     - PID.md
     - MPC.md
     - Dockable_Probe.md
+    - INDX.md
   - G-Code Reference:
     - G-Codes.md
     - Command_Templates.md
@@ -139,6 +140,7 @@ nav:
     - Using_PWM_Tools.md
   - Developer Documentation:
     - Code_Overview.md
+    - Developer_Cookbook.md
     - Kinematics.md
     - Protocol.md
     - API_Server.md

@@ -37,6 +37,9 @@ class MCU_buttons:
     def build_config(self):
         if not self.pin_list:
             return
+        # The firmware restarts its ack counter on buttons_query, which is
+        # also re-sent when a non-critical mcu reconnects after a reset
+        self.ack_count = self.last_button = 0
         self.oid = self.mcu.create_oid()
         self.mcu.add_config_cmd(
             "config_buttons oid=%d button_count=%d"
@@ -116,7 +119,7 @@ class MCU_ADC_buttons:
         self.max_value = 0.0
         ppins = printer.lookup_object("pins")
         self.mcu_adc = ppins.setup_pin("adc", self.pin)
-        self.mcu_adc.setup_minmax(ADC_SAMPLE_TIME, ADC_SAMPLE_COUNT)
+        self.mcu_adc.setup_adc_sample(ADC_SAMPLE_TIME, ADC_SAMPLE_COUNT)
         self.mcu_adc.setup_adc_callback(ADC_REPORT_TIME, self.adc_callback)
         query_adc = printer.lookup_object("query_adc")
         query_adc.register_adc("adc_button:" + pin.strip(), self.mcu_adc)

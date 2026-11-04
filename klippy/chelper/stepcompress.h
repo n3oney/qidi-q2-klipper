@@ -6,9 +6,6 @@
 
 #define ERROR_RET -989898989
 
-struct rhs_3;
-struct points;
-
 struct stepcompress {
     // Buffer management
     uint32_t *queue, *queue_end, *queue_pos, *queue_next;
@@ -27,12 +24,12 @@ struct stepcompress {
     // History tracking
     int64_t last_position;
     struct list_head history_list;
-    // Extra fields for the optional high precision algorithm
+    // Extra fields for high precision algorithm
     uint32_t next_expected_interval;
     uint16_t cached_count;
     struct rhs_3 *rhs_cache;
     struct points *errb_cache;
-    // Compression algorithm callbacks
+    // Callbacks
     int (*queue_flush)(struct stepcompress *, uint64_t);
     int (*queue_flush_far)(struct stepcompress *, uint64_t);
 };
@@ -50,8 +47,8 @@ struct pull_history_steps {
     int step_count, interval, add, add2, shift;
 };
 
+struct list_head;
 struct stepcompress *stepcompress_alloc(struct list_head *msg_queue);
-struct stepcompress *stepcompress_hp_alloc(struct list_head *msg_queue);
 void stepcompress_fill(struct stepcompress *sc, uint32_t oid, uint32_t max_error
                        , int32_t queue_step_msgtag
                        , int32_t set_next_step_dir_msgtag);

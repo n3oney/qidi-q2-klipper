@@ -121,19 +121,28 @@ class HomingMove:
         # Start endstop checking
         print_time = self.toolhead.get_last_move_time()
         endstop_triggers = []
-        for mcu_endstop, name in self.endstops:
-            rest_time = self._calc_endstop_rate(mcu_endstop, movepos, speed)
-            wait = mcu_endstop.home_start(
-                print_time,
-                ENDSTOP_SAMPLE_TIME,
-                ENDSTOP_SAMPLE_COUNT,
-                rest_time,
-                triggered=triggered,
-            )
-            endstop_triggers.append(wait)
-        all_endstop_trigger = multi_complete(self.printer, endstop_triggers)
-
-        self.toolhead.dwell(HOMING_START_DELAY)
+        try:
+            for mcu_endstop, name in self.endstops:
+                rest_time = self._calc_endstop_rate(mcu_endstop, movepos, speed)
+                wait = mcu_endstop.home_start(
+                    print_time,
+                    ENDSTOP_SAMPLE_TIME,
+                    ENDSTOP_SAMPLE_COUNT,
+                    rest_time,
+                    triggered=triggered,
+                )
+                endstop_triggers.append(wait)
+            all_endstop_trigger = multi_complete(self.printer, endstop_triggers)
+            self.toolhead.dwell(HOMING_START_DELAY)
+        except Exception:
+            # Stop endstops already started so they release their resources
+            end_time = self.toolhead.get_last_move_time()
+            for mcu_endstop, name in self.endstops[: len(endstop_triggers)]:
+                try:
+                    mcu_endstop.home_wait(end_time)
+                except self.printer.command_error:
+                    pass
+            raise
         # Issue move
         error = None
         try:
@@ -244,6 +253,7 @@ class Homing:
         self.changed_axes = []
         self.trigger_mcu_pos = {}
         self.adjust_pos = {}
+        self.saved_accel = None
 
     def set_axes(self, axes):
         self.changed_axes = axes
@@ -272,16 +282,18 @@ class Homing:
         if accel is None:
             return
         if pre_homing:
+            if self.saved_accel is None:
+                self.saved_accel = self.toolhead.get_max_velocity()[1]
             self.toolhead.set_accel(accel)
-        else:
-            self.toolhead.reset_accel()
+        elif self.saved_accel is not None:
+            self.toolhead.set_accel(self.saved_accel)
+            self.saved_accel = None
 
     def _set_homing_current(self, homing_axes, pre_homing):
         print_time = self.toolhead.get_last_move_time()
         affected_rails = set()
         for axis in homing_axes:
-            axis_name = "xyz"[axis]  # only works for cartesian
-            partial_rails = self.toolhead.get_active_rails_for_axis(axis_name)
+            partial_rails = self.toolhead.get_active_rails_for_axis(axis)
             affected_rails = affected_rails | set(partial_rails)
 
         dwell_time = 0.0
@@ -308,8 +320,9 @@ class Homing:
     def home_rails(self, rails, forcepos, movepos):
         # Notify of upcoming homing operation
         self.printer.send_event("homing:home_rails_begin", self, rails)
-        # Alter kinematics class to think printer is at forcepo
-        homing_axes = [axis for axis in range(3) if forcepos[axis] is not None]
+        # Alter kinematics class to think printer is at forcepos
+        force_axes = [axis for axis in range(3) if forcepos[axis] is not None]
+        homing_axes = "".join(["xyz"[i] for i in force_axes])
         startpos = self._fill_coord(forcepos)
         homepos = self._fill_coord(movepos)
         self.toolhead.set_position(startpos, homing_axes=homing_axes)
@@ -323,31 +336,27 @@ class Homing:
             self._set_homing_current(homing_axes, pre_homing=True)
             self._reset_endstop_states(endstops)
             hmove.homing_move(homepos, hi.speed)
-        finally:
-            self._set_homing_accel(hi.accel, pre_homing=False)
-            self._set_homing_current(homing_axes, pre_homing=False)
 
-        needs_rehome = False
-        retract_dist = hi.retract_dist
-        if hmove.moved_less_than_dist(hi.min_home_dist, homing_axes):
-            needs_rehome = True
-            retract_dist = hi.min_home_dist
+            needs_rehome = False
+            retract_dist = hi.retract_dist
+            if hmove.moved_less_than_dist(hi.min_home_dist, force_axes):
+                needs_rehome = True
+                retract_dist = hi.min_home_dist
 
-        # Perform second home
-        if retract_dist:
-            logging.info("homing: needs rehome: %s", needs_rehome)
-            # Retract
-            startpos = self._fill_coord(forcepos)
-            homepos = self._fill_coord(movepos)
-            axes_d = [hp - sp for hp, sp in zip(homepos, startpos)]
-            move_d = math.sqrt(sum([d * d for d in axes_d[:3]]))
-            retract_r = min(1.0, retract_dist / move_d)
-            retractpos = [
-                hp - ad * retract_r for hp, ad in zip(homepos, axes_d)
-            ]
-            self.toolhead.move(retractpos, hi.retract_speed)
-            if not hi.use_sensorless_homing or needs_rehome:
-                try:
+            # Perform second home
+            if retract_dist:
+                logging.info("homing: needs rehome: %s", needs_rehome)
+                # Retract
+                startpos = self._fill_coord(forcepos)
+                homepos = self._fill_coord(movepos)
+                axes_d = [hp - sp for hp, sp in zip(homepos, startpos)]
+                move_d = math.sqrt(sum([d * d for d in axes_d[:3]]))
+                retract_r = min(1.0, retract_dist / move_d)
+                retractpos = [
+                    hp - ad * retract_r for hp, ad in zip(homepos, axes_d)
+                ]
+                self.toolhead.move(retractpos, hi.retract_speed)
+                if not hi.use_sensorless_homing or needs_rehome:
                     # Home again
                     startpos = [
                         rp - ad * retract_r
@@ -368,30 +377,29 @@ class Homing:
                         hi.use_sensorless_homing
                         and needs_rehome
                         and hmove.moved_less_than_dist(
-                            hi.min_home_dist, homing_axes
+                            hi.min_home_dist, force_axes
                         )
                     ):
                         raise self.printer.command_error(
                             "Early homing trigger on second home!"
                         )
-                finally:
-                    self._set_homing_accel(hi.accel, pre_homing=False)
-                    self._set_homing_current(homing_axes, pre_homing=False)
 
-                if hi.retract_dist:
-                    # Retract (again)
-                    startpos = self._fill_coord(forcepos)
-                    homepos = self._fill_coord(movepos)
-                    axes_d = [hp - sp for hp, sp in zip(homepos, startpos)]
-                    move_d = math.sqrt(sum([d * d for d in axes_d[:3]]))
-                    retract_r = min(1.0, hi.retract_dist / move_d)
-                    retractpos = [
-                        hp - ad * retract_r for hp, ad in zip(homepos, axes_d)
-                    ]
-                    self.toolhead.move(retractpos, hi.retract_speed)
+                    if hi.use_sensorless_homing and hi.retract_dist:
+                        # Retract (again)
+                        startpos = self._fill_coord(forcepos)
+                        homepos = self._fill_coord(movepos)
+                        axes_d = [hp - sp for hp, sp in zip(homepos, startpos)]
+                        move_d = math.sqrt(sum([d * d for d in axes_d[:3]]))
+                        retract_r = min(1.0, hi.retract_dist / move_d)
+                        retractpos = [
+                            hp - ad * retract_r
+                            for hp, ad in zip(homepos, axes_d)
+                        ]
+                        self.toolhead.move(retractpos, hi.retract_speed)
+        finally:
+            self._set_homing_accel(hi.accel, pre_homing=False)
+            self._set_homing_current(homing_axes, pre_homing=False)
 
-        self._set_homing_accel(hi.accel, pre_homing=False)
-        self._set_homing_current(homing_axes, pre_homing=False)
         # Signal home operation complete
         self.toolhead.flush_step_generation()
         self.trigger_mcu_pos = {
@@ -411,7 +419,7 @@ class Homing:
                 for s in kin.get_steppers()
             }
             newpos = kin.calc_position(kin_spos)
-            for axis in homing_axes:
+            for axis in force_axes:
                 homepos[axis] = newpos[axis]
             self.toolhead.set_position(homepos)
 

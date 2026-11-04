@@ -8,6 +8,8 @@ import json
 import logging
 import math
 
+from klippy.gcode import GCodeCommand
+
 from . import probe
 from .danger_options import get_danger_options
 
@@ -245,7 +247,8 @@ class BedMesh:
             self.last_position[2] -= self.fade_target
         else:
             # return current position minus the current z-adjustment
-            x, y, z, e = self.toolhead.get_position()
+            cur_pos = self.toolhead.get_position()
+            x, y, z = cur_pos[:3]
             max_adj = self.z_mesh.calc_z(x, y)
             factor = 1.0
             z_adj = max_adj - self.fade_target
@@ -262,21 +265,21 @@ class BedMesh:
                 )
                 factor = constrain(factor, 0.0, 1.0)
             final_z_adj = factor * z_adj + self.fade_target
-            self.last_position[:] = [x, y, z - final_z_adj, e]
+            self.last_position[:] = [x, y, z - final_z_adj] + cur_pos[3:]
         return list(self.last_position)
 
     def move(self, newpos, speed):
         factor = self.get_z_factor(newpos[2])
         if self.z_mesh is None or not factor:
             # No mesh calibrated, or mesh leveling phased out.
-            x, y, z, e = newpos
+            x, y, z = newpos[:3]
             if self.log_fade_complete:
                 self.log_fade_complete = False
                 logging.info(
                     "bed_mesh fade complete: Current Z: %.4f fade_target: %.4f "
                     % (z, self.fade_target)
                 )
-            self.toolhead.move([x, y, z + self.fade_target, e], speed)
+            self.toolhead.move([x, y, z + self.fade_target] + newpos[3:], speed)
         else:
             self.splitter.build_move(self.last_position, newpos, factor)
             while not self.splitter.traverse_complete:
@@ -288,6 +291,11 @@ class BedMesh:
                         "Mesh Leveling: Error splitting move "
                     )
         self.last_position[:] = newpos
+
+    def generate_points(
+        self, gcmd: GCodeCommand, profile_name: str = "default"
+    ):
+        return self.bmc.generate_points(gcmd, profile_name)
 
     def get_status(self, eventtime=None):
         return self.status
@@ -621,9 +629,9 @@ class BedMeshCalibrate:
 
     def print_generated_points(self, print_func, truncate=False):
         x_offset = y_offset = 0.0
-        probe = self.printer.lookup_object("probe", None)
-        if probe is not None:
-            x_offset, y_offset = probe.get_offsets()[:2]
+        pprobe = probe.ProbeList.get_list(self.printer).get_default_probe()
+        if pprobe is not None:
+            x_offset, y_offset = pprobe.get_offsets()[:2]
         print_func(
             "bed_mesh: generated points\nIndex |  Tool Adjusted  |   Probe"
         )
@@ -966,8 +974,8 @@ class BedMeshCalibrate:
         need_cfg_update |= self.set_adaptive_mesh(gcmd)
         probe_method = gcmd.get("METHOD", "automatic")
 
+        self._verify_algorithm(gcmd.error)
         if need_cfg_update:
-            self._verify_algorithm(gcmd.error)
             self._generate_points(gcmd.error, probe_method)
             pts = self._get_adjusted_points()
             self.probe_helper.update_probe_points(pts, 3)
@@ -997,14 +1005,20 @@ class BedMeshCalibrate:
             adj_pts.append(self.zero_ref_pos)
         return adj_pts
 
-    cmd_BED_MESH_CALIBRATE_help = "Perform Mesh Bed Leveling"
-
-    def cmd_BED_MESH_CALIBRATE(self, gcmd):
-        self._profile_name = gcmd.get("PROFILE", "default")
+    def generate_points(
+        self, gcmd: GCodeCommand, profile_name: str = "default"
+    ):
+        self._profile_name = gcmd.get("PROFILE", profile_name)
         if not self._profile_name.strip():
             raise gcmd.error("Value for parameter 'PROFILE' must be specified")
         self.bedmesh.set_mesh(None)
         self.update_config(gcmd)
+        return self._get_adjusted_points()
+
+    cmd_BED_MESH_CALIBRATE_help = "Perform Mesh Bed Leveling"
+
+    def cmd_BED_MESH_CALIBRATE(self, gcmd):
+        self.generate_points(gcmd)
         self.probe_helper.start_probe(gcmd)
 
     def probe_finalize(self, offsets, positions):
@@ -1191,7 +1205,7 @@ class MoveSplitter:
         self.z_offset = self._calc_z_offset(prev_pos)
         self.traverse_complete = False
         self.distance_checked = 0.0
-        axes_d = [self.next_pos[i] - self.prev_pos[i] for i in range(4)]
+        axes_d = [np - pp for np, pp in zip(self.next_pos, self.prev_pos)]
         self.total_move_length = math.sqrt(sum([d * d for d in axes_d[:3]]))
         self.axis_move = [not isclose(d, 0.0, abs_tol=1e-10) for d in axes_d]
 
@@ -1207,7 +1221,7 @@ class MoveSplitter:
                 "bed_mesh: Slice distance is negative "
                 "or greater than entire move length"
             )
-        for i in range(4):
+        for i in range(len(self.next_pos)):
             if self.axis_move[i]:
                 self.current_pos[i] = lerp(
                     t, self.prev_pos[i], self.next_pos[i]
@@ -1226,12 +1240,9 @@ class MoveSplitter:
                     next_z = self._calc_z_offset(self.current_pos)
                     if abs(next_z - self.z_offset) >= self.split_delta_z:
                         self.z_offset = next_z
-                        return (
-                            self.current_pos[0],
-                            self.current_pos[1],
-                            self.current_pos[2] + self.z_offset,
-                            self.current_pos[3],
-                        )
+                        newpos = list(self.current_pos)
+                        newpos[2] += self.z_offset
+                        return newpos
             # end of move reached
             self.current_pos[:] = self.next_pos
             self.z_offset = self._calc_z_offset(self.current_pos)
@@ -1423,7 +1434,7 @@ class ZMesh:
         return constrain(t, 0.0, 1.0), idx
 
     def _sample_direct(self, z_matrix):
-        self.mesh_matrix = z_matrix
+        self.mesh_matrix = [y[:] for y in z_matrix]
 
     def _sample_lagrange(self, z_matrix):
         x_mult = self.x_mult
