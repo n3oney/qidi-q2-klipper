@@ -214,6 +214,42 @@ sudo systemctl start klipper klipper-mcu
 
 Refer to [my config](https://github.com/n3oney/q2-config) for a full, functional example.
 
+## Load cell probe: mainline `trigger_analog` port
+
+Patch `nix/klipper/patches/0018-load-cell-probe-trigger-analog.patch` replaces
+Kalico's `load_cell_probe` (MCU `load_cell_probe.c`, host tap analysis and
+tap quality classifier) with the current mainline Klipper stack:
+
+- MCU: `trigger_analog.c` + the new `sos_filter.c` (offset/scale, continuous
+  tare), all four load cell sensors (`hx71x`, `cs1237`, `ads1220`,
+  `ads131m0x`) report samples to `trigger_analog`. The Q2 `sensor_cs1237.c`
+  keeps its DRDY interrupt on `PB4`.
+- Host: `klippy/extras/trigger_analog.py` (mainline), a rewritten
+  `klippy/extras/load_cell/load_cell_probe.py` that keeps Kalico's
+  `PrinterProbe` (retry strategies, `bad_probe_*` options) and adds the
+  mainline ascent least-squares fit after each tap.
+
+The MCU protocol changes, so the `thr.bin` firmware must be flashed together
+with the host tree (Katapult, see above).
+
+Config changes for an existing `[load_cell_probe]` section:
+
+- unchanged: `sensor_type`, pins, `sample_rate`, `gain`, `channel`,
+  `refout_off`, `sensor_orientation`, `z_offset`, `speed`, `lift_speed`,
+  `samples`, `sample_retract_dist`, `samples_*`, `trigger_force`,
+  `force_safety_limit` (0 still disables), `counts_per_gram`,
+  `reference_tare_counts`, `bad_probe_strategy`, `bad_probe_retries`.
+- removed (delete them if present): `drift_safety_limit`,
+  `disable_pullback_move`, `pullback_distance`, `pullback_speed`,
+  `tap_classifier`, `min_tap_quality`, `decompression_angle`,
+  `max_approach_force`, `max_departure_force`,
+  `max_baseline_force_delta`, `max_dwell_force_drop`.
+- `sample_retract_dist` is now the lift performed during the tap while the
+  ascent samples are collected (the probe helper does not lift a second time).
+- optional continuous tare filters (`drift_filter_cutoff_frequency`,
+  `buzz_filter_cutoff_frequency`, `notch_filter_frequencies`) need SciPy in
+  `~/klippy-env`.
+
 ## License
 
 This project is licensed under the [GNU General Public License v3.0](LICENSE).
