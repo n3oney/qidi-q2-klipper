@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -37,7 +38,7 @@ jobs:
       - parallel:
           - name: Build and publish Happy-Hare
             env:
-              GH_TOKEN: ${{ secrets.PUBLISH_TOKEN }}
+              GH_TOKEN: ${{ secrets.PUBLISH_TOKEN || github.token }}
             shell: bash
             run: |
               set -euo pipefail
@@ -47,7 +48,7 @@ jobs:
           
           - name: Build and publish Kalico bleeding-edge-v2
             env:
-              GH_TOKEN: ${{ secrets.PUBLISH_TOKEN }}
+              GH_TOKEN: ${{ secrets.PUBLISH_TOKEN || github.token }}
             shell: bash
             run: |
               set -euo pipefail
